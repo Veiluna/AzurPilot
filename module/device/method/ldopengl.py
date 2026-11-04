@@ -1,16 +1,19 @@
+"""雷电模拟器 OpenGL 截图后端。通过 LDPlayer 的原生 OpenGL 接口
+直接读取渲染缓冲区，实现低延迟高质量截图。"""
+
 import ctypes
 import os
 import subprocess
-import time
 from dataclasses import dataclass
-from functools import wraps
+from functools import partial
 
 import cv2
 import numpy as np
 
 from module.base.decorator import cached_property
 from module.device.env import IS_WINDOWS
-from module.device.method.utils import RETRY_TRIES, get_serial_pair, retry_sleep
+from module.device.method.retry import retry_backend, recover_unknown, retry_without_recovery
+from module.device.method.utils import get_serial_pair
 from module.device.platform import Platform
 from module.exception import RequestHumanTakeover
 from module.logger import logger
@@ -77,38 +80,39 @@ class LDConsole:
         self.ld_console = os.path.abspath(os.path.join(ld_folder, './ldconsole.exe'))
 
     def subprocess_run(self, cmd, timeout=10):
-        """
+        """执行 ldconsole 子进程命令并获取输出。
+
         Args:
-            cmd (list):
-            timeout (int):
+            cmd (list[str]): ldconsole 的子命令参数列表。
+            timeout (int): 超时时间（秒）。
 
         Returns:
-            bytes:
+            bytes: 标准输出字节串。
+
+        Raises:
+            LDOpenGLIncompatible: 未找到 ldconsole.exe。
         """
         cmd = [self.ld_console] + cmd
-        logger.info(f'Execute: {cmd}')
+        logger.info(f'执行: {cmd}')
 
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=False)
         except FileNotFoundError as e:
-            logger.warning(f'warning when calling {cmd}, {str(e)}')
-            raise LDOpenGLIncompatible(f'ld_folder does not have ldconsole.exe')
+            logger.warning(f'调用时警告 {cmd}, {str(e)}')
+            raise LDOpenGLIncompatible('ld_folder does not have ldconsole.exe')
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             process.kill()
             stdout, stderr = process.communicate()
-            logger.warning(f'TimeoutExpired when calling {cmd}, stdout={stdout}, stderr={stderr}')
+            logger.warning(f'调用超时 {cmd}, stdout={stdout}, stderr={stderr}')
         return stdout
 
     def list2(self):
-        """
-        > ldconsole.exe list2
-        0,雷电模拟器,28053900,42935798,1,59776,36816,1280,720,240
-        1,雷电模拟器-1,0,0,0,-1,-1,1280,720,240
+        """调用 `ldconsole.exe list2` 并解析多开实例列表。
 
         Returns:
-            list[DataLDPlayerInfo]:
+            list[DataLDPlayerInfo]: 解析出的雷电模拟器实例信息列表。
         """
         out = []
         data = self.subprocess_run(['list2'])
@@ -119,13 +123,13 @@ class LDConsole:
             info = row.split(b',')
             # 检查字段数
             if len(info) != 10:
-                logger.warning(f'ldplayer info does not have 10 parts: "{row}"')
+                logger.warning(f'雷电模拟器信息不足10部分: "{row}"')
                 continue
             # 构建信息
             try:
                 info = DataLDPlayerInfo(*info)
             except Exception as e:
-                logger.warning(f'Failed to build ldplayer info from "{row}", {e}')
+                logger.warning(f'无法构建雷电模拟器信息 "{row}", {e}')
             out.append(info)
         return out
 
@@ -148,44 +152,17 @@ class IScreenShotClass:
         self.class_release(self.ptr)
 
 
-def retry(func):
-    @wraps(func)
-    def retry_wrapper(self, *args, **kwargs):
-        """
-        Args:
-            self (NemuIpcImpl):
-        """
-        init = None
-        for _ in range(RETRY_TRIES):
-            try:
-                if callable(init):
-                    time.sleep(retry_sleep(_))
-                    init()
-                return func(self, *args, **kwargs)
-            # 不可处理
-            except RequestHumanTakeover:
-                break
-            # 不可处理
-            except LDOpenGLIncompatible as e:
-                logger.error(e)
-                break
-            # LDOpenGLError
-            except LDOpenGLError as e:
-                logger.error(e)
+def _retry_recover(self, error, trial):
+    if isinstance(error, LDOpenGLIncompatible):
+        logger.error(error)
+        return None
+    if isinstance(error, LDOpenGLError):
+        logger.error(error)
+        return retry_without_recovery
+    return recover_unknown(error)
 
-                def init():
-                    pass
-            # 未知异常，可能是损坏的图像
-            except Exception as e:
-                logger.exception(e)
 
-                def init():
-                    pass
-
-        logger.critical(f'重试 {func.__name__}() 失败')
-        raise RequestHumanTakeover
-
-    return retry_wrapper
+retry = partial(retry_backend, recover=_retry_recover, label='设备-ldopengl')
 
 
 class LDOpenGLImpl:
@@ -197,7 +174,7 @@ class LDOpenGLImpl:
         """
         ldopengl_dll = os.path.abspath(os.path.join(ld_folder, './ldopengl64.dll'))
         logger.info(
-            f'LDOpenGL init, '
+            f'[设备-ldopengl] LDOpenGL init, '
             f'ld_folder={ld_folder}, '
             f'ldopengl_dll={ldopengl_dll}, '
             f'instance_id={instance_id}'
@@ -228,19 +205,20 @@ class LDOpenGLImpl:
         self.screenshot_instance = IScreenShotClass(instance_ptr)
 
     def get_player_info_by_index(self, instance_id: int):
-        """
+        """根据多开索引获取雷电模拟器实例信息并校验运行状态。
+
         Args:
-            instance_id:
+            instance_id (int): 模拟器实例索引编号。
 
         Returns:
-            DataLDPlayerInfo:
+            DataLDPlayerInfo: 模拟器进程及窗口信息对象。
 
         Raises:
-            LDOpenGLError:
+            LDOpenGLError: 找不到指定索引实例或模拟器未处于运行状态。
         """
         for info in self.console.list2():
             if info.index == instance_id:
-                logger.info(f'Match LDPlayer instance: {info}')
+                logger.info(f'[设备-ldopengl] 匹配雷电模拟器实例: {info}')
                 if not info.sysboot:
                     raise LDOpenGLError('尝试连接雷电模拟器实例，但模拟器未运行')
                 return info
@@ -307,13 +285,13 @@ class LDOpenGL(Platform):
                     )
                 except (LDOpenGLIncompatible, LDOpenGLError) as e:
                     logger.error(e)
-                    logger.error('模拟器信息不正确')
+                    logger.error('[设备-ldopengl] 模拟器信息不正确')
 
         # 搜索模拟器实例
         # 例如 E:/ProgramFiles/LDPlayer9/dnplayer.exe
         # 安装路径为 E:/ProgramFiles/LDPlayer9
         if self.emulator_instance is None:
-            logger.error('无法使用 LDOpenGL，因为未找到模拟器实例')
+            logger.error('[设备-ldopengl] 无法使用 LDOpenGL，因为未找到模拟器实例')
             raise RequestHumanTakeover
         try:
             return LDOpenGLImpl(
@@ -322,7 +300,7 @@ class LDOpenGL(Platform):
             )
         except (LDOpenGLIncompatible, LDOpenGLError) as e:
             logger.error(e)
-            logger.error('无法初始化 LDOpenGL')
+            logger.error('[设备-ldopengl] 无法初始化 LDOpenGL')
             raise RequestHumanTakeover
 
     def ldopengl_available(self) -> bool:
@@ -330,7 +308,7 @@ class LDOpenGL(Platform):
             return False
         if not self.is_ldplayer_bluestacks_family:
             return False
-        logger.attr('EmulatorInfo_Emulator', self.config.EmulatorInfo_Emulator)
+        logger.attr('模拟器信息', self.config.EmulatorInfo_Emulator)
         if self.config.EmulatorInfo_Emulator not in ['LDPlayer9', 'LDPlayer14']:
             return False
 

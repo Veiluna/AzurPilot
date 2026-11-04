@@ -1,3 +1,9 @@
+"""嵌套字典高性能访问模块。
+
+提供 deep_get、deep_set、deep_pop、deep_iter 等函数，
+用于高性能地访问和操作嵌套字典/列表结构的配置数据。
+"""
+
 from collections import deque
 
 # deep_* 系列函数用于访问嵌套字典。
@@ -112,6 +118,11 @@ def deep_set(d, keys, value):
     """安全地向嵌套字典中设置值，模拟 deep_get() 的键路径遍历逻辑。
 
     仅支持字典类型，不支持列表。
+
+    Args:
+        d: 目标字典。
+        keys (list[str] | str): 键路径，如 ['Scheduler', 'NextRun', 'value'] 或点分字符串。
+        value: 要设置的值。
     """
     # 150 * depth (ns)
     if type(keys) is str:
@@ -166,6 +177,11 @@ def deep_default(d, keys, value):
     """安全地向嵌套字典中设置默认值（仅当键不存在时），模拟 deep_get() 的键路径遍历逻辑。
 
     仅支持字典类型，不支持列表。
+
+    Args:
+        d: 目标字典。
+        keys (list[str] | str): 键路径，如 ['Scheduler', 'NextRun', 'value'] 或点分字符串。
+        value: 默认值。
     """
     # 150 * depth (ns)
     if type(keys) is str:
@@ -217,7 +233,16 @@ def deep_default(d, keys, value):
 
 
 def deep_pop(d, keys, default=None):
-    """从嵌套字典和列表中弹出值。"""
+    """从嵌套字典和列表中弹出值。
+
+    Args:
+        d: 目标字典或列表。
+        keys (list[str] | str): 键路径，如 ['Scheduler', 'NextRun', 'value'] 或点分字符串。
+        default: 键不存在时的默认返回值。
+
+    Returns:
+        弹出对应键路径的值，不存在时返回 default。
+    """
     if type(keys) is str:
         keys = keys.split('.')
 

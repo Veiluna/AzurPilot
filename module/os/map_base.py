@@ -1,19 +1,55 @@
+"""大世界地图基础数据结构。
+
+定义大世界（Operation Siren）的地图数据模型。
+大世界的地图使用 OSCampaignMap 类，继承自主线战役的 CampaignMap，
+但有以下差异：
+- 使用 OSGridInfo 而非 GridInfo 作为格子类型
+- 相机视野范围不同（camera_sight = (-4, -1, 3, 3)）
+- 地图尺寸通过节点名称动态设置
+- 所有格子默认权重为 10
+
+继承自 CampaignMap，复用寻路和地图管理的核心逻辑。
+"""
+
 from module.base.utils import *
 from module.map.map_base import CampaignMap, camera_2d
 from module.map_detection.os_grid import OSGridInfo
 
 
 class OSCampaignMap(CampaignMap):
+    """大世界地图数据结构。
+
+    管理大世界海域的格子信息和寻路逻辑。
+
+    Attributes:
+        camera_sight (tuple[int, int, int, int]): 相机视野范围。
+        camera_data (list[str]): 相机位置节点数据列表。
+    """
     def __init__(self, name=None):
+        """初始化大世界地图数据结构。
+
+        Args:
+            name (str | None): 地图名称。
+        """
         super().__init__(name)
         self.camera_sight = (-4, -1, 3, 3)
 
     @property
     def shape(self):
+        """获取地图尺寸元组 (width, height)。
+
+        Returns:
+            tuple[int, int]: 地图尺寸。
+        """
         return self._shape
 
     @shape.setter
     def shape(self, scale):
+        """设置地图尺寸并初始化网格信息及相机遍历数据。
+
+        Args:
+            scale (str): 地图规格节点名称，如 'J10'。
+        """
         self._shape = node2location(scale.upper())
         for y in range(self._shape[1] + 1):
             for x in range(self._shape[0] + 1):
@@ -21,19 +57,20 @@ class OSCampaignMap(CampaignMap):
                 grid.location = (x, y)
                 self.grids[(x, y)] = grid
 
-        # camera_data can be generate automatically, but it's better to set it manually.
+        # 相机数据支持自动生成，也可手动指定
         self.camera_data = [location2node(loca) for loca in camera_2d((0, 0, *self._shape), sight=self.camera_sight)]
         self.camera_data_spawn_point = []
-        # weight_data set to 10.
+        # 所有格子默认权重设为 10
         for grid in self:
             grid.weight = 10.
 
     def update(self, grids, camera, mode='normal'):
-        """
+        """将当前视野检测到的格子数据合并更新到全局地图中。
+
         Args:
-            grids:
-            camera (tuple):
-            mode (str): Scan mode, such as 'normal', 'carrier', 'movable'
+            grids (OSGrid): 当前检测到的格子集合对象。
+            camera (tuple[int, int]): 当前相机中心坐标。
+            mode (str): 扫描模式，如 'normal'、'carrier'、'movable'。默认 'normal'。
         """
         offset = np.array(camera) - np.array(grids.center_loca)
         grids.show()

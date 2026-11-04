@@ -1,3 +1,6 @@
+"""模拟器基类定义。提供 EmulatorBase、EmulatorInstanceBase、
+EmulatorManagerBase 的抽象接口，定义模拟器路径和实例管理的通用协议。"""
+
 import os
 import re
 import typing as t
@@ -7,6 +10,14 @@ from module.device.platform.utils import cached_property, iter_folder
 
 
 def abspath(path):
+    """将路径转换为规范化的绝对路径并使用正斜杠。
+
+    Args:
+        path (str): 待转换路径。
+
+    Returns:
+        str: 正斜杠分隔的绝对路径。
+    """
     return os.path.abspath(path).replace('\\', '/')
 
 
@@ -108,12 +119,17 @@ class EmulatorInstanceBase:
         将 MuMu 12 实例名称转换为实例 ID。
         示例名称:
             MuMuPlayer-12.0-3
+            MuMuPlayerGlobal-12.0-0
+            MuMuPlayer-15.0-0
             YXArkNights-12.0-1
 
         Returns:
             int: 实例 ID，如果不是 MuMu 12 实例则返回 None
         """
         res = re.search(r'MuMuPlayer(?:Global)?-12.0-(\d+)', self.name)
+        if res:
+            return int(res.group(1))
+        res = re.search(r'MuMuPlayer(?:Global)?-15.0-(\d+)', self.name)
         if res:
             return int(res.group(1))
         res = re.search(r'YXArkNights-12.0-(\d+)', self.name)
@@ -211,6 +227,11 @@ class EmulatorBase:
         pass
 
     def __init__(self, path):
+        """初始化模拟器基础对象。
+
+        Args:
+            path (str): 模拟器可执行文件路径。
+        """
         # .exe 文件路径
         self.path = path.replace('\\', '/')
         # 模拟器安装目录
@@ -237,6 +258,15 @@ class EmulatorBase:
         return True
 
     def abspath(self, path, folder=None):
+        """获取相对于模拟器目录或指定目录的绝对路径。
+
+        Args:
+            path (str): 相对路径。
+            folder (str, optional): 基准目录，默认为模拟器安装目录。
+
+        Returns:
+            str: 解析后的绝对路径。
+        """
         if folder is None:
             folder = self.dir
         return abspath(os.path.join(folder, path))

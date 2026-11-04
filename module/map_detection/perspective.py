@@ -1,3 +1,6 @@
+"""透视检测模块。通过检测网格线的消失点和边缘，确定地图的透视变换参数，
+用于校正地图视角并识别网格边界。"""
+
 import time
 import warnings
 
@@ -16,22 +19,26 @@ warnings.filterwarnings("ignore")
 
 
 class Perspective:
-    """透视检测。
+    """透视检测器。
 
-    Examples:
-        persp = Perspective(AzurLaneConfig('template'))
-        persp.load(image)
+    通过检测地图网格线的消失点与边缘，计算地图视角的透视变换参数，
+    用于校正地图视角并识别网格边界。
 
-    Logs:
-                  vanish_point: (  646, -1736)
-                 distant_point: (-2321, -1736)
-        0.155s  _   Horizontal: 5 (7 inner, 3 edge)
-        Edges: /_     Vertical: 9 (10 inner, 3 edge)
+    Attributes:
+        image (np.ndarray): 输入的地图图像。
+        config (AzurLaneConfig): 配置对象。
+        left_edge (Lines): 左边缘线段对象。
+        right_edge (Lines): 右边缘线段对象。
+        lower_edge (Lines): 下边缘线段对象。
+        upper_edge (Lines): 上边缘线段对象。
+        horizontal (Lines): 检测到的水平线段集合。
+        vertical (Lines): 检测到的垂直线段集合。
+        crossings (Points): 水平线与垂直线的交点集合。
+        vanish_point (tuple): 消失点（灭点）坐标。
+        distant_point (tuple): 远点坐标。
+        map_inner (np.ndarray): 内部区域坐标。
     """
 
-    """
-    输出
-    """
     image: np.ndarray
     config: AzurLaneConfig
     # 四条边缘线，bool 类型或具有 __bool__ 属性
@@ -40,9 +47,6 @@ class Perspective:
     lower_edge: Lines
     upper_edge: Lines
 
-    """
-    私有属性
-    """
     horizontal: Lines
     vertical: Lines
     crossings: Points
@@ -51,16 +55,21 @@ class Perspective:
     map_inner: np.ndarray
 
     def __init__(self, config):
-        """
+        """初始化透视检测器。
+
         Args:
             config (AzurLaneConfig): 配置对象。
         """
         self.config = config
 
     def load(self, image):
-        """
+        """加载地图截图并执行透视线段检测与参数优化。
+
         Args:
             image (np.ndarray): 截图图像，形状为 (720, 1280, 3)。
+
+        Raises:
+            MapDetectionError: 未检测到水平线、垂直线或灭点计算异常时抛出。
         """
         start_time = time.time()
         self.image = image
@@ -121,8 +130,8 @@ class Perspective:
         self.vanish_point = optimize.brute(self._vanish_point_value, self.config.VANISH_POINT_RANGE)
         distance_point_x = optimize.brute(self._distant_point_value, self.config.DISTANCE_POINT_X_RANGE)[0]
         self.distant_point = (distance_point_x, self.vanish_point[1])
-        logger.attr_align('vanish_point', point2str(*self.vanish_point, length=5))
-        logger.attr_align('distant_point', point2str(*self.distant_point, length=5))
+        logger.attr_align('灭点', point2str(*self.vanish_point, length=5))
+        logger.attr_align('远点', point2str(*self.distant_point, length=5))
         if np.linalg.norm(np.subtract(self.vanish_point, self.distant_point)) < 10:
             raise MapDetectionError('Vanish point and distant point too close')
 
@@ -149,11 +158,11 @@ class Perspective:
 
         # Log
         time_cost = round(time.time() - start_time, 3)
-        logger.info('%ss  %s   Horizontal: %s (%s inner, %s edge)' % (
+        logger.info('[地图-透视] %ss  %s   水平: %s (%s 内部, %s 边缘)' % (
             float2str(time_cost), '_' if self.lower_edge else ' ',
             len(self.horizontal), len(horizontal), len(edge_h))
                     )
-        logger.info('Edges: %s%s%s    Vertical: %s (%s inner, %s edge)' % (
+        logger.info('[地图-透视] 边缘: %s%s%s    垂直: %s (%s 内部, %s 边缘)' % (
             '/' if self.left_edge else ' ', '_' if self.upper_edge else ' ',
             '\\' if self.right_edge else ' ', len(self.vertical), len(vertical), len(edge_v))
                     )
@@ -169,7 +178,7 @@ class Perspective:
         """
         image = rgb2gray(crop(image, self.config.DETECTING_AREA, copy=False))
         cv2.bitwise_and(image, ASSETS.ui_mask, dst=image)
-        cv2.subtract(255, image, dst=image)
+        cv2.bitwise_not(image, dst=image)
         return image
 
     @staticmethod
@@ -243,6 +252,13 @@ class Perspective:
         image.show()
 
     def draw(self, lines=None, bg=None, expend=0):
+        """在图像上绘制透视线段并展示。
+
+        Args:
+            lines (Lines, optional): 待绘制的线段集合。默认为 None。
+            bg (np.ndarray, optional): 背景图像。默认为 None（使用 self.image）。
+            expend (int, optional): 边缘扩展像素数。默认为 0。
+        """
         if bg is None:
             image = self.image.copy()
         else:
@@ -360,8 +376,8 @@ class Perspective:
 
         diff = np.max([mid_diff_range[0] - coincident_point[1], coincident_point[1] - mid_diff_range[1]])
         if diff > 0:
-            logger.info('%s coincident point unexpected: %s' % (
-                'Horizontal' if is_horizontal else 'Vertical',
+            logger.info('[地图-透视] %s 重合点异常: %s' % (
+                '水平' if is_horizontal else '垂直',
                 str(coincident_point)))
 
         # 检测区域的边界

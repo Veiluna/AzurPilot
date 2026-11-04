@@ -1,3 +1,9 @@
+"""ADB Shell 警告信息过滤模块。
+
+移除 VMOS、Waydroid 等环境 Shell 输出中的链接器与渲染器警告信息，
+避免干扰后续数据解析（如 PNG 截图数据）。
+"""
+
 from typing import overload
 
 
@@ -10,29 +16,17 @@ def remove_shell_warning(s: str) -> str: ...
 
 
 def remove_shell_warning(s):
-    """
-    Remove warnings from shell
+    """过滤 Shell 执行输出中的链接器等干扰警告信息。
 
-    1. Warnings in VMOS shell
-    https://github.com/LmeSzinc/AzurLaneAutoScript/issues/1425
-
-    WARNING: linker: [vdso]: unused DT entry: type 0x70000001 arg 0x0\n
-    \x89PNG\r\n\x1a\n\x00\x00\x00\rIH...
-
-    2. This linker thingy might appear multiple times when executing multiple commands
-
-    mek_8q:/dev # getprop | grep gnss
-    WARNING: linker: Warning: "[vdso]" unused DT entry: unknown processor-specific (type 0x70000001 arg 0x0) (ignoring)
-    WARNING: linker: Warning: "[vdso]" unused DT entry: unknown processor-specific (type 0x70000001 arg 0x0) (ignoring)
-    [init.svc.gnss_service]: [running]
-    [init.svc_debug_pid.gnss_service]: [406]
-    [ro.boottime.gnss_service]: [27308752875]
+    处理场景包括：
+    1. VMOS shell 中的链接器警告（如 `WARNING: linker: [vdso]: unused DT entry...`）
+    2. 多命令串联执行时重复出现的链接器警告
 
     Args:
-        s (str | bytes): bytes or str
+        s (str | bytes): 原始 Shell 输出文本或字节串。
 
     Returns:
-        str | bytes: Shell output with warnings removed
+        str | bytes: 过滤警告后的输出内容。
     """
     if isinstance(s, bytes):
         while 1:
@@ -59,41 +53,19 @@ def remove_screenshot_warning(s: str) -> str: ...
 
 
 def remove_screenshot_warning(s):
-    """
-    Remove warnings when taking screenshot
+    """过滤截屏数据前附带的各种控制台警告前缀。
 
-    1. Errors in waydroid screencap render
-    https://github.com/LmeSzinc/AzurLaneAutoScript/issues/4760
-
-    Failed to create //.cache for shader cache (Read-only file system)---disabling.\n
-
-    2. Warning when taking screenshot from multiscreen device
-
-    [Warning] Multiple displays were found, but no display id was specified! Defaulting to the first display found,
-    however this default is not guaranteed to be consistent across captures.\n
-    A display id should be specified.\n
-    See "dumpsys SurfaceFlinger --display-id" for valid display IDs.\n
-    \x89PNG...
-
-    3. Another format of multiscreen warning
-    https://github.com/LmeSzinc/AzurLaneAutoScript/issues/5682
-
-    [Warning] Multiple displays were found, but no display id was specified! Defaulting to the first display found,
-    however this default is not guaranteed to be consistent across captures. A display id should be specified.\n
-    A display ID can be specified with the [-d display-id] option.\n
-    See "dumpsys SurfaceFlinger --display-id" for valid display IDs.\n
-    \x89PNG...
-
-    4. Unknown header on VMOS PRO screenshot
-    https://github.com/LmeSzinc/AzurLaneAutoScript/pull/940
-
-    long long=8 fun*=10\n\x89PNG...
+    处理场景包括：
+    1. Waydroid screencap 着色器缓存创建失败提示
+    2. 多屏幕设备 screencap 的 display id 缺失提示
+    3. VMOS PRO 截图前缀未知头
+    4. NAS 等轻量 Linux 运行 redroid 时的 AMD GPU 驱动警告
 
     Args:
-        s (str | bytes): bytes or str
+        s (str | bytes): 原始截屏二进制或文本数据。
 
     Returns:
-        str | bytes: Screenshot data with warnings removed
+        str | bytes: 过滤掉警告头部的实际截屏数据。
     """
     if isinstance(s, bytes):
         if s.startswith(b'Failed to create'):
@@ -106,6 +78,10 @@ def remove_screenshot_warning(s):
                     _, _, s = s.partition(b'\n')
         if s.startswith(b'long long=8'):
             _, _, s = s.partition(b'\n')
+        if s.startswith(b'amdgpu:'):
+            _, _, s = s.partition(b'\n')
+            if s.startswith(b'If they do'):
+                _, _, s = s.partition(b'\n')
 
     elif isinstance(s, str):
         if s.startswith('Failed to create'):
@@ -118,5 +94,9 @@ def remove_screenshot_warning(s):
                     _, _, s = s.partition('\n')
         if s.startswith('long long=8'):
             _, _, s = s.partition('\n')
+        if s.startswith('amdgpu:'):
+            _, _, s = s.partition('\n')
+            if s.startswith('If they do'):
+                _, _, s = s.partition('\n')
 
     return s

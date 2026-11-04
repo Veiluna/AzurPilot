@@ -1,3 +1,11 @@
+"""
+代币商店处理器（大世界商店）。
+
+通过模板匹配定位代币图标，动态计算商品网格布局，
+识别并过滤代币商店中的商品，按配置购买优先级执行购买。
+支持单次购买日志档案商品的 run_once() 方法。
+"""
+
 from module.base.button import ButtonGrid
 from module.base.decorator import cached_property, del_cached_property
 from module.base.timer import Timer
@@ -40,7 +48,7 @@ class VoucherShop(ShopClerk, ShopStatus):
         left_column = self.image_crop((305, 306, 1256, 646), copy=False)
         vouchers = TEMPLATE_VOUCHER_ICON.match_multi(left_column, similarity=0.75, threshold=5)
         vouchers = Points([(0., v.area[1]) for v in vouchers]).group(threshold=5)
-        logger.attr('Vouchers_icon', len(vouchers))
+        logger.attr('代币图标数', len(vouchers))
         return vouchers
 
     def wait_until_voucher_appear(self, skip_first_screenshot=True):
@@ -50,7 +58,7 @@ class VoucherShop(ShopClerk, ShopStatus):
         此方法等待任意凭证图标出现。
 
         Args:
-            skip_first_screenshot: 是否跳过首次截图
+            skip_first_screenshot (bool): 是否跳过首次截图。默认 True。
         """
         timeout = Timer(1, count=3).start()
         while 1:
@@ -79,7 +87,7 @@ class VoucherShop(ShopClerk, ShopStatus):
         vouchers = self._get_vouchers()
         count = len(vouchers)
         if count == 0:
-            logger.warning('Unable to find voucher icon, assume item list is at top')
+            logger.warning('未找到代币图标，假设商品列表在顶部')
             origin_y = 200
             delta_y = 191
             row = 2
@@ -97,7 +105,7 @@ class VoucherShop(ShopClerk, ShopStatus):
             delta_y = abs(y1 - y2)
             row = 2
         else:
-            logger.warning(f'Unexpected voucher icon match result: {[v.area for v in vouchers]}')
+            logger.warning(f'意外的代币图标匹配结果: {[v.area for v in vouchers]}')
             origin_y = 200
             delta_y = 191
             row = 2
@@ -157,7 +165,7 @@ class VoucherShop(ShopClerk, ShopStatus):
             int: 凭证数量
         """
         self._currency = self.status_get_voucher()
-        logger.info(f'Voucher: {self._currency}')
+        logger.info(f'凭证: {self._currency}')
         return self._currency
 
     def shop_interval_clear(self):
@@ -182,6 +190,7 @@ class VoucherShop(ShopClerk, ShopStatus):
 
         Args:
             item: 待购买的商品对象
+            skip_first_screenshot: 是否跳过首次截图
 
         Returns:
             bool: 是否检测到购买界面并进行了处理
@@ -210,10 +219,15 @@ class VoucherShop(ShopClerk, ShopStatus):
         处理退役、遮挡、信息栏等意外情况。
 
         Args:
-            item: 待购买的商品对象
-            skip_first_screenshot: 是否跳过首次截图
+            item: 待购买的商品对象。
+            skip_first_screenshot (bool): 是否跳过首次截图。默认 True。
+
         """
         success = False
+        confirmed_purchase = False
+        from module.statistics.resource_tracking import receipt_totals
+        receipts = receipt_totals(self.config)
+        item._resource_purchase_quantity = 1
         self.shop_interval_clear()
 
         while 1:
@@ -234,6 +248,10 @@ class VoucherShop(ShopClerk, ShopStatus):
             if self.handle_retirement():
                 self.interval_reset(BACK_ARROW)
                 continue
+            if self.shop_purchase_result_handle():
+                self.interval_reset(BACK_ARROW)
+                success = confirmed_purchase = True
+                continue
             if self.shop_obstruct_handle():
                 self.interval_reset(BACK_ARROW)
                 success = True
@@ -243,8 +261,11 @@ class VoucherShop(ShopClerk, ShopStatus):
                 success = True
                 continue
 
-            # 结束条件
+            # End
             if success and self.appear(BACK_ARROW, offset=(30, 30)):
+                if confirmed_purchase:
+                    from module.statistics.resource_tracking import record_purchase
+                    record_purchase(self.config, item, item._resource_purchase_quantity, receipts)
                 break
 
     def run(self):
@@ -254,15 +275,16 @@ class VoucherShop(ShopClerk, ShopStatus):
 
         按照过滤器配置购买凭证商店商品，自动翻页直到列表底部。
         """
-        # 过滤器为空时直接退出
+        # Base case; exit run if filter empty
         if not self.shop_filter:
             return
 
-        # 调用时应已在凭证商店界面
+        # When called, expected to be in
+        # correct Voucher Shop interface
         logger.hr('Voucher Shop', level=1)
         self.wait_until_voucher_appear()
 
-        # 执行购买操作
+        # Execute buy operations
         VOUCHER_SHOP_SCROLL.set_top(main=self)
         while 1:
             self.shop_buy()
@@ -287,21 +309,21 @@ class VoucherShop(ShopClerk, ShopStatus):
         self.shop_filter = 'LoggerArchive'
 
         # 调用时应已在凭证商店界面
-        logger.hr('Voucher Shop Once', level=1)
+        logger.hr('[商店-代币] 代币商店单次购买', level=1)
         self.wait_until_voucher_appear()
 
         # 执行购买操作
         items = self.shop_get_items()
         self.shop_currency()
         if self._currency <= 0:
-            logger.warning(f'Current funds: {self._currency}, stopped')
+            logger.warning(f'[商店-代币] 当前资金: {self._currency}，停止')
             return False
 
         item = self.shop_get_item_to_buy(items)
         if item is None:
-            logger.info('No logger archives available for purchase')
+            logger.info('[商店-代币] 无记录仪档案可购买')
             return False
         self.shop_buy_execute(item)
 
-        logger.info('Purchased single logger archive')
+        logger.info('已购买单个记录仪档案')
         return True

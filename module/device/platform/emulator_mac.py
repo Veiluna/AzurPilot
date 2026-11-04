@@ -1,3 +1,6 @@
+"""macOS 模拟器管理。实现 macOS 平台的模拟器实例检测和管理，
+支持 BlueStacks Air 和 MuMu Pro 等模拟器。"""
+
 import json
 import os
 import re
@@ -12,6 +15,14 @@ from module.logger import logger
 
 
 def abspath(path):
+    """将路径转换为规范化的绝对路径并使用正斜杠。
+
+    Args:
+        path (str): 待转换路径。
+
+    Returns:
+        str: 正斜杠分隔的绝对路径。
+    """
     return os.path.abspath(path).replace('\\', '/')
 
 

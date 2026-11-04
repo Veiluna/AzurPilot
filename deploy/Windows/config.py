@@ -1,29 +1,45 @@
-import copy
 import os
+import random
 import subprocess
 import sys
 from typing import Optional, Union
 
+from deploy.geo import get_country_code
+from deploy.config_transaction import DeployConfigTransaction
 from deploy.Windows.logger import logger
-from deploy.Windows.utils import DEPLOY_CONFIG, DEPLOY_TEMPLATE, cached_property, poor_yaml_read, poor_yaml_write
+from deploy.Windows.utils import DEPLOY_CONFIG, DEPLOY_TEMPLATE, cached_property, poor_yaml_read
 
 
 GIT_OVER_CDN_REPOSITORY = 'git://git.pull/AzurPilot'
-GIT_OVER_CDN_FALLBACK_REPOSITORY = 'https://gitcode.com/ddl2/AzurLaneAutoScript'
+GITHUB_REPOSITORY = 'https://github.com/wess09/AzurPilot'
+GIT_OVER_CDN_FALLBACK_REPOSITORIES = [
+    'https://cnb.cool/AzurPilot/AzurPilot',
+    'https://gitcode.com/ddl2/AzurPilot',
+]
+GIT_OVER_CDN_FALLBACK_REPOSITORY = GIT_OVER_CDN_FALLBACK_REPOSITORIES[1]
+
+
+def choose_fallback_repository() -> str:
+    """在可用的国内镜像源（CNB 与 GitCode）之间分流，避免单一镜像源流量过大引发风控。"""
+    return random.choice(GIT_OVER_CDN_FALLBACK_REPOSITORIES)
 
 
 class ExecutionError(Exception):
-    pass
+    """部署流程执行失败；code 取 deploy.config.ErrorCodes，供上游结构化识别。"""
+
+    def __init__(self, code: int = 1, message: str = ''):
+        super().__init__(message or f'deploy failed with error code {code}')
+        self.code = code
 
 
 class ConfigModel:
+    """Windows 部署配置模型，定义所有配置项及其默认值。"""
     # Git 配置
-    Repository: str = "https://github.com/wess09/AzurPilot"
+    Repository: str = GITHUB_REPOSITORY
     Branch: str = "master"
     GitExecutable: str = "./.venv/Scripts/git/cmd/git.exe"
     GitProxy: Optional[str] = None
     SSLVerify: bool = False
-    AutoUpdate: bool = True
 
     # Python 配置
     PythonExecutable: str = "./.venv/Scripts/python.exe"
@@ -52,18 +68,30 @@ class ConfigModel:
 
     # 远程访问
     EnableRemoteAccess: bool = False
+    RemoteAccessMode: str = "auto"
+    CloudflareRegistry: str = "https://remote.azurpilot.com"
+    CloudflareDeviceId: str = ""
     SSHUser: Optional[str] = None
     SSHServer: Optional[str] = None
     SSHExecutable: Optional[str] = None
+    AllowedRedirectHosts: Optional[str] = None
+    MaxRedirects: int = 2
+    SignalingServer: Optional[str] = None
+    StunServers: Optional[str] = '["stun:stun.l.google.com:19302"]'
+    TurnServers: Optional[str] = None
+    TurnCredentialMode: str = "static"
 
     # WebUI 配置
     WebuiHost: str = "0.0.0.0"
-    WebuiPort: int = 22367
+    WebuiPort: int = 25548
     Language: str = "en-US"
     Theme: str = "default"
     DpiScaling: bool = True
     Password: Optional[str] = None
     CDN: Union[str, bool] = False
+    # --watermark. 关闭未经验证版本的水印。默认 False，即默认显示水印；
+    # 需与 deploy/config.py 保持一致，否则 Windows 启动器读不到该开关。
+    DisableBranchWatermark: bool = False
     Run: Optional[str] = None
     AppAsarUpdate: bool = True
     NoSandbox: bool = True
@@ -72,7 +100,9 @@ class ConfigModel:
     GitOverCdn: bool = False
 
 
-class DeployConfig(ConfigModel):
+class DeployConfig(DeployConfigTransaction, ConfigModel):
+    """Windows 环境部署配置管理器，维护配置加载、事务同步与工具路径解析。"""
+
     def __init__(self, file=DEPLOY_CONFIG):
         """初始化部署配置。
 
@@ -80,13 +110,20 @@ class DeployConfig(ConfigModel):
             file (str): 用户部署配置文件路径。
         """
         self.file = file
+        self.template_file = DEPLOY_TEMPLATE
         self.config = {}
         self.config_template = {}
+        self._github_location_checked = False
+        # 网络查询不持有配置文件锁，避免多个进程启动时串行等待网络。
+        values = {**poor_yaml_read(self.template_file), **poor_yaml_read(self.file)}
+        self._github_country_code = (get_country_code()
+                                     if values.get('Repository') == GITHUB_REPOSITORY else None)
         self.read()
 
         self.show_config()
 
     def show_config(self):
+        """展示非默认的部署配置项。"""
         logger.hr("Show deploy config", 1)
         for k, v in self.config.items():
             if k in ("Password", "SSHUser"):
@@ -97,35 +134,39 @@ class DeployConfig(ConfigModel):
 
         logger.info(f"Rest of the configs are the same as default")
 
-    def read(self):
-        self.config = poor_yaml_read(DEPLOY_TEMPLATE)
-        self.config_template = copy.deepcopy(self.config)
-        origin = poor_yaml_read(self.file)
-        self.config.update(origin)
-
-        for key, value in self.config.items():
-            if hasattr(self, key):
-                super().__setattr__(key, value)
-
-        self.config_redirect()
-
-        if self.config != origin:
-            self.write()
-
-    def write(self):
-        poor_yaml_write(self.config, self.file)
-
     def config_redirect(self):
         """部署配置重定向，处理旧配置到新配置的迁移。
 
         每次 `read()` 之后必须调用。
         """
+        self.config.pop('AutoUpdate', None)
+        self._redirect_github_repository()
         # 绕过 webui.config.DeployConfig.__setattr__()，不写入 deploy.yaml
         super().__setattr__('GitOverCdn', self.Repository in ['cn', GIT_OVER_CDN_REPOSITORY])
         if self.Repository in ['global']:
             super().__setattr__('Repository', 'https://github.com/wess09/AzurPilot')
         if self.Repository in ['cn', GIT_OVER_CDN_REPOSITORY]:
-            super().__setattr__('Repository', GIT_OVER_CDN_FALLBACK_REPOSITORY)
+            super().__setattr__('Repository', choose_fallback_repository())
+        if self.Repository in ['cnb']:
+            super().__setattr__('Repository', GIT_OVER_CDN_FALLBACK_REPOSITORIES[0])
+        if self.Repository in ['gitcode']:
+            super().__setattr__('Repository', GIT_OVER_CDN_FALLBACK_REPOSITORIES[1])
+
+    def _redirect_github_repository(self):
+        """为官方 GitHub 源一次性选择适合当前网络的更新镜像。"""
+        if self._github_location_checked or self.Repository != GITHUB_REPOSITORY:
+            return
+
+        self._github_location_checked = True
+        country_code = self._github_country_code
+        if country_code == 'cn':
+            logger.info('检测到中国大陆网络，切换至国内 Git 更新源')
+            object.__setattr__(self, 'Repository', GIT_OVER_CDN_REPOSITORY)
+            self.config['Repository'] = GIT_OVER_CDN_REPOSITORY
+        elif country_code is None:
+            logger.warning('无法检测网络所在国家，保留 GitHub 更新源')
+        else:
+            logger.info('当前网络不在中国大陆，保留 GitHub 更新源')
 
     def filepath(self, path):
         """获取绝对文件路径。
@@ -147,6 +188,11 @@ class DeployConfig(ConfigModel):
 
     @cached_property
     def root_filepath(self):
+        """获取项目根目录绝对路径。
+
+        Returns:
+            str: 格式化为正斜杠的绝对路径。
+        """
         return (
             os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
             .replace(r"\\", "/")
@@ -155,6 +201,11 @@ class DeployConfig(ConfigModel):
 
     @cached_property
     def adb(self) -> str:
+        """获取 ADB 可执行文件路径。
+
+        Returns:
+            str: ADB 绝对路径或回退命令 'adb'。
+        """
         exe = self.filepath(self.AdbExecutable)
         if os.path.exists(exe):
             return exe
@@ -164,6 +215,11 @@ class DeployConfig(ConfigModel):
 
     @cached_property
     def git(self) -> str:
+        """获取 Git 可执行文件路径。
+
+        Returns:
+            str: Git 绝对路径或回退命令 'git'。
+        """
         exe = self.filepath(self.GitExecutable)
         if os.path.exists(exe):
             return exe
@@ -173,6 +229,11 @@ class DeployConfig(ConfigModel):
 
     @cached_property
     def python(self) -> str:
+        """获取 Python 可执行文件路径。
+
+        Returns:
+            str: Python 绝对路径或当前解释器路径。
+        """
         exe = self.filepath(self.PythonExecutable)
         if os.path.exists(exe):
             return exe
@@ -204,7 +265,9 @@ class DeployConfig(ConfigModel):
             else:
                 logger.info(f"[ failure ], error_code: {error_code}")
                 self.show_error(command)
-                raise ExecutionError
+                raise ExecutionError(
+                    10, f'Command failed (exit {error_code}): {command}'
+                )
         else:
             logger.info(f"[ success ]")
             return True
@@ -231,6 +294,11 @@ class DeployConfig(ConfigModel):
         return stdout.decode()
 
     def show_error(self, command=None):
+        """展示更新失败信息及排查指引。
+
+        Args:
+            command (str, optional): 触发失败的命令。
+        """
         logger.hr("Update failed", 0)
         self.show_config()
         logger.info("")

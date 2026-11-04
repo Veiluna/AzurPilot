@@ -1,3 +1,10 @@
+"""战役加成统计。
+
+识别并解析战役通关后的加成奖励弹窗，
+提取额外掉落物品信息并记录到统计数据中。
+继承 GetItemsStatistics 复用物品识别逻辑。
+"""
+
 from module.base.button import ButtonGrid
 from module.base.utils import *
 from module.handler.assets import AUTO_SEARCH_MENU_EXIT
@@ -8,12 +15,29 @@ from module.statistics.utils import *
 
 
 class BonusItem(Item):
+    """战役额外奖励物品对象。"""
+
     def predict_valid(self):
+        """判断奖励格是否包含有效物品图标。
+
+        Returns:
+            bool: 灰度均值大于阈值返回 True，否则返回 False。
+        """
         return np.mean(rgb2gray(self.image) > 160) > 0.1
 
 
 class CampaignBonusStatistics(GetItemsStatistics):
+    """战役连续战斗结算额外奖励统计。"""
+
     def appear_on(self, image):
+        """检查截图是否为连续战斗奖励弹窗界面。
+
+        Args:
+            image (np.ndarray): 截图图像。
+
+        Returns:
+            bool: 匹配成功返回 True，否则返回 False。
+        """
         if AUTO_SEARCH_MENU_EXIT.match(image, offset=(200, 20)) \
                 and (CAMPAIGN_BONUS.match(image, offset=(200, 500)) \
                 or CAMPAIGN_BONUS_SINGLE.match(image, offset=(200, 500))):

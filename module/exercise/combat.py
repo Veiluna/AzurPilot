@@ -1,17 +1,51 @@
+"""
+演习战斗执行模块。
+
+处理演习的战斗流程，包括：
+- 对手选择和进入战斗准备界面
+- 战斗执行和结算画面处理
+- 低血量检测和战斗退出处理
+- 装备管理（演习前穿装、演习后脱装）
+
+战斗过程中自动检测 S/D 评价结算、经验信息、获得物品等画面，
+并通过弹窗处理器处理各类突发事件（紧急委托、投票等）。
+"""
 from module.combat.combat import *
 from module.exercise.assets import *
-from module.exercise.equipment import ExerciseEquipment
 from module.exercise.hp_daemon import HpDaemon
 from module.exercise.opponent import OPPONENT, OpponentChoose
 from module.ui.assets import EXERCISE_CHECK
 
 
-class ExerciseCombat(HpDaemon, OpponentChoose, ExerciseEquipment, Combat):
+class ExerciseCombat(HpDaemon, OpponentChoose, Combat):
+    """演习战斗处理器，整合对手选择、血量监控和装备管理。
+
+    继承自 HpDaemon（血量监控）、OpponentChoose（对手选择）、
+    Combat（战斗及装备管理），
+    提供完整的演习战斗执行流程。
+
+    战斗流程：选择对手 -> 准备 -> 执行 -> 结算处理 -> 返回。
+    """
+
     def _in_exercise(self):
+        """检测当前是否处于演习主页面。
+
+        Returns:
+            bool: 处于演习页面返回 True，否则返回 False。
+        """
         return self.appear(EXERCISE_CHECK, offset=(20, 20))
 
     def _combat_preparation(self, skip_first_screenshot=True):
-        logger.info('Combat preparation')
+        """处理战斗准备界面，点击出击按钮进入战斗。
+
+        Args:
+            skip_first_screenshot (bool): 是否跳过首次截图，默认 True。
+
+        Pages:
+            in: BATTLE_PREPARATION
+            out: 战斗画面（is_combat_executing）
+        """
+        logger.info('[演习-战斗] 战斗准备')
         self.device.stuck_record_clear()
         self.device.click_record_clear()
         while 1:
@@ -20,27 +54,26 @@ class ExerciseCombat(HpDaemon, OpponentChoose, ExerciseEquipment, Combat):
             else:
                 self.device.screenshot()
 
-            if self.appear(BATTLE_PREPARATION, offset=(20, 20), interval=2):
-                # self.equipment_take_on()
-                pass
-
-                self.device.click(BATTLE_PREPARATION)
+            if self.handle_battle_preparation():
                 continue
 
             # 结束
             pause = self.is_combat_executing()
             if pause:
-                logger.attr('BattleUI', pause)
+                logger.attr('战斗UI主题', pause)
                 break
 
     def _combat_execute(self):
-        """
-        执行战斗。
+        """监控演习战斗执行全过程直至结算或 SL 退出。
 
         Returns:
-            bool: 胜利返回 True，退出返回 False。
+            bool: 战斗胜利或自然完成返回 True，血量过低 SL 退出返回 False。
+
+        Pages:
+            in: 战斗画面
+            out: 演习主页或战斗准备界面
         """
-        logger.info('Combat execute')
+        logger.info('[演习-战斗] 执行战斗')
         self.device.stuck_record_clear()
         self.device.click_record_clear()
         self.low_hp_confirm_timer = Timer(1.5, count=2).start()
@@ -55,9 +88,9 @@ class ExerciseCombat(HpDaemon, OpponentChoose, ExerciseEquipment, Combat):
             self.device.screenshot()
             # 结束
             if self._in_exercise() or self.appear(BATTLE_PREPARATION, offset=(20, 20)):
-                logger.hr('Combat end')
+                logger.hr('战斗结束')
                 if not end:
-                    logger.warning('Combat ended without end conditions detected')
+                    logger.warning('[演习-战斗] 战斗结束但未检测到结束条件')
                 break
             p = self.is_combat_executing()
             if p:
@@ -69,39 +102,39 @@ class ExerciseCombat(HpDaemon, OpponentChoose, ExerciseEquipment, Combat):
                 self.low_hp_confirm_timer.reset()
                 # 结算 - S 或 D 评价
                 if self.appear(BATTLE_STATUS_S, interval=1):
-                    logger.info(f'{BATTLE_STATUS_S} -> {CLICK_SAFE_AREA}')
+                    logger.info(f'[演习-战斗] {BATTLE_STATUS_S} -> {CLICK_SAFE_AREA}')
                     self.device.click(CLICK_SAFE_AREA)
                     success = True
                     end = True
                     battle_status_detected = True
                     continue
                 if self.appear(BATTLE_STATUS_D, interval=1):
-                    logger.info(f'{BATTLE_STATUS_D} -> {CLICK_SAFE_AREA}')
+                    logger.info(f'[演习-战斗] {BATTLE_STATUS_D} -> {CLICK_SAFE_AREA}')
                     self.device.click(CLICK_SAFE_AREA)
                     success = True
                     end = True
                     battle_status_detected = True
-                    logger.info("Exercise LOST")
+                    logger.info('[演习-战斗] 演习失败')
                     continue
 
             # 仅在战斗结算后处理 GET_ITEMS_1
             if battle_status_detected and self.appear(GET_ITEMS_1, offset=(30, 30), interval=1):
-                logger.info(f'{GET_ITEMS_1} -> {CLICK_SAFE_AREA}')
+                logger.info(f'[演习-战斗] {GET_ITEMS_1} -> {CLICK_SAFE_AREA}')
                 self.device.click(CLICK_SAFE_AREA)
                 continue
             if self.appear(EXP_INFO_S, interval=1):
-                logger.info(f'{EXP_INFO_S} -> {CLICK_SAFE_AREA}')
+                logger.info(f'[演习-战斗] {EXP_INFO_S} -> {CLICK_SAFE_AREA}')
                 self.device.click(CLICK_SAFE_AREA)
                 continue
             if self.appear(EXP_INFO_D, interval=1):
-                logger.info(f'{EXP_INFO_D} -> {CLICK_SAFE_AREA}')
+                logger.info(f'[演习-战斗] {EXP_INFO_D} -> {CLICK_SAFE_AREA}')
                 self.device.click(CLICK_SAFE_AREA)
                 continue
             # 最后的 D 评价画面
             if self.appear_then_click(OPTS_INFO_D, offset=(30, 30), interval=1):
                 success = True
                 end = True
-                logger.info("Exercise LOST")
+                logger.info('[演习-战斗] 演习失败')
                 continue
             # 退出
             if self.handle_combat_quit():
@@ -114,7 +147,7 @@ class ExerciseCombat(HpDaemon, OpponentChoose, ExerciseEquipment, Combat):
                 continue
             if not end:
                 if p and self._at_low_hp(image=self.device.image, pause=pause):
-                    logger.info('Exercise quit')
+                    logger.info('[演习-战斗] 退出演习')
                     if pause_interval.reached():
                         self.device.click(p)
                         pause_interval.reset()
@@ -137,13 +170,17 @@ class ExerciseCombat(HpDaemon, OpponentChoose, ExerciseEquipment, Combat):
         return success
 
     def _choose_opponent(self, index, skip_first_screenshot=True):
-        """
-        选择对手。
+        """选择指定位置的对手并点击进入准备界面。
 
         Args:
-            index (int): 从左到右，0 到 3。
+            index (int): 对手位置索引，从左到右 0 到 3。
+            skip_first_screenshot (bool): 是否跳过首次截图，默认 True。
+
+        Pages:
+            in: EXERCISE_CHECK
+            out: BATTLE_PREPARATION
         """
-        logger.hr('Opponent: %s' % str(index))
+        logger.hr('对手: %s' % str(index))
         opponent_timer = Timer(5)
         preparation_timer = Timer(5)
 
@@ -168,28 +205,33 @@ class ExerciseCombat(HpDaemon, OpponentChoose, ExerciseEquipment, Combat):
                 break
 
     def _preparation_quit(self):
-        logger.info('Preparation quit')
+        """从战斗准备界面退回演习主页面。
+
+        Pages:
+            in: BATTLE_PREPARATION
+            out: EXERCISE_CHECK
+        """
+        logger.info('[演习-战斗] 退出准备界面')
         self.ui_back(check_button=self._in_exercise, appear_button=BATTLE_PREPARATION, skip_first_screenshot=True)
 
     def _combat(self, opponent):
-        """
-        执行一次战斗。
+        """对指定对手执行一次或多次尝试战斗。
 
         Args:
-            opponent(int): 从左到右，0 到 3。
+            opponent (int): 对手位置索引，从左到右 0 到 3。
 
         Returns:
-            bool: 胜利返回 True，挑战次数耗尽返回 False。
+            bool: 战斗胜利返回 True，达到重试上限失败返回 False。
         """
         self._choose_opponent(opponent)
 
         trial = self.config.Exercise_OpponentTrial
         if not isinstance(trial, int) or trial < 1:
-            logger.warning(f'Invalid Exercise.OpponentTrial: {trial}, revise to 1')
+            logger.warning(f'[演习-战斗] 无效的对手尝试次数: {trial}，修正为1')
             self.config.Exercise_OpponentTrial = 1
 
         for n in range(1, self.config.Exercise_OpponentTrial + 1):
-            logger.hr('Try: %s' % n)
+            logger.hr('尝试: %s' % n)
             self._combat_preparation()
             success = self._combat_execute()
             if success:
@@ -197,23 +239,3 @@ class ExerciseCombat(HpDaemon, OpponentChoose, ExerciseEquipment, Combat):
 
         self._preparation_quit()
         return False
-
-    def equipment_take_off_when_finished(self):
-        if self.config.EXERCISE_FLEET_EQUIPMENT is None:
-            return False
-        if not self.equipment_has_take_on:
-            return False
-
-        self._choose_opponent(0)
-        super().equipment_take_off()
-        self._preparation_quit()
-
-    # def equipment_take_on(self):
-    #     if self.config.EXERCISE_FLEET_EQUIPMENT is None:
-    #         return False
-    #     if self.equipment_has_take_on:
-    #         return False
-    #
-    #     self._choose_opponent(0)
-    #     super().equipment_take_on()
-    #     self._preparation_quit()

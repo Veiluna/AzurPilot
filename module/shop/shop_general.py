@@ -1,9 +1,14 @@
+"""通用商店处理器，支持金币和钻石两种货币购买商品。
+支持 2025-08-14 新 UI 布局，可配置是否允许使用钻石。
+"""
+
 from module.base.decorator import cached_property
 from module.logger import logger
 from module.shop.base import ShopItemGrid, ShopItemGrid_250814
 from module.shop.clerk import ShopClerk
 from module.shop.shop_status import ShopStatus
 from module.shop.ui import ShopUI
+from module.ui.page import page_meowfficer
 
 
 class GeneralShop_250814(ShopClerk, ShopUI, ShopStatus):
@@ -72,15 +77,16 @@ class GeneralShop_250814(ShopClerk, ShopUI, ShopStatus):
         while 1:
             self._currency = self.status_get_gold_coins()
             self.gems = self.status_get_gems()
-            logger.info(f'Gold coins: {self._currency}, Gems: {self.gems}')
+            logger.info(f'[商店-货币] 金币: {self._currency}, 钻石: {self.gems}')
 
             if self.currency_rechecked >= 3:
-                logger.warning('Failed to handle fix currency bug in general shop, skip')
+                logger.warning('[商店-货币] 无法修复通用商店货币bug，跳过')
                 break
 
             break
 
         return self._currency
+
 
     def shop_check_item(self, item):
         """检查商品是否可购买（基于货币余额）。
@@ -107,8 +113,8 @@ class GeneralShop_250814(ShopClerk, ShopUI, ShopStatus):
     def shop_check_custom_item(self, item):
         """检查自定义商品是否满足特定购买条件。
 
-        处理需要特殊判断的商品，如金币余额超过 550000 时
-        自动购买金币商品，或购买装备外观箱。
+        处理需要特殊判断的商品，如物资超过 ConsumeCoins 阈值时
+        自动购买消耗物资的商品，或购买装备外观箱。
 
         Args:
             item: 待检查的商品对象
@@ -116,18 +122,96 @@ class GeneralShop_250814(ShopClerk, ShopUI, ShopStatus):
         Returns:
             bool: 是否为满足条件的自定义商品
         """
-        if self.config.GeneralShop_ConsumeCoins and self._currency >= 550000:
-            if item.cost == 'Coins':
-                return True
+        consume_coins = self.config.GeneralShop_ConsumeCoins
+        # 阈值验证：必须 > 0 且 <= 600000
+        # 类型安全由 run() → _validate_config_values() 中的规范化保证
+        if consume_coins > 0 and consume_coins <= 600000:
+            if self._currency >= consume_coins:
+                if item.cost == 'Coins':
+                    return True
 
         if self.config.GeneralShop_BuySkinBox:
             if (not item.is_known_item()) and item.amount == 1 and item.cost == 'Coins' and item.price == 7000:
                 # 装备外观箱无法通过模板匹配识别（颜色和外观持续变化）
-                logger.info(f'Item {item} is considered to be an equip skin box')
+                logger.info(f'[商店-商品] 物品 {item} 被认为是装备外观箱')
                 if self._currency >= item.price:
                     return True
 
         return False
+
+    @staticmethod
+    def _normalize_threshold(value, name):
+        """验证并修正阈值配置值。
+
+        检测值是否为有效的 int 类型（排除 bool）且在 0-600000 范围内，
+        无效则返回 0 并记录警告。有效范围：0 表示关闭功能，1-600000 表示启用。
+
+        Args:
+            value: 待验证的阈值。
+            name: 配置项名称（用于日志）。
+
+        Returns:
+            int: 规范化后的阈值（0 或有效范围内的 int）。
+        """
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 600000:
+            return value
+        logger.warning(f'[商店-配置] {name}={value}，无效值（期望0-600000的整数），'
+                       f'设置为0以禁用功能')
+        return 0
+
+    def _meowfficer_overflow_buy(self):
+        """金币溢出时自动购买猫箱。
+
+        当金币超过 OverflowCoins 阈值时，导航到指挥喵界面购买猫箱，
+        直到金币降至阈值以下或达到每日15个购买限制。
+        阈值范围 1-600000，超出范围视为无效并跳过功能。
+
+        Pages: in: page_shop, out: page_main
+        """
+        overflow_coins = self.config.GeneralShop_OverflowCoins
+
+        # 阈值检查：<= 0 表示功能关闭
+        # 类型安全由 run() → _validate_config_values() 中的规范化保证
+        if overflow_coins <= 0:
+            return
+
+        # 重新OCR识别金币（购买消耗物资后金币可能已变化）
+        self.shop_currency()
+        if self._currency <= overflow_coins:
+            logger.info(f'[商店-溢出] 金币 {self._currency} <= 溢出阈值 {overflow_coins}，跳过指挥喵溢出购买')
+            return
+
+        logger.hr('指挥喵溢出购买', level=1)
+        logger.info(f'[商店-溢出] 金币 {self._currency} > 溢出阈值 {overflow_coins}，触发指挥喵溢出购买')
+
+        # 导航到指挥喵界面
+        self.ui_goto(page_meowfficer)
+
+        # 等待界面加载完成
+        from module.meowfficer.buy import MeowfficerBuy
+        meow = MeowfficerBuy(config=self.config, device=self.device)
+        meow.wait_meowfficer_buttons()
+
+        # 执行猫箱溢出购买
+        meow.meow_overflow_buy(overflow_coins=overflow_coins)
+
+        # 返回主界面
+        self.ui_goto_main()
+
+    def _validate_config_values(self):
+        """验证并修正配置值。
+
+        检测 ConsumeCoins 和 OverflowCoins 的异常值（不在 0-600000 范围内，
+        或类型非 int（如旧数据中的 bool）），并将异常值强制设置为零。
+
+        有效范围：0 表示关闭功能，1-600000 表示启用功能并设置阈值。
+        必须为 int 类型：Python 中 bool 是 int 的子类，True > 0 恒为 True，
+        旧数据中的布尔值会导致消费溢出逻辑永远触发。
+        """
+        self.config.GeneralShop_ConsumeCoins = self._normalize_threshold(
+            self.config.GeneralShop_ConsumeCoins, 'ConsumeCoins')
+        self.config.GeneralShop_OverflowCoins = self._normalize_threshold(
+            self.config.GeneralShop_OverflowCoins, 'OverflowCoins')
 
     def run(self):
         """运行通用商店购买流程。
@@ -135,13 +219,20 @@ class GeneralShop_250814(ShopClerk, ShopUI, ShopStatus):
         Pages: in: page_shop (general shop tab)
 
         按照过滤器配置购买通用商店商品，支持刷新。
+        购买完成后，若金币超过溢出阈值则自动购买猫箱。
         """
+        # Base case; exit run if filter empty
+        self._validate_config_values()
         if not self.shop_filter:
+            self._meowfficer_overflow_buy()
             return
 
+        # When called, expected to be in
+        # corrected General Shop interface
         logger.hr('General Shop', level=1)
 
-        # 执行购买操作，启用刷新时最多尝试 2 次
+        # Execute buy operations
+        # Refresh if enabled and available
         refresh = self.config.GeneralShop_Refresh
         for _ in range(2):
             success = self.shop_buy()
@@ -150,3 +241,4 @@ class GeneralShop_250814(ShopClerk, ShopUI, ShopStatus):
             if refresh and self.shop_refresh():
                 continue
             break
+        self._meowfficer_overflow_buy()

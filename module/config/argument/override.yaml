@@ -49,17 +49,10 @@ GemsFarming:
     Fleet1Control: prevent_red_face
     Fleet1Recover: not_in_dormitory
     Fleet1Oath: false
+    # 支持二队出击，心情值与记录时间必须保留运行时写入，不能强制覆盖。
     Fleet2Control: prevent_red_face
     Fleet2Recover: not_in_dormitory
     Fleet2Oath: false
-  Submarine:
-    Mode:
-      display: display
-      value: do_not_use
-      option: [do_not_use, hunt_only]
-    AutoSearchMode: sub_standby
-    DistanceToBoss: use_open_ocean_support
-
 
 ThreeOilLowCost:
   Scheduler:
@@ -71,8 +64,6 @@ ThreeOilLowCost:
     # SuccessInterval: 0
     # FailureInterval: 0
   Campaign:
-    Event:
-      value: campaign_main
     Mode: normal
     UseClearMode: true
     UseFleetLock: true
@@ -97,16 +88,10 @@ ThreeOilLowCost:
     Fleet2Control: prevent_red_face
     Fleet2Recover: not_in_dormitory
     Fleet2Oath: false
-  Submarine:
-    Mode:
-      display: display
-      value: do_not_use
-      option: [do_not_use, hunt_only]
-    AutoSearchMode: sub_standby
-    DistanceToBoss: use_open_ocean_support
 
 Ambush11:
   Campaign:
+    ContinueAfterRestart: false
     Event:
       value: campaign_main
     Mode: normal
@@ -134,6 +119,7 @@ Ambush11:
     AutoSearchMode: sub_standby
     DistanceToBoss: use_open_ocean_support
   GemsFarming:
+    EventFallbackStage: '0'
     VanguardLevelMin: 1
     VanguardLevelMax: 28
 
@@ -231,6 +217,7 @@ EventSp:
     AutoSearchMode: sub_standby
 Raid:
   Campaign:
+    ContinueAfterRestart: false
     Name: dynamic
     Mode: normal
     UseClearMode: true
@@ -256,14 +243,20 @@ Raid:
     DistanceToBoss: 2_grid_to_boss
   Emotion:
     Fleet1Control: prevent_yellow_face
-    Fleet2Value: 119
-    Fleet2Record: 2020-01-01 00:00:00
+    # 当前固定使用一队；二队状态保持隐藏，但仍需保留通用心情流程的运行时写入。
+    Fleet2Value:
+      type: stored
+      value: 119
+    Fleet2Record:
+      type: stored
+      value: 2020-01-01 00:00:00
     Fleet2Control: prevent_yellow_face
     Fleet2Recover: not_in_dormitory
     Fleet2Oath: false
 
 RaidScuttle:
   Campaign:
+    ContinueAfterRestart: false
     Name: dynamic
     Event:
       type: state
@@ -279,8 +272,13 @@ Hospital:
     Fleet1Recover: not_in_dormitory
     Fleet1Oath: false
     Fleet1Onsen: false
-    Fleet2Value: 119
-    Fleet2Record: 2020-01-01 00:00:00
+    # 当前固定使用一队；二队状态保持隐藏，但仍需保留通用心情流程的运行时写入。
+    Fleet2Value:
+      type: stored
+      value: 119
+    Fleet2Record:
+      type: stored
+      value: 2020-01-01 00:00:00
     Fleet2Control: prevent_yellow_face
     Fleet2Recover: not_in_dormitory
     Fleet2Oath: false
@@ -304,6 +302,7 @@ RaidDaily:
     FailureInterval: 30
     ServerUpdate: 00:00
   Campaign:
+    ContinueAfterRestart: false
     Name: dynamic
     Mode: normal
     UseClearMode: true
@@ -318,8 +317,13 @@ RaidDaily:
     GetNewShip: false
     ReachLevel: 0
   Emotion:
-    Fleet2Value: 119
-    Fleet2Record: 2020-01-01 00:00:00
+    # 当前固定使用一队；二队状态保持隐藏，但仍需保留通用心情流程的运行时写入。
+    Fleet2Value:
+      type: stored
+      value: 119
+    Fleet2Record:
+      type: stored
+      value: 2020-01-01 00:00:00
     Fleet2Control: prevent_yellow_face
     Fleet2Recover: not_in_dormitory
     Fleet2Oath: false
@@ -335,6 +339,7 @@ Coalition:
     FailureInterval: 30
     ServerUpdate: 00:00
   Campaign:
+    ContinueAfterRestart: false
     Name: dynamic
     Event:
       type: state
@@ -344,20 +349,50 @@ Coalition:
     UseAutoSearch: false
     Use2xBook: false
     AmbushEvade: true
-#  Coalition:
-#    Mode:
-#      option: [ easy, normal, hard, ex ]
+  Coalition:
+    Mode:
+      option: [ easy, normal, hard, sp, ex ]
   StopCondition:
     MapAchievement: non_stop
     StageIncrease: false
     GetNewShip: false
     ReachLevel: 0
   Emotion:
-    Fleet2Value: 119
-    Fleet2Record: 2020-01-01 00:00:00
+    # 当前固定使用一队；二队状态保持隐藏，但仍需保留通用心情流程的运行时写入。
+    Fleet2Value:
+      type: stored
+      value: 119
+    Fleet2Record:
+      type: stored
+      value: 2020-01-01 00:00:00
     Fleet2Control: prevent_yellow_face
     Fleet2Recover: not_in_dormitory
     Fleet2Oath: false
+
+CoalitionScuttle:
+  Scheduler:
+    SuccessInterval: 30
+    FailureInterval: 30
+    ServerUpdate: 00:00
+  Campaign:
+    ContinueAfterRestart: false
+    Name: dynamic
+    Event:
+      type: state
+    Mode: normal
+    UseClearMode: true
+    UseFleetLock: true
+    UseAutoSearch: false
+    Use2xBook: false
+    AmbushEvade: true
+  Coalition:
+    Mode:
+      option: [ easy, normal, hard, ex, sp ]
+  StopCondition:
+    MapAchievement: non_stop
+    StageIncrease: false
+    GetNewShip: false
+    ReachLevel: 0
 
 CoalitionSp:
   Scheduler:
@@ -365,6 +400,7 @@ CoalitionSp:
     FailureInterval: 30
     ServerUpdate: 00:00
   Campaign:
+    ContinueAfterRestart: false
     Name: sp
     Mode: normal
     UseClearMode: true
@@ -393,6 +429,7 @@ CoalitionSp:
     FailureInterval: 30
     ServerUpdate: 00:00
   Campaign:
+    ContinueAfterRestart: false
     Name: sp
     Mode: normal
     UseClearMode: true
@@ -409,8 +446,13 @@ CoalitionSp:
     GetNewShip: false
     ReachLevel: 0
   Emotion:
-    Fleet2Value: 119
-    Fleet2Record: 2020-01-01 00:00:00
+    # 当前固定使用一队；二队状态保持隐藏，但仍需保留通用心情流程的运行时写入。
+    Fleet2Value:
+      type: stored
+      value: 119
+    Fleet2Record:
+      type: stored
+      value: 2020-01-01 00:00:00
     Fleet2Control: prevent_yellow_face
     Fleet2Recover: not_in_dormitory
     Fleet2Oath: false
@@ -437,6 +479,11 @@ Research:
     SuccessInterval: 30-60
     FailureInterval: 30-60
     ServerUpdate: 00:00
+StorageStatistics:
+  Scheduler:
+    SuccessInterval: 10080
+    FailureInterval: 60
+    ServerUpdate: 04:00
 Dorm:
   Scheduler:
     SuccessInterval: 278
@@ -451,12 +498,12 @@ Guild:
   Scheduler:
     SuccessInterval: 30
     FailureInterval: 30
-    ServerUpdate: 00:00, 06:00, 12:00, 18:00, 21:00
+    ServerUpdate: 00:00, 06:00, 12:00, 18:00
 Reward:
   Scheduler:
     SuccessInterval: 120-240
     FailureInterval: 120-240
-    ServerUpdate: 00:00
+    ServerUpdate: 00:00, 06:00, 12:00, 18:00
 ShopFrequent:
   Scheduler:
     SuccessInterval: 30
@@ -486,7 +533,7 @@ PrivateQuarters:
   Scheduler:
     SuccessInterval: 30
     FailureInterval: 30
-    ServerUpdate: 00:00
+    ServerUpdate: 03:00
 
 # ==================== Daily ====================
 
@@ -511,16 +558,33 @@ WarArchives:
     FailureInterval: 30
     ServerUpdate: 00:00
   Campaign:
+    ContinueAfterRestart: false
     Mode: normal
     AmbushEvade: true
-
-# ==================== Opsi ====================
-
-OpsiAshAssist:
+OperationHandover:
   Scheduler:
     SuccessInterval: 30
     FailureInterval: 30
     ServerUpdate: 00:00
+  Campaign:
+    ContinueAfterRestart: false
+    UseClearMode:
+      display: hide
+    UseFleetLock:
+      display: hide
+    UseAutoSearch:
+      display: hide
+    Use2xBook:
+      display: hide
+    AmbushEvade:
+      display: hide
+    UseRecommendFleet:
+      display: hide
+    DefeatWithdraw:
+      display: hide
+
+# ==================== Opsi ====================
+
 OpsiAshBeacon:
   Scheduler:
     SuccessInterval: 30
@@ -530,6 +594,11 @@ OpsiExplore:
   Scheduler:
     SuccessInterval: 0
     FailureInterval: 0
+    ServerUpdate: 00:00
+OpsiExploreCleanup:
+  Scheduler:
+    SuccessInterval: 0
+    FailureInterval: 30
     ServerUpdate: 00:00
 OpsiShop:
   Scheduler:
@@ -580,14 +649,9 @@ OpsiHazard1Leveling:
     Submarine: false
 OpsiScheduling:
   Scheduler:
-    NextRun:
-      display: hide
-    SuccessInterval:
-      display: hide
-    FailureInterval:
-      display: hide
-    ServerUpdate:
-      display: hide
+    SuccessInterval: 30
+    FailureInterval: 30
+    ServerUpdate: 00:00
 
 # ==================== Tool ====================
 

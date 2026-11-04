@@ -1,3 +1,9 @@
+"""大世界模拟器核心模块。
+
+通过蒙特卡洛模拟评估大世界（Operation Siren）行动力的最优使用策略。
+使用 Numba JIT 加速采样计算，模拟明石商店抽奖、海域净化、
+行动力消耗等随机过程，输出统计分布以辅助策略决策。
+"""
 import numpy as np
 import numba as nb
 import threading
@@ -11,19 +17,19 @@ from module.statistics.cl1_database import db
 from module.statistics.ship_exp_stats import get_ship_exp_stats
 
 from module.os_simulator.constants import *
-from module.os_simulator.plotter import OSSimulatorPlotter
+from module.os_simulator.plotter import OSSimulatorPlotter, PLOT_LOCK
 from module.os_simulator.logger import OSSLogger, TqdmToLogger
 
 @nb.njit(cache=True, fastmath=True)
 def _akashi_sample():
     """
-    不放回采样: 从 AKASHI (长度24) 中选6个。
+    不放回采样：从 AKASHI 的 28 个选项中选 6 个。
     """
     total = 0.0
     mask = 0
     for _ in range(6):
         while True:
-            idx = np.random.randint(0, 24)
+            idx = np.random.randint(0, len(AKASHI))
             if not ((mask >> idx) & 1):
                 mask |= (1 << idx)
                 total += AKASHI[idx]
@@ -44,7 +50,7 @@ def _handle_akashi(s, akashi_prob, deterministic):
         s[AP] += reward
         s[COIN] -= reward * 40.0
 
-@nb.njit(cache=True, fastmath=True)
+@nb.njit(cache=True, fastmath=True, nogil=True)
 def _simulate_one(
     init_ap, init_coin,
     total_time, meow_hazard_level,
@@ -57,9 +63,33 @@ def _simulate_one(
     deterministic,
     record_history=False
 ):
-    """
-    模拟单个样本的核心循环。
+    """模拟单个样本的核心循环。
+
     支持 record_history 模式以记录轨迹。
+
+    Args:
+        init_ap (float): 初始行动力。
+        init_coin (float): 初始黄币。
+        total_time (float): 模拟总时长（秒）。
+        meow_hazard_level (int): 耄耋相接侵蚀等级。
+        coin_preserve (float): 保留黄币。
+        coin_threshold (float): 离开耄耋相接所需获得的黄币阈值。
+        ap_preserve (float): 保留行动力（低于此值判定坠机）。
+        coin_expect_cl1 (float): 侵蚀1每轮期望黄币。
+        coin_expect_meow (float): 耄耋相接每轮期望黄币。
+        modified_cl1_time (float): 考虑利用率修正后的侵蚀1单轮耗时。
+        modified_meow_time (float): 考虑利用率修正后的耄耋相接单轮耗时。
+        akashi_prob (float): 遇见明石概率。
+        daily_reward (float): 每日任务黄币。
+        stronghold_reward (float): 要塞黄币。
+        cross_week (bool): 是否计算跨周。
+        buy_ap (bool): 是否每周购买行动力。
+        days_until_next_monday (int): 距离下周一的天数。
+        deterministic (bool): 是否为确定性模式。
+        record_history (bool, optional): 是否记录历史轨迹。默认 False。
+
+    Returns:
+        tuple: (最终状态向量, 时间数组, 行动力数组, 黄币数组, 状态数组, 轨迹长度)。
     """
     s = np.zeros(8, dtype=np.float64)
     s[AP], s[COIN], s[STATUS] = init_ap, init_coin, 0.0
@@ -136,8 +166,18 @@ def _simulate_one(
 
     return s, hist_time[:hist_idx], hist_ap[:hist_idx], hist_coin[:hist_idx], hist_status[:hist_idx], hist_idx
 
-@nb.njit(cache=True, parallel=True, fastmath=True)
+@nb.njit(cache=True, parallel=True, fastmath=True, nogil=True)
 def _simulate_batch_kernel(results, record_multi, grid_ap, grid_coin, grid_crash, *params):
+    """批量模拟内核函数（并行加速执行）。
+
+    Args:
+        results (np.ndarray): 存储各样本最终结果的二维数组。
+        record_multi (bool): 是否记录多样本轨迹网格数据。
+        grid_ap (np.ndarray): 批次行动力网格数组。
+        grid_coin (np.ndarray): 批次黄币网格数组。
+        grid_crash (np.ndarray): 批次坠机标记网格数组。
+        *params: 传递给 _simulate_one 的各项模拟参数。
+    """
     for i in nb.prange(len(results)):
         res, h_time, h_ap, h_coin, h_status, h_len = _simulate_one(*params, record_multi)
         results[i] = res
@@ -163,15 +203,30 @@ def _simulate_batch_kernel(results, record_multi, grid_ap, grid_coin, grid_crash
                 grid_crash[i, j] = has_crashed
 
 class OSSimulator:
-    def __init__(self):
+    """大世界蒙特卡洛模拟器。
+
+    负责加载模拟参数、调用 JIT 内核分批执行模拟计算，
+    并汇总统计最终行动力、黄币、刷图次数、坠机概率等指标。
+    """
+
+    def __init__(self, figure_directory=None):
+        """初始化大世界模拟器。"""
         self.logger = OSSLogger()
-        self.plotter = OSSimulatorPlotter(self.logger)
+        self.plotter = OSSimulatorPlotter(self.logger, directory=figure_directory)
         self.config = None
         self.history_single = {}
         self._thread = None
         self._stop_event = threading.Event()
+        self._lock = threading.RLock()
+        self.state = 'idle'
+        self.error = ''
+        self.completed_samples = 0
+        self.total_samples = 0
+        self.result = None
+        self.run_id = 0
 
     def _get_azurstat_data(self):
+        """读取海域黄币期望与明石概率等统计基准数据。"""
         # 预计之后使用azurstat统计数据，目前先这样吧（
         
         # 目前包括吊机
@@ -183,40 +238,41 @@ class OSSimulator:
             3: meow3_coin,
             5: meow5_coin
         }
-        self.logger.info(f'每轮对应侵蚀等级期望获得黄币: {self.coin_expectation}')
+        self.logger.info(f'[大世界模拟器] 每轮对应侵蚀等级期望获得黄币: {self.coin_expectation}')
         
         self.akashi_probability = self.config.cross_get('OpsiSimulator.OpsiSimulatorParameters.AkashiProbability')
-        self.logger.info(f'遇见明石概率: {self.akashi_probability}')
+        self.logger.info(f'[大世界模拟器] 遇见明石概率: {self.akashi_probability}')
 
         self.daily_reward = 6520
-        self.logger.info(f'每日任务获得黄币: {self.daily_reward}')
+        self.logger.info(f'[大世界模拟器] 每日任务获得黄币: {self.daily_reward}')
         
         self.stronghold_reward = 40000
-        self.logger.info(f'每周要塞期望获得黄币: {self.stronghold_reward}')
+        self.logger.info(f'[大世界模拟器] 每周要塞期望获得黄币: {self.stronghold_reward}')
     
     def get_paras(self):
+        """从配置中加载大世界模拟器所需的所有参数。"""
         self.config.load()
         
         self.samples = self.config.cross_get('OpsiSimulator.OpsiSimulatorParameters.Samples')
-        self.logger.info(f'样本数: {self.samples}')
+        self.logger.info(f'[大世界模拟器] 样本数: {self.samples}')
 
         self.draw_setting = self.config.cross_get('OpsiSimulator.OpsiSimulatorParameters.Draw')
-        self.logger.info(f'绘图设置: {self.draw_setting}')
+        self.logger.info(f'[大世界模拟器] 绘图设置: {self.draw_setting}')
         
         self.total_time = self.config.cross_get('OpsiSimulator.OpsiSimulatorParameters.TotalTime')
         if not self.total_time:
             self.total_time = self._get_remaining_seconds()
-        self.logger.info(f'总模拟时间 (s): {self.total_time}')
+        self.logger.info(f'[大世界模拟器] 总模拟时间 (s): {self.total_time}')
         
         self.time_use_ratio = self.config.cross_get('OpsiSimulator.OpsiSimulatorParameters.TimeUseRatio')
-        self.logger.info(f'时间利用率: {self.time_use_ratio}')
+        self.logger.info(f'[大世界模拟器] 时间利用率: {self.time_use_ratio}')
         
         hazard_level = self.config.cross_get('OpsiSimulator.OpsiSimulatorParameters.MeowHazardLevel', 'level5')
         if hazard_level == 'level3':
             self.meow_hazard_level = 3
         else:
             self.meow_hazard_level = 5
-        self.logger.info(f'短猫侵蚀等级: {self.meow_hazard_level}')
+        self.logger.info(f'[大世界模拟器] 耄耋相接侵蚀等级: {self.meow_hazard_level}')
         
         log_res = LogRes(self.config)
         ap = self.config.cross_get('OpsiSimulator.OpsiSimulatorParameters.InitialAp')
@@ -230,64 +286,76 @@ class OSSimulator:
 
         self.init_ap = float(ap)
         self.init_coin = float(coin)
-        self.logger.info(f'初始黄币: {coin}')
-        self.logger.info(f'初始行动力: {ap}')
+        self.logger.info(f'[大世界模拟器] 初始黄币: {coin}')
+        self.logger.info(f'[大世界模拟器] 初始行动力: {ap}')
 
         self.cross_week = self.config.cross_get('OpsiSimulator.OpsiSimulatorParameters.CrossWeek')
-        self.logger.info(f'是否计算跨周: {self.cross_week}')
+        self.logger.info(f'[大世界模拟器] 是否计算跨周: {self.cross_week}')
 
         self.buy_ap = self.config.cross_get('OpsiSimulator.OpsiSimulatorParameters.BuyAp')
-        self.logger.info(f'每周是否购买行动力: {self.buy_ap}')
+        self.logger.info(f'[大世界模拟器] 每周是否购买行动力: {self.buy_ap}')
         
         self.coin_preserve = self.config.cross_get('OpsiScheduling.OpsiScheduling.OperationCoinsPreserve')
-        self.logger.info(f'保留黄币: {self.coin_preserve}')
+        self.logger.info(f'[大世界模拟器] 保留黄币: {self.coin_preserve}')
         self.ap_preserve = self.config.cross_get('OpsiScheduling.OpsiScheduling.ActionPointPreserve')
-        self.logger.info(f'保留行动力: {self.ap_preserve}')
+        self.logger.info(f'[大世界模拟器] 保留行动力: {self.ap_preserve}')
         self.coin_threshold = self.config.cross_get('OpsiScheduling.OpsiScheduling.OperationCoinsReturnThreshold')
-        self.logger.info(f'短猫直到获得多少黄币: {self.coin_threshold}')
+        self.logger.info(f'[大世界模拟器] 耄耋相接直到获得多少黄币: {self.coin_threshold}')
         
         self.instance_name = getattr(self.config, 'config_name', 'default')
-        self.logger.info(f'实例名: {self.instance_name}')
+        self.logger.info(f'[大世界模拟器] 实例名: {self.instance_name}')
         
         if self.meow_hazard_level == 3:
             self.meow_time = self.config.cross_get('OpsiSimulator.OpsiSimulatorParameters.Meow3Time')
             if not self.meow_time:
-                # 尝试从数据库获取短猫统计，如果不区分等级则统一使用平均值
-                self.meow_time = db.get_meow_stats(self.instance_name).get('avg_round_time', 100)
+                # 尝试从数据库获取耄耋相接统计，如果不区分等级则统一使用平均值
+                self.meow_time = db.get_meow_stats(self.instance_name).get('avg_round_time') or 100
         else: # hazard level 5
             self.meow_time = self.config.cross_get('OpsiSimulator.OpsiSimulatorParameters.Meow5Time')
             if not self.meow_time:
-                self.meow_time = db.get_meow_stats(self.instance_name).get('avg_round_time', 200)
+                self.meow_time = db.get_meow_stats(self.instance_name).get('avg_round_time') or 200
         
-        self.logger.info(f'每轮短猫时间: {self.meow_time}')
+        self.logger.info(f'[大世界模拟器] 每轮耄耋相接时间: {self.meow_time}')
 
         self.cl1_time = self.config.cross_get('OpsiSimulator.OpsiSimulatorParameters.Cl1Time')
         if not self.cl1_time:
             self.cl1_time = get_ship_exp_stats(self.instance_name).get_average_round_time()
-        self.logger.info(f'每轮侵蚀1时间: {self.cl1_time}')
+        self.logger.info(f'[大世界模拟器] 每轮侵蚀1时间: {self.cl1_time}')
         
         self.days_until_next_monday = self._get_days_until_next_monday()
-        self.logger.info(f'距离下周一还有多少天: {self.days_until_next_monday}')
+        self.logger.info(f'[大世界模拟器] 距离下周一还有多少天: {self.days_until_next_monday}')
 
         # 调试模式开关：设置为 True 则取消随机性，按照期望值计算演化
         self.deterministic = self.config.cross_get('OpsiSimulator.OpsiSimulatorParameters.Deterministic', False)
         if self.deterministic:
             self.samples = 1
-            self.logger.info('调试模式：使用确定性计算。采样数已强制设置为 1 以提高计算速度。')
-            self.logger.info('（不使用随机概率，按期望演化）')
+            self.logger.info('[大世界模拟器] 调试模式：使用确定性计算。采样数已强制设置为 1 以提高计算速度。')
+            self.logger.info('[大世界模拟器] （不使用随机概率，按期望演化）')
+
+        if type(self.samples) is not int or self.samples <= 0:
+            raise ValueError('样本数必须为正整数')
+        if not np.isfinite(self.time_use_ratio) or not 0 < self.time_use_ratio <= 1:
+            raise ValueError('时间利用率必须大于 0 且不超过 1')
+        for label, value in [('总模拟时间', self.total_time), ('侵蚀1单轮时间', self.cl1_time),
+                             ('耄耋相接单轮时间', self.meow_time)]:
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f'{label}必须为正数')
+        self.total_samples = self.samples
 
         # 修正后的单轮时间：包含了因"时间利用率"不足而产生的空闲时间，用于正确计算AP的自然恢复
         self.modified_meow_time = self.meow_time / self.time_use_ratio
         self.modified_cl1_time = self.cl1_time / self.time_use_ratio
 
         self._get_azurstat_data()
+        if not np.isfinite(self.akashi_probability) or not 0 <= self.akashi_probability <= 1:
+            raise ValueError('遇见明石概率必须在 0 到 1 之间')
 
     def precompile(self):
-        """
-        预编译 Numba 函数，确保正式模拟时达到最高速度。
+        """预编译 Numba 函数，确保正式模拟时达到最高速度。
+
         即使已从缓存加载，也会在日志输出时间。
         """
-        self.logger.info("检查预编译状态（第一次运行时会耗费一定时间）...")
+        self.logger.info("[大世界模拟器] 检查预编译状态（第一次运行时会耗费一定时间）...")
         start_time = time.perf_counter()
         
         # 1. 编译基础采样函数
@@ -311,17 +379,28 @@ class OSSimulator:
         _simulate_batch_kernel(np.empty((1, 8), dtype=np.float64), False, dummy_grid, dummy_grid, dummy_grid, *_params)
         
         elapsed = time.perf_counter() - start_time
-        self.logger.info(f"预编译检查完成，用时: {elapsed:.3f}s")
+        self.logger.info(f"[大世界模拟器] 预编译检查完成，用时: {elapsed:.3f}s")
     
     @property
     def is_running(self):
+        """判断模拟线程是否正在运行。
+
+        Returns:
+            bool: 线程是否活跃。
+        """
         return bool(self._thread and self._thread.is_alive())
     
     @property
     def figure(self):
+        """获取生成的图表路径。
+
+        Returns:
+            str: 图表文件路径。
+        """
         return self.plotter.result_figure_path
     
     def _run(self):
+        """模拟器线程工作主函数。"""
         try:
             if not self.config:
                 raise ValueError('缺少配置')
@@ -329,38 +408,78 @@ class OSSimulator:
             self.get_paras()
 
             if self.meow_hazard_level not in self.coin_expectation:
-                raise ValueError(f'不支持的短猫侵蚀等级: {self.meow_hazard_level}')
+                raise ValueError(f'不支持的耄耋相接侵蚀等级: {self.meow_hazard_level}')
 
             self.precompile()
 
-            self.logger.info("开始模拟...")
+            if self._stop_event.is_set():
+                self.state = 'interrupted'
+                return
+
+            self.logger.info("[大世界模拟器] 开始模拟...")
             start_time = time.time()
             result = self.simulate()
-            self.logger.info(f"模拟完成，用时: {time.time() - start_time:.2f}秒")
-            self._handle_result(result)
+            if len(result):
+                self._handle_result(result)
+            with self._lock:
+                self.state = 'interrupted' if self._stop_event.is_set() else 'completed'
+            self.logger.info(f"[大世界模拟器] {'模拟中断' if self.state == 'interrupted' else '模拟完成'}，"
+                             f"用时: {time.time() - start_time:.2f}秒")
         except Exception as e:
-            self.logger.exception(f"运行中出现错误: {e}")
+            with self._lock:
+                self.error = str(e)
+                self.state = 'failed'
+            self.logger.exception(f"[大世界模拟器] 运行中出现错误: {e}")
     
     def set_config(self, config: AzurLaneConfig):
+        """设置模拟器配置对象。
+
+        Args:
+            config (AzurLaneConfig): 配置实例。
+        """
         self.config = config
 
     def start(self):
-        if self.is_running:
-            self.logger.warning("模拟正在进行，请耐心等待")
-            return
-
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run)
-        self._thread.start()
+        """启动后台线程开始模拟计算。"""
+        with self._lock:
+            if self.is_running:
+                self.logger.warning("[大世界模拟器] 模拟正在进行，请耐心等待")
+                return False
+            self._stop_event.clear()
+            self.state, self.error, self.result = 'running', '', None
+            self.run_id += 1
+            self.completed_samples = self.total_samples = 0
+            self.history_single = {}
+            self.history_multi_avg = {}
+            self.plotter.result_figure_path = ''
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+            return True
     
     def interrupt(self):
-        if self.is_running:
-            self.logger.info("等待模拟中断")
-            self._stop_event.set()
-        else:
-            self.logger.info("无正在进行的模拟")
+        """中断当前正在运行的模拟。"""
+        with self._lock:
+            if self.is_running:
+                self.logger.info("[大世界模拟器] 等待模拟中断")
+                self.state = 'stopping'
+                self._stop_event.set()
+            else:
+                self.logger.info("[大世界模拟器] 无正在进行的模拟")
+
+    def snapshot(self):
+        """读取后台计算状态，结果仅在汇总完成后发布。"""
+        with self._lock:
+            return {'state': self.state, 'running': self.is_running,
+                    'runId': self.run_id,
+                    'completedSamples': self.completed_samples, 'totalSamples': self.total_samples,
+                    'error': self.error, 'result': self.result, 'figure': self.figure or None}
 
     def _get_remaining_seconds(self):
+        """计算距离次月1日重置的剩余秒数。
+
+        Returns:
+            float: 剩余秒数。
+        """
         now = datetime.now()
         if now.month == 12:
             next_month = datetime(now.year + 1, 1, 1)
@@ -369,14 +488,25 @@ class OSSimulator:
         return (next_month - now).total_seconds()
 
     def _get_days_until_next_monday(self):
+        """计算距离下周一的天数。
+
+        Returns:
+            int: 距离天数（1-7）。
+        """
         now = datetime.now()
         current_weekday = now.weekday()
         days_ahead = 7 - current_weekday
         return days_ahead
     
     def simulate(self):
+        """执行全量蒙特卡洛模拟。
+
+        Returns:
+            np.ndarray: 所有样本的模拟结果矩阵。
+        """
         if not hasattr(self, 'init_ap'):
             self.get_paras()
+        self.completed_samples = 0
         
         # 准备传给 Numba kernel 的参数
         coin_expect_cl1 = float(self.coin_expectation[1])
@@ -430,7 +560,7 @@ class OSSimulator:
         )
 
         # 绘图历史（仅 single_sample 时记录 sample 0）
-        if record_single and self.samples > 0:
+        if record_single and self.samples > 0 and not self._stop_event.is_set():
             result, h_time, h_ap, h_coin, h_status, h_len = _simulate_one(*params, True)
             results[0] = result
             self.history_single = {
@@ -440,11 +570,12 @@ class OSSimulator:
                 'status': h_status.tolist()
             }
             start_idx = 1
+            self.completed_samples = 1
             pbar.update(1)
 
         for i in range(start_idx, self.samples, batch_size):
             if self._stop_event.is_set():
-                self.logger.info("模拟中断")
+                self.logger.info("[大世界模拟器] 模拟中断")
                 break
             
             this_batch = min(batch_size, self.samples - i)
@@ -467,11 +598,12 @@ class OSSimulator:
                 grid_coin_sq += np.sum(cur_batch_grid_coin ** 2, axis=0)
                 
             pbar.update(this_batch)
+            self.completed_samples = i + this_batch
         
         pbar.close()
 
-        if record_multi and self.samples > 0:
-            completed = self.samples
+        if record_multi and self.completed_samples > 0:
+            completed = self.completed_samples
             mean_ap = grid_ap_sum / completed
             mean_coin = grid_coin_sum / completed
             mean_crash = grid_crash_sum / completed
@@ -489,27 +621,41 @@ class OSSimulator:
                 'crash': mean_crash
             }
 
-        return results
+        # 中断后的尾部尚未初始化，不能参与均值和概率计算。
+        return results[:self.completed_samples]
     
     def _handle_result(self, result):
-        self.logger.info('====================模拟结果====================')
+        """处理并打印模拟结果，触发图表绘制。
+
+        Args:
+            result (np.ndarray): 模拟结果数组。
+        """
+        self.logger.info('[大世界模拟器] ====================模拟结果====================')
 
         self.result_cl1_count = np.mean(result[:, CL1_COUNT])
-        self.logger.info(f'[模拟结果] 侵蚀1次数: {self.result_cl1_count}')
+        self.logger.info(f'[大世界模拟器] [模拟结果] 侵蚀1次数: {self.result_cl1_count}')
         self.result_meow_count = np.mean(result[:, MEOW_COUNT])
-        self.logger.info(f'[模拟结果] 短猫次数: {self.result_meow_count}')
+        self.logger.info(f'[大世界模拟器] [模拟结果] 耄耋相接次数: {self.result_meow_count}')
         self.result_crashed_probability = np.mean(result[:, HAS_CRASHED])
-        self.logger.info(f'[模拟结果] 坠机概率: {self.result_crashed_probability}')
+        self.logger.info(f'[大世界模拟器] [模拟结果] 坠机概率: {self.result_crashed_probability}')
         self.result_cl1_total_time = self.result_cl1_count * self.cl1_time
-        self.logger.info(f'[模拟结果] 侵蚀一总时长 (h): {self.result_cl1_total_time / 3600}')
+        self.logger.info(f'[大世界模拟器] [模拟结果] 侵蚀一总时长 (h): {self.result_cl1_total_time / 3600}')
         self.result_meow_total_time = self.result_meow_count * self.meow_time
-        self.logger.info(f'[模拟结果] 短猫总时长 (h): {self.result_meow_total_time / 3600}')
+        self.logger.info(f'[大世界模拟器] [模拟结果] 耄耋相接总时长 (h): {self.result_meow_total_time / 3600}')
         self.result_ap = np.mean(result[:, AP])
-        self.logger.info(f'[模拟结果] 最终行动力: {self.result_ap}')
+        self.logger.info(f'[大世界模拟器] [模拟结果] 最终行动力: {self.result_ap}')
         self.result_coin = np.mean(result[:, COIN])
-        self.logger.info(f'[模拟结果] 最终黄币: {self.result_coin}')
+        self.logger.info(f'[大世界模拟器] [模拟结果] 最终黄币: {self.result_coin}')
 
-        if self.draw_setting == 'single_sample':
-            self.plotter.plot_single_sample_history(self.history_single)
-        elif self.draw_setting == 'multi_sample':
-            self.plotter.plot_multi_sample_history(result, self.history_multi_avg)
+        with PLOT_LOCK:
+            if self.draw_setting == 'single_sample':
+                self.plotter.plot_single_sample_history(self.history_single)
+            elif self.draw_setting == 'multi_sample':
+                self.plotter.plot_multi_sample_history(result, self.history_multi_avg)
+        with self._lock:
+            self.result = {
+                'cl1Count': float(self.result_cl1_count), 'meowCount': float(self.result_meow_count),
+                'crashedProbability': float(self.result_crashed_probability),
+                'cl1Time': float(self.result_cl1_total_time), 'meowTime': float(self.result_meow_total_time),
+                'ap': float(self.result_ap), 'coin': float(self.result_coin),
+            }

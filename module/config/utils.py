@@ -1,9 +1,23 @@
+"""配置管理工具函数集。
+
+提供配置系统所需的底层工具函数，包括：
+- 文件读写：JSON/YAML 文件的安全读写（原子写入）
+- 数据解析：配置值的类型转换和解析
+- 服务器时间：各服务器时区计算和重置时间
+- 路径管理：配置文件、资源文件、i18n 文件的路径解析
+- 随机 ID：配置实例的唯一标识生成
+
+常量定义：
+- LANGUAGES: 支持的语言列表（zh-CN、en-US、ja-JP、zh-TW）
+- SERVER_TO_LANG: 服务器到语言的映射
+- SERVER_TO_TIMEZONE: 服务器到时区的映射
+"""
+
 # 此文件提供了配置管理相关的通用工具函数。
 # 包含 JSON/YAML 读写、数据类型解析转换、服务器特定时间计算以及随机 ID 生成等底层功能。
 import json
 import random
 import string
-import time
 from datetime import datetime, timedelta, timezone
 
 import yaml
@@ -12,9 +26,10 @@ import module.config.server as server_
 from deploy.atomic import atomic_read_text, atomic_read_bytes, atomic_write
 from module.submodule.utils import *
 from module.base.decorator import run_once
+from module.config.time_source import now as current_time, timestamp as current_timestamp
 from module.logger import logger
 
-LANGUAGES = ['zh-CN', 'zh-MIAO', 'en-US', 'ja-JP', 'zh-TW']
+LANGUAGES = ['zh-CN', 'en-US', 'ja-JP', 'zh-TW']
 SERVER_TO_LANG = {
     'cn': 'zh-CN',
     'en': 'en-US',
@@ -30,6 +45,10 @@ SERVER_TO_TIMEZONE = {
 }
 DEFAULT_TIME = datetime(2023, 1, 1, 0, 0)
 DEFAULT_CONFIG_NAME = 'ap'
+# 实例名会拼进 ./config/<name>.json，含这些字符会越出配置目录或触发 Windows 保留名。
+# 与 module/runtime/deploy_settings.py 的 INVALID_INSTANCE_CHARS 同源，但不拦 `.`：
+# `ap.fpy` 这类模块实例本身就带点，见 filepath_config 的 mod_name。
+INVALID_CONFIG_NAME_CHARS = set('\\/:*?"\'<>|')
 
 
 # https://stackoverflow.com/questions/8640959/how-can-i-control-what-scalar-form-pyyaml-uses-for-my-data/15423007
@@ -83,7 +102,6 @@ def read_file(file):
     Returns:
         dict, list: 解析后的数据。
     """
-    print(f'read: {file}')
     if file.endswith('.json'):
         content = atomic_read_bytes(file)
         if not content:
@@ -98,7 +116,7 @@ def read_file(file):
             data = {}
         return data
     else:
-        print(f'Unsupported config file extension: {file}')
+        logger.warning(f'不支持的配置文件扩展名: {file}')
         return {}
 
 
@@ -110,7 +128,6 @@ def write_file(file, data):
         file (str): 文件路径。
         data (dict, list): 要写入的数据。
     """
-    print(f'write: {file}')
     if file.endswith('.json'):
         content = json.dumps(data, indent=2, ensure_ascii=False, sort_keys=False, default=str)
         atomic_write(file, content)
@@ -123,7 +140,7 @@ def write_file(file, data):
                 data, default_flow_style=False, encoding='utf-8', allow_unicode=True, sort_keys=False)
         atomic_write(file, content)
     else:
-        print(f'Unsupported config file extension: {file}')
+        logger.warning(f'不支持的配置文件扩展名: {file}')
 
 
 def iter_folder(folder, is_dir=False, ext=None):
@@ -180,7 +197,9 @@ def alas_template():
     for file in os.listdir('./config'):
         name, extension = os.path.splitext(file)
         if name == 'template' and extension == '.json':
-            out.append(f'{name}-alas')
+            # 主模块（template.json）在前端以 template-ap 展示，
+            # 实际模块名仍为 alas，由 get_config_mod() 负责映射回去。
+            out.append(f'{name}-{DEFAULT_CONFIG_NAME}')
 
     out.extend(list_mod_template())
 
@@ -210,6 +229,79 @@ def alas_instance():
     return out
 
 
+def parse_config_name(argv):
+    """
+    解析入口参数中的实例名。
+
+    不传参数时回退到 `DEFAULT_CONFIG_NAME`，保持 `python alas.py` 的原有行为；
+    传入实例名时按 `alas_instance()` 校验，使 AUTO-MAS 等外部调度器可以按实例
+    拉起调度器进程，并据 `get_log_file_path()` 定位该实例的运行日志。
+
+    Args:
+        argv (list[str]): 入口脚本参数，不含脚本名本身。
+
+    Returns:
+        str: 实例名。
+
+    Raises:
+        ValueError: 参数多于一个，或实例名非法、不存在。
+    """
+    argv = list(argv)
+
+    if len(argv) > 1:
+        raise ValueError(f'只接受一个实例名，收到 {len(argv)} 个参数：{" ".join(argv)}')
+    if not argv:
+        return DEFAULT_CONFIG_NAME
+
+    name = argv[0].strip()
+    if not name or name in ('.', '..') or set(name) & INVALID_CONFIG_NAME_CHARS:
+        raise ValueError(f'实例名非法：{name!r}')
+
+    try:
+        instances = alas_instance()
+    except OSError:
+        # config 目录尚未创建，交给 OOBE 检查给出首次配置提示
+        return name
+
+    if name not in instances:
+        raise ValueError(f'实例不存在：{name}')
+
+    return name
+
+
+def read_run_param(config, attr, default, minimum=None, maximum=None):
+    """读取「运行参数」页（RunParams）的参数值，非法时回退默认值。
+
+    参数在 argument.yaml 的 RunParams 页定义，config.bind() 会将该页
+    随任意任务一并绑定，以 `<Group>_<Argument>` 属性挂到 config 实例。
+    属性值在任务绑定时确定，修改配置后在下一次任务绑定（任务切换）
+    或调度器重启时生效，任务运行中途不会变化。
+
+    Args:
+        config: AzurLaneConfig 实例。
+        attr (str): 绑定属性名，如 `Watchdog_CheckInterval`。
+        default: 读取失败、类型非法时的回退值，取自
+            module/base/runtime_params.py 中对应的兜底常量。
+        minimum: 合法下限（闭区间），越界时取下限并告警。
+        maximum: 合法上限（闭区间），越界时取上限并告警。
+
+    Returns:
+        float: 参数值。
+    """
+    try:
+        value = float(getattr(config, attr, default))
+    except (TypeError, ValueError):
+        logger.warning(f'运行参数 {attr} 类型非法，回退默认值 {default}')
+        return default
+    if minimum is not None and value < minimum:
+        logger.warning(f'运行参数 {attr}={value} 低于下限 {minimum}，取下限')
+        value = minimum
+    if maximum is not None and value > maximum:
+        logger.warning(f'运行参数 {attr}={value} 高于上限 {maximum}，取上限')
+        value = maximum
+    return value
+
+
 def parse_value(value, data):
     """
     尝试将字符串转换为 float、int 或 datetime。
@@ -221,11 +313,10 @@ def parse_value(value, data):
     Returns:
         转换后的值，无法转换时返回原值。
     """
-    if 'option' in data:
-        if value not in data['option']:
-            return data['value']
-    if isinstance(value, str):
-        if value == '':
+    def parse_single(value):
+        if not isinstance(value, str):
+            return value
+        if value == '' and not data.get('preserve_empty'):
             return None
         if value == 'true' or value == 'True':
             return True
@@ -246,6 +337,26 @@ def parse_value(value, data):
         except ValueError:
             pass
 
+        return value
+
+    if data.get('type') == 'checkbox' and isinstance(value, list):
+        # PyWebIO checkbox 关闭时返回 []，打开时返回 [True]。
+        return any(bool(v) for v in value)
+
+    if data.get('type') == 'multiselect':
+        if value is None or value == '':
+            return data['value']
+        if not isinstance(value, list):
+            value = [value]
+        value = [parse_single(item) for item in value]
+        if 'option' in data and any(item not in data['option'] for item in value):
+            return data['value']
+        return value
+
+    if 'option' in data:
+        if value not in data['option']:
+            return data['value']
+    value = parse_single(value)
     return value
 
 
@@ -319,17 +430,24 @@ def dict_to_kv(dictionary, allow_none=True):
 
 
 def server_timezone() -> timedelta:
+    """获取当前游戏服务器对应的时区时差。
+
+    Returns:
+        timedelta: 与 UTC 的时间差对象。
+    """
     return SERVER_TO_TIMEZONE.get(server_.server, SERVER_TO_TIMEZONE['cn'])
 
 
 def server_time_offset() -> timedelta:
-    """
-    计算本地时间与服务器时间的偏移量。
+    """计算本地时间与服务器时间的偏移量。
 
-    本地时间转服务器时间：server_time = local_time + server_time_offset()
-    服务器时间转本地时间：local_time = server_time - server_time_offset()
+    本地时间转服务器时间：server_time = local_time - server_time_offset()
+    服务器时间转本地时间：local_time = server_time + server_time_offset()
+
+    Returns:
+        timedelta: 本地时区与游戏服务器时区的差值。
     """
-    return datetime.now(timezone.utc).astimezone().utcoffset() - server_timezone()
+    return current_time(timezone.utc).astimezone().utcoffset() - server_timezone()
 
 
 def random_normal_distribution_int(a, b, n=3):
@@ -383,6 +501,28 @@ def ensure_time(second, n=3, precision=3):
         return second
 
 
+def get_os_next_reset_after(moment):
+    """
+    获取指定时间之后的下一次大世界重置时间。
+
+    与 get_os_next_reset() 的区别：以传入时间为基准，可用来判断某个历史时间点
+    （如「上次打空隐秘/深渊的时间」）之后会先撞上哪次重置。
+
+    Args:
+        moment (datetime.datetime): 基准时间（本地时间）。
+
+    Returns:
+        datetime.datetime: 该时间之后的下一次重置的本地时间。
+    """
+    diff = server_time_offset()
+    server_moment = moment - diff
+    server_reset = (server_moment.replace(day=1) + timedelta(days=32)) \
+        .replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    server_reset = server_reset.replace(tzinfo=timezone(server_timezone()))
+    local_reset = server_reset.astimezone().replace(tzinfo=None)
+    return local_reset
+
+
 def get_os_next_reset():
     """
     获取下个月的第一天（大世界重置时间）。
@@ -390,27 +530,44 @@ def get_os_next_reset():
     Returns:
         datetime.datetime: 下次重置的本地时间。
     """
-    diff = server_time_offset()
-    server_now = datetime.now() - diff
-    server_reset = (server_now.replace(day=1) + timedelta(days=32)) \
-        .replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    local_reset = server_reset + diff
-    return local_reset
+    return get_os_next_reset_after(current_time())
 
 
 def get_os_reset_remain():
     """
-    获取距离大世界下次重置的剩余天数。
+    获取距离大世界下次重置的剩余整天数（不足一天向下取整）。
+
+    按整 24 小时计算，因此「还剩 1 天」指的是重置前的最后 24 小时。
+    要按自然日判断「距重置还有几天」请用 get_os_reset_remain_days()。
 
     Returns:
         int: 剩余天数。
     """
     next_reset = get_os_next_reset()
-    now = datetime.now()
-    logger.attr('OpsiNextReset', next_reset)
+    now = current_time()
+    logger.attr('大世界下次重置', next_reset)
 
     remain = int((next_reset - now).total_seconds() // 86400)
-    logger.attr('ResetRemain', remain)
+    logger.attr('重置剩余天数', remain)
+    return remain
+
+
+def get_os_reset_remain_days():
+    """
+    获取距离大世界下次重置的剩余自然天数（按日期计算）。
+
+    用于「距离重置还剩几天」的判断，重置前一天为 1，重置当天已是新月。
+    与 get_os_reset_remain() 的整天数不同，不会因为过了半天就跳动一天。
+
+    Returns:
+        int: 剩余自然天数。
+    """
+    next_reset = get_os_next_reset()
+    now = current_time()
+    logger.attr('大世界下次重置', next_reset)
+
+    remain = (next_reset.date() - now.date()).days
+    logger.attr('重置剩余自然天数', remain)
     return remain
 
 
@@ -428,7 +585,7 @@ def get_server_next_update(daily_trigger):
         daily_trigger = daily_trigger.replace(' ', '').split(',')
 
     diff = server_time_offset()
-    local_now = datetime.now()
+    local_now = current_time()
     trigger = []
     for t in daily_trigger:
         h, m = [int(x) for x in t.split(':')]
@@ -454,7 +611,7 @@ def get_server_last_update(daily_trigger):
         daily_trigger = daily_trigger.replace(' ', '').split(',')
 
     diff = server_time_offset()
-    local_now = datetime.now()
+    local_now = current_time()
     trigger = []
     for t in daily_trigger:
         h, m = [int(x) for x in t.split(':')]
@@ -499,7 +656,7 @@ def get_nearest_weekday_date(target):
         datetime.datetime: 最近的目标星期几的本地时间。
     """
     diff = server_time_offset()
-    server_now = datetime.now() - diff
+    server_now = current_time() - diff
 
     days_ahead = target - server_now.weekday()
     if days_ahead <= 0:
@@ -520,7 +677,7 @@ def get_server_weekday():
         int: 星期几（0=周一, 6=周日）。
     """
     diff = server_time_offset()
-    server_now = datetime.now() - diff
+    server_now = current_time() - diff
     result = server_now.weekday()
     return result
 
@@ -533,7 +690,7 @@ def get_server_monthday():
         int: 月份中的天数。
     """
     diff = server_time_offset()
-    server_now = datetime.now() - diff
+    server_now = current_time() - diff
     result = server_now.day
     return result
 
@@ -619,9 +776,15 @@ def time_delta(_timedelta):
     return _time_dict
 
 
-def readable_time(before: str, value: str) -> str:
-    """
-    计算两个时间之间的差值，返回人类可读的时间描述。
+def readable_time(before: str, value: str) -> dict:
+    """计算两个时间之间的差值，返回人类可读的时间描述。
+
+    Args:
+        before: 历史时间 ISO 格式字符串。
+        value: 默认展示值。
+
+    Returns:
+        dict: 包含 value、time 与 time_name 键的人类可读描述字典。
     """
     timedata = {
         'value': value,
@@ -640,7 +803,7 @@ def readable_time(before: str, value: str) -> str:
         timedata['value'] = 'None'
         return timedata
 
-    diff = time.time() - ti.timestamp()
+    diff = current_timestamp() - ti.timestamp()
     if diff < -1:
         timedata['time_name'] = 'TimeError'
     elif diff < 60:
@@ -659,9 +822,14 @@ def readable_time(before: str, value: str) -> str:
     return timedata
 
 @run_once
-def is_good_gpu():
+def is_good_gpu() -> bool:
+    """检测当前机器是否拥有显存 >= 1GB 的独立/高性能 GPU。
+
+    Returns:
+        bool: Windows 平台且显存 >= 1GB 返回 True，否则返回 False。
+    """
     if os.name != 'nt':
-        logger.info("当前系统为非 Windows，不使用 GPU")
+        logger.info("[Config] 当前系统为非 Windows，不使用 GPU")
         return False
 
     try:
@@ -676,14 +844,14 @@ def is_good_gpu():
                 try:
                     # AdapterRAM 单位为字节，1GB = 1073741824 字节
                     if int(line) >= 1073741824:
-                        logger.info("检测到高性能 GPU")
+                        logger.info("[Config] 检测到高性能 GPU")
                         return True
                 except (ValueError, TypeError):
                     continue
-        logger.info("未检测到高性能 GPU")
+        logger.info("[Config] 未检测到高性能 GPU")
         return False
     except Exception:
-        logger.warning("检测 GPU 性能失败")
+        logger.warning("[Config] 检测 GPU 性能失败")
         return False
     
 

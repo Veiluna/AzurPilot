@@ -1,3 +1,7 @@
+"""指挥喵猫窝处理器，执行猫窝中的日常互动获取经验值。
+包括完成日常任务和收起已放置的指挥喵。
+"""
+
 from module.base.timer import Timer
 from module.combat.assets import GET_ITEMS_1
 from module.logger import logger
@@ -6,14 +10,16 @@ from module.meowfficer.base import MeowfficerBase
 
 
 class MeowfficerFort(MeowfficerBase):
+    """指挥喵猫窝处理器。
+
+    执行猫窝中的日常互动任务以获取经验值和奖励。
+    """
+
     def meow_chores(self, skip_first_screenshot=True):
-        """
-        Loop through all chore mechanics to
-        get fort xp points
+        """循环执行猫窝日常打扫与互动以获取经验值。
 
         Args:
-            skip_first_screenshot (bool): Skip first
-            screen shot or not
+            skip_first_screenshot (bool): 是否跳过首次截图。默认为 True。
 
         Pages:
             in: MEOWFFICER_FORT
@@ -28,7 +34,7 @@ class MeowfficerFort(MeowfficerBase):
             else:
                 self.device.screenshot()
 
-            # Accidentally exit fort
+            # 意外退出猫窝时重新进入
             if self.appear_then_click(MEOWFFICER_FORT_ENTER, offset=(20, 20), interval=3):
                 check_timer.reset()
                 confirm_timer.reset()
@@ -49,14 +55,14 @@ class MeowfficerFort(MeowfficerBase):
             if check_timer.reached():
                 is_chore = self.image_color_count(
                     MEOWFFICER_FORT_CHORE, color=(247, 186, 90),
-                    threshold=235, count=50)
+                    threshold=20, count=50)
                 check_timer.reset()
                 if is_chore:
                     self.device.click(MEOWFFICER_FORT_CHORE)
                     confirm_timer.reset()
                     continue
 
-            # End
+            # 判定结束
             if self.appear(MEOWFFICER_FORT_CHECK, offset=(20, 20)):
                 if confirm_timer.reached():
                     break
@@ -64,26 +70,29 @@ class MeowfficerFort(MeowfficerBase):
                 confirm_timer.reset()
 
     def meow_fort(self):
-        """
-        Performs fort chores if available,
-        applies to every meowfficer simultaneously
+        """检查并执行指挥喵猫窝日常打扫任务。
+
+        检测猫窝红点，若有红点则进入猫窝执行日常打扫互动并返回。
+
+        Returns:
+            bool: 成功执行了打扫返回 True，无红点跳过返回 False。
 
         Pages:
             in: page_meowfficer
             out: page_meowfficer
         """
-        # Check for fort red notification
+        # 检查猫窝红点提示
         if not self.appear(MEOWFFICER_FORT_RED_DOT):
             return False
-        logger.hr('Meowfficer fort', level=1)
+        logger.hr('指挥喵-小屋', level=1)
 
-        # Enter MEOWFFICER_FORT window
+        # 进入猫窝界面
         self.meow_enter(MEOWFFICER_FORT_ENTER, check_button=MEOWFFICER_FORT_CHECK)
 
-        # Perform fort chore operations
+        # 执行猫窝互动打扫
         self.meow_chores()
 
-        # Exit back into page_meowfficer
+        # 关闭猫窝弹窗返回主界面
         self.meow_menu_close()
 
         return True

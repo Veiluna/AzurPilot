@@ -1,3 +1,9 @@
+"""大世界商店 UI 操作模块。
+
+提供大世界商店界面的通用 UI 操作，包括商店页面加载检测、
+侧边栏导航（明石商店/港口商店）、自适应滚动条控制、
+安全区域点击防护以及死循环检测等基础交互功能。
+"""
 from typing import Tuple
 from module.base.button import ButtonGrid
 from module.base.decorator import cached_property
@@ -10,7 +16,7 @@ from module.ui.navbar import Navbar
 from module.ui.scroll import AdaptiveScroll
 from module.ui.ui import UI
 
-# 大世界商店滚动条配置
+# 大世界商店+滚动条配置
 OS_SHOP_SCROLL = AdaptiveScroll(
     OS_SHOP_SCROLL_AREA.button,
     parameters={
@@ -24,7 +30,7 @@ OS_SHOP_SCROLL.edge_threshold = 0.1
 
 
 class OSShopUI(UI):
-    """大世界商店 UI 操作类。
+    """大世界商店+ UI 操作类。
 
     提供商店页面加载检测、侧边栏导航、滚动条控制等功能。
     """
@@ -35,7 +41,7 @@ class OSShopUI(UI):
         切换侧边栏后需要等待页面加载完成，类似舰队后勤的加载逻辑。
 
         Args:
-            skip_first_screenshot: 是否跳过首次截图。
+            skip_first_screenshot (bool): 是否跳过首次截图。默认 True。
 
         Returns:
             bool: 页面加载完成返回 True。
@@ -50,13 +56,13 @@ class OSShopUI(UI):
             else:
                 self.device.screenshot()
 
-            # 结束条件
+            # End
             if self.appear(OS_SHOP_CHECK):
                 return True
             else:
                 logger.warning('OpsiShop is not appear, retrying.')
 
-            # 异常处理
+            # Exception
             if ensure_timeout.reached():
                 raise GameStuckError('Waiting too long for OpsiShop to appear.')
 
@@ -66,6 +72,9 @@ class OSShopUI(UI):
 
         侧边栏包含 4 个选项：
             NY（纽约）、Liverpool（利物浦）、Gibraltar（直布罗陀）、St. Petersburg（圣彼得堡）
+
+        Returns:
+            Navbar: 侧边栏导航组件。
         """
         os_shop_side_navbar = ButtonGrid(
             origin=(44, 266), delta=(0, 87),
@@ -73,31 +82,23 @@ class OSShopUI(UI):
             name='OS_SHOP_SIDE_NAVBAR')
 
         return Navbar(grids=os_shop_side_navbar,
-                      active_color=(43, 94, 248), active_threshold=221,
-                      inactive_color=(12, 58, 86), inactive_threshold=221)
+                      active_color=(43, 94, 248), active_threshold=30,
+                      inactive_color=(12, 58, 86), inactive_threshold=30)
 
     def os_shop_side_navbar_ensure(self, upper=None, bottom=None):
         """确保侧边栏导航到指定页面。
 
         Args:
-            upper: 从上往下的索引。
-                limited|regular
-                    1     NY
-                    2     Liverpool
-                    3     Gibraltar
-                    4     St. Petersburg
-            bottom: 从下往上的索引。
-                limited|regular
-                    4     NY
-                    3     Liverpool
-                    2     Gibraltar
-                    1     St. Petersburg
+            upper (int, optional): 从上往下的索引（1-4）。
+                1: NY, 2: Liverpool, 3: Gibraltar, 4: St. Petersburg。
+            bottom (int, optional): 从下往上的索引（1-4）。
+                4: NY, 3: Liverpool, 2: Gibraltar, 1: St. Petersburg。
 
         Pages:
             in: PORT_SUPPLY_CHECK
             out: PORT_SUPPLY_CHECK
         """
-        logger.info(f'OpsiShop side navbar set to {upper or bottom}')
+        logger.info(f'大世界商店+侧边栏切换到 {upper or bottom}')
         self.os_shop_load_ensure()
         self._os_shop_side_navbar.set(self, upper=upper, bottom=bottom)
 
@@ -130,7 +131,7 @@ class OSShopUI(UI):
         当滚动条不可见时，通过拖拽操作使其重新出现。
 
         Args:
-            distance: 拖拽距离，默认 200 像素。
+            distance (int): 拖拽距离，默认 200 像素。
         """
         detection_area = (1130, 230, 1170, 710)
         direction_vector = (0, distance)
@@ -146,8 +147,8 @@ class OSShopUI(UI):
         当滚动失败时尝试救援滚动条并重试。
 
         Args:
-            pre_pos: 前一位置。
-            cur_pos: 当前位置。
+            pre_pos (float): 前一位置。
+            cur_pos (float): 当前位置。
 
         Returns:
             float: 滚动后的位置。

@@ -14,6 +14,11 @@ IGNORE_SERIAL = [
 
 
 def show_fix_tip(module):
+    """显示依赖缺失时的修复提示。
+
+    Args:
+        module (str): 缺失的模块名称。
+    """
     from deploy.uv import venv_uv
 
     uv = venv_uv()
@@ -27,8 +32,15 @@ def show_fix_tip(module):
 
 
 class AdbManager(DeployConfig):
+    """ADB 服务管理与设备连接器。"""
+
     @cached_property
     def adb(self):
+        """获取 ADB 可执行文件路径。
+
+        Returns:
+            str: ADB 可执行文件绝对路径或回退命令 'adb'。
+        """
         exe = self.filepath('AdbExecutable')
         if os.path.exists(exe):
             return exe
@@ -37,6 +49,7 @@ class AdbManager(DeployConfig):
         return 'adb'
 
     def adb_install(self):
+        """启动并初始化 ADB 服务，完成模拟器连接与环境检查。"""
         logger.hr('Start ADB service', 0)
 
         emulator = EmulatorConnect(adb=self.adb)
@@ -80,19 +93,13 @@ class AdbManager(DeployConfig):
                     continue
                 initer.set_atx_agent_addr('127.0.0.1:7912')
 
-                for _ in range(2):
-                    try:
-                        initer.install()
-                        break
-                    except AssertionError:
-                        logger.info(f'AssertionError when installing uiautomator2 on device {device.serial}')
-                        logger.info('If you are using BlueStacks or LD player or WSA, '
-                                    'please enable ADB in the settings of your emulator')
-                        exit(1)
-                    except ConnectionError:
-                        if _ == 1:
-                            raise
-                        init.GITHUB_BASEURL = 'http://tool.appetizer.io/openatx'
+                try:
+                    initer.install()
+                except AssertionError:
+                    logger.info(f'AssertionError when installing uiautomator2 on device {device.serial}')
+                    logger.info('If you are using BlueStacks or LD player or WSA, '
+                                'please enable ADB in the settings of your emulator')
+                    exit(1)
 
                 initer._device.shell(["rm", "/data/local/tmp/minicap"])
                 initer._device.shell(["rm", "/data/local/tmp/minicap.so"])

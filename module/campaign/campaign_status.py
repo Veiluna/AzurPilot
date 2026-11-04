@@ -1,3 +1,19 @@
+"""战役状态检测模块。
+
+通过 OCR 读取战役页面上的数值信息，包括：
+- 物资（金币）数量
+- 石油数量
+- 活动 PT（点数）
+- 石油和物资限制检测
+
+这些信息用于判断是否满足停止条件（如石油耗尽、物资溢出等）。
+
+PtOcr 类专门处理活动 PT 数字的 OCR 识别，
+需要特殊的图像预处理（反色、背景去除等）。
+
+继承自 UI，利用页面导航能力。
+"""
+
 import datetime
 import re
 
@@ -20,35 +36,52 @@ from module.log_res import LogRes
 #    OCR_COIN = Digit(OCR_COIN, name='OCR_COIN', letter=(201, 201, 201), threshold=128)
 
 class PtOcr(Ocr):
+    """活动 PT 数字专用的 OCR 识别器。"""
+
     def __init__(self, *args, **kwargs):
+        """初始化 PT 识别器。
+
+        Args:
+            *args: 位置参数，传递给父类。
+            **kwargs: 关键字参数，传递给父类。
+        """
         super().__init__(*args, lang='azur_lane', alphabet='X0123456789', **kwargs)
 
     def pre_process(self, image):
-        """
-        对 PT 数字图像进行预处理。
+        """对 PT 数字图像进行预处理。
+
+        取 RGB 三通道最大值并反色，去除背景干扰。
 
         Args:
-            image (np.ndarray): 形状为 (height, width, channel) 的图像。
+            image (np.ndarray): 形状为 (height, width, channel) 的彩色图像。
 
         Returns:
-            np.ndarray: 形状为 (width, height) 的灰度图像。
+            np.ndarray: 形状为 (height, width) 的灰度图像。
         """
-        # 取 RGB 三通道的最大值
-        r, g, b = cv2.split(cv2.subtract((255, 255, 255), image))
-        image = cv2.min(cv2.min(r, g), b)
+        # 取 RGB 三通道的最大值（等价于反色图取最小值后取反，避免分配中间数组）
+        r, g, b = cv2.split(image)
+        cv2.max(r, g, dst=r)
+        cv2.max(r, b, dst=r)
+        cv2.bitwise_not(r, dst=r)
         # 去除背景，将 0-192 映射到 0-255
-        image = cv2.multiply(image, 255 / 192)
-
-        return image.astype(np.uint8)
+        cv2.convertScaleAbs(r, alpha=255 / 192, dst=r)
+        return r
 
 
 OCR_PT = PtOcr(OCR_EVENT_PT)
 
 
 class CampaignStatus(UI):
+    """战役资源状态检测混入类。
+
+    提供活动 PT、物资（金币）、石油数量的读取与更新方法。
+    """
+
     def get_event_pt(self, update=False):
-        """
-        获取活动 PT 数量。
+        """获取活动 PT 数量。
+
+        Args:
+            update (bool): 是否将读取到的数值写回配置。默认 False。
 
         Returns:
             int: PT 数量，解析失败返回 0。
@@ -59,30 +92,33 @@ class CampaignStatus(UI):
         res = re.search(r'X(\d+)', pt)
         if res:
             pt = int(res.group(1))
-            logger.attr('Event_PT', pt)
+            logger.attr('活动PT', pt)
             LogRes(self.config).Pt = pt
         else:
             # 回退：若 OCR 返回纯数字也接受（保留警告以便回溯）
             res2 = re.search(r'(\d+)', pt)
             if res2:
                 num = int(res2.group(1))
-                logger.warning(f"Invalid pt result format (missing 'X'): {pt}; fallback to digits: {num}")
-                logger.attr('Event_PT_fallback', num)
+                logger.warning(f"无效的PT结果格式 (missing 'X'): {pt}; fallback to digits: {num}")
+                logger.attr('活动PT_回退', num)
                 LogRes(self.config).Pt = num
                 pt = num
             else:
-                logger.warning(f'Invalid pt result: {pt}')
+                logger.warning(f'无效的PT结果: {pt}')
                 pt = 0
         if update:
             self.config.update()
         return pt
 
     def get_coin(self, skip_first_screenshot=True, update=False):
-        """
-        获取金币数量。
+        """获取金币数量。
+
+        Args:
+            skip_first_screenshot (bool): 是否跳过首次截图。默认 True。
+            update (bool): 是否将读取到的数值写回配置。默认 False。
 
         Returns:
-            int: 金币数量。
+            int: 金币当前数量。
         """
         _coin = {}
         timeout = Timer(1, count=2).start()
@@ -93,22 +129,33 @@ class CampaignStatus(UI):
                 self.device.screenshot()
 
             if timeout.reached():
-                logger.warning('Get coin timeout')
+                logger.warning('获取物资超时')
                 break
 
             _coin = {
-                'Value': self._get_num(OCR_COIN, 'OCR_COIN', (239, 239, 239)),
-                'Limit': self._get_num(OCR_COIN_LIMIT, 'OCR_COIN_LIMIT', (239, 239, 239))
+                'Value': self._get_num(OCR_COIN, 'OCR_COIN', (239, 239, 239), require_valid=True),
+                'Limit': self._get_num(OCR_COIN_LIMIT, 'OCR_COIN_LIMIT', (239, 239, 239), require_valid=True)
             }
-            if _coin['Value'] >= 100:
+            if _coin['Value'] is not None and _coin['Value'] >= 100:
                 break
-        LogRes(self.config).Coin = _coin
+        LogRes(self.config).record('Coin', {key: value for key, value in _coin.items() if value is not None},
+                                   observed=_coin.get('Value') is not None and _coin['Value'] >= 100)
         if update:
             self.config.update()
 
-        return _coin['Value']
+        return _coin.get('Value') or 0
 
-    def _get_num(self, _button, name, letter=(247, 247, 247)):
+    def _get_num(self, _button, name, letter=(247, 247, 247), require_valid=False):
+        """动态检测背景颜色并识别指定区域的数字。
+
+        Args:
+            _button: 按钮区域对象。
+            name (str): 识别器标识名称。
+            letter (tuple[int, int, int]): 字符目标颜色 RGB 值。默认 (247, 247, 247)。
+
+        Returns:
+            int: 识别到的数值。
+        """
         # 更新偏移量
         _ = self.appear(OCR_OIL_CHECK)
 
@@ -126,17 +173,21 @@ class CampaignStatus(UI):
             # 带黑色遮罩
             ocr = Digit(_button, name=name, letter=(165, 165, 165), threshold=128)
         else:
-            logger.warning(f'Unexpected OCR_OIL_CHECK color')
+            logger.warning('[战役-状态] 意外的OCR_OIL_CHECK颜色')
             ocr = Digit(_button, name=name, letter=(247, 247, 247), threshold=128)
 
-        return ocr.ocr(self.device.image)
+        value = ocr.ocr(self.device.image)
+        return None if require_valid and not getattr(ocr, 'last_valid', False) else value
 
     def get_oil(self, skip_first_screenshot=True, update=False):
-        """
-        获取石油数量。
+        """获取石油数量。
+
+        Args:
+            skip_first_screenshot (bool): 是否跳过首次截图。默认 True。
+            update (bool): 是否将读取到的数值写回配置。默认 False。
 
         Returns:
-            int: 石油数量。
+            int: 石油当前数量。
         """
         _oil = {}
         timeout = Timer(1, count=2).start()
@@ -147,31 +198,31 @@ class CampaignStatus(UI):
                 self.device.screenshot()
 
             if not self.appear(OCR_OIL_CHECK, offset=(10, 2)):
-                logger.info('No oil icon')
+                logger.info('无石油图标')
                 self.device.sleep(1)
 
             if timeout.reached():
-                logger.warning('Get oil timeout')
+                logger.warning('获取石油超时')
                 break
 
             _oil = {
-                'Value': self._get_num(OCR_OIL, 'OCR_OIL', (247, 247, 247)),
-                'Limit': self._get_num(OCR_OIL_LIMIT, 'OCR_OIL_LIMIT', (247, 247, 247))
+                'Value': self._get_num(OCR_OIL, 'OCR_OIL', (247, 247, 247), require_valid=True),
+                'Limit': self._get_num(OCR_OIL_LIMIT, 'OCR_OIL_LIMIT', (247, 247, 247), require_valid=True)
             }
-            if _oil['Value'] >= 100:
+            if _oil['Value'] is not None and _oil['Value'] >= 100:
                 break
-        LogRes(self.config).Oil = _oil
+        LogRes(self.config).record('Oil', {key: value for key, value in _oil.items() if value is not None},
+                                   observed=_oil.get('Value') is not None and _oil['Value'] >= 100)
         if update:
             self.config.update()
 
-        return _oil['Value']
+        return _oil.get('Value') or 0
 
     def is_balancer_task(self):
-        """
-        判断当前任务是否为活动任务（排除每日活动任务）。
+        """判断当前任务是否为活动任务（排除每日活动任务）。
 
         Returns:
-            bool: 是否为活动任务。
+            bool: 若为活动任务返回 True，否则返回 False。
         """
         tasks = [
             'Event',

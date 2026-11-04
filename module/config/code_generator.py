@@ -1,3 +1,9 @@
+"""代码生成器模块。
+
+提供带缩进管理的代码生成器 CodeGenerator 和上下文管理器 TabWrapper，
+用于自动生成 Python 配置代码（如 config_generated.py）。
+"""
+
 import typing as t
 
 
@@ -38,6 +44,11 @@ class TabWrapper:
         return self.prefix
 
     def set_nested(self, suffix=''):
+        """标记当前上下文为嵌套结构，并追加后缀。
+
+        Args:
+            suffix: 追加的后缀字符。
+        """
         self.nested = True
         self.suffix += suffix
 

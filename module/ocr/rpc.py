@@ -7,9 +7,11 @@
 import argparse
 import multiprocessing
 import pickle
+import threading
+import time
 
 from module.logger import logger
-from module.webui.setting import State
+from module.runtime.setting import State
 
 process: multiprocessing.Process = None
 
@@ -20,41 +22,141 @@ class ModelProxy:
     通过 zerorpc 连接远程 OCR 服务器，当服务器不可用时自动回退到本地模型。
     """
     client = None
-    online = True
+    online = False
+    _address = None
+    _owner_thread = None
+    _retry_at = 0.0
+    _retry_interval = 30.0
+    _connection_lock = threading.Lock()
+
+    @classmethod
+    def _disconnect(cls):
+        """在持锁且属于客户端线程时释放连接。
+
+        关闭异常不影响本地回退。
+        """
+        client, cls.client = cls.client, None
+        cls.online = False
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                logger.warning("关闭OCR服务器连接失败，已弃用该连接")
 
     @classmethod
     def init(cls, address="127.0.0.1:22268"):
-        """初始化 RPC 客户端并连接 OCR 服务器。
+        """在当前线程尝试一次连接，显式调用可跳过故障冷却期。
+
+        zerorpc 的 gevent 客户端不能跨原生线程使用。其他线程或并发调用
+        直接回退本地；非阻塞锁也避免同线程 greenlet 等待时互相阻塞。
 
         Args:
-            address: OCR 服务器地址，格式为 'host:port'。
-        """
-        import zerorpc
+            address (str): OCR 服务器地址，形如 'ip:port'。默认 '127.0.0.1:22268'。
 
-        logger.info(f"Connecting to OCR server {address}")
-        cls.client = zerorpc.Client(timeout=5)
-        cls.client.connect(f"tcp://{address}")
+        Returns:
+            bool: 连接成功返回 True，失败或跳过返回 False。
+        """
+        if not cls._connection_lock.acquire(blocking=False):
+            return False
         try:
-            cls.client.hello()
-            logger.info("Successfully connected to OCR server")
-        except Exception:
-            cls.online = False
-            logger.warning("Ocr server not running")
+            owner = threading.get_native_id()
+            if cls._owner_thread not in (None, owner):
+                return False
+            cls._disconnect()
+            cls._owner_thread = owner
+            cls._address = address
+            try:
+                import zerorpc
+
+                logger.info(f"连接OCR服务器 {address}")
+                cls.client = zerorpc.Client(timeout=5)
+                cls.client.connect(f"tcp://{address}")
+                cls.client.hello()
+            except Exception:
+                cls._disconnect()
+                cls._retry_at = time.monotonic() + cls._retry_interval
+                logger.warning("OCR服务器不可用，冷却后重试，暂时使用本地模型")
+                return False
+            cls.online = True
+            cls._retry_at = 0.0
+            logger.info("成功连接OCR服务器")
+            return True
+        finally:
+            cls._connection_lock.release()
+
+    @classmethod
+    def _ensure_client(cls):
+        """所有代理共用健康状态，冷却结束后由调用线程最多尝试一次重连。
+
+        Returns:
+            bool: 客户端当前是否可用。
+        """
+        if cls._owner_thread not in (None, threading.get_native_id()):
+            return False
+        if cls.online and cls.client is not None:
+            return True
+        if time.monotonic() < cls._retry_at:
+            return False
+        address = cls._address or State.deploy_config.OcrClientAddress
+        return cls.init(address=address)
 
     @classmethod
     def close(cls):
-        """关闭 RPC 客户端连接。"""
-        if cls.client is not None:
-            logger.info('Disconnect to OCR server')
-            cls.client.close()
-            logger.info('Successfully disconnected to OCR server')
-            cls.client = None
+        """在客户端所属线程关闭连接，允许后续访问重新初始化。
+
+        Returns:
+            bool: 关闭成功返回 True，未获取到锁返回 False。
+        """
+        if not cls._connection_lock.acquire(blocking=False):
+            return False
+        try:
+            if cls._owner_thread not in (None, threading.get_native_id()):
+                return False
+            cls._disconnect()
+            cls._owner_thread = None
+            cls._address = None
+            cls._retry_at = 0.0
+            return True
+        finally:
+            cls._connection_lock.release()
+
+    def _call(self, method, *args):
+        """统一远程调用、共享故障清理与本地回退，保留本地参数原貌。
+
+        Args:
+            method (str): 调用的 OCR 方法名。
+            *args: 方法参数。
+
+        Returns:
+            Any: OCR 识别结果。
+        """
+        cls = ModelProxy
+        if cls._ensure_client() and cls._connection_lock.acquire(blocking=False):
+            try:
+                if cls.online and cls.client is not None:
+                    remote_args = args
+                    if method != "set_cand_alphabet":
+                        if method in ("ocr_for_single_lines", "atomic_ocr_for_single_lines", "debug"):
+                            images = [image.dumps() for image in args[0]]
+                        else:
+                            images = args[0].dumps()
+                        remote_args = (images, *args[1:])
+                    try:
+                        return cls.client(method, self.lang, *remote_args)
+                    except Exception:
+                        cls._disconnect()
+                        cls._retry_at = time.monotonic() + cls._retry_interval
+                        logger.warning("OCR远程调用失败，冷却后重试，暂时使用本地模型")
+            finally:
+                cls._connection_lock.release()
+        from module.ocr.models import OCR_MODEL
+        return getattr(getattr(OCR_MODEL, self.lang), method)(*args)
 
     def __init__(self, lang) -> None:
         """初始化模型代理。
 
         Args:
-            lang: OCR 模型语言标识，如 'azur_lane'、'cnocr'、'jp'、'tw'。
+            lang: OCR 模型语言标识，如 'azur_lane'、'ppocr_v6'、'cnocr'、'jp'、'tw'。
         """
         self.lang = lang
 
@@ -67,14 +169,7 @@ class ModelProxy:
         Returns:
             OCR 识别结果。
         """
-        if self.online:
-            img_str = img_fp.dumps()
-            try:
-                return self.client("ocr", self.lang, img_str)
-            except Exception:
-                self.online = False
-        from module.ocr.models import OCR_MODEL
-        return OCR_MODEL.__getattribute__(self.lang).ocr(img_fp)
+        return self._call("ocr", img_fp)
 
     def ocr_for_single_line(self, img_fp):
         """对单行文本图像执行 OCR 识别。
@@ -85,14 +180,7 @@ class ModelProxy:
         Returns:
             单行 OCR 识别结果。
         """
-        if self.online:
-            img_str = img_fp.dumps()
-            try:
-                return self.client("ocr_for_single_line", self.lang, img_str)
-            except Exception:
-                self.online = False
-        from module.ocr.models import OCR_MODEL
-        return OCR_MODEL.__getattribute__(self.lang).ocr_for_single_line(img_fp)
+        return self._call("ocr_for_single_line", img_fp)
 
     def ocr_for_single_lines(self, img_list):
         """对多张单行文本图像批量执行 OCR 识别。
@@ -103,14 +191,7 @@ class ModelProxy:
         Returns:
             各图像对应的 OCR 识别结果列表。
         """
-        if self.online:
-            img_str_list = [img_fp.dumps() for img_fp in img_list]
-            try:
-                return self.client("ocr_for_single_lines", self.lang, img_str_list)
-            except Exception:
-                self.online = False
-        from module.ocr.models import OCR_MODEL
-        return OCR_MODEL.__getattribute__(self.lang).ocr_for_single_lines(img_list)
+        return self._call("ocr_for_single_lines", img_list)
 
     def set_cand_alphabet(self, cand_alphabet: str):
         """设置 OCR 识别的候选字符集。
@@ -121,13 +202,7 @@ class ModelProxy:
         Returns:
             设置结果。
         """
-        if self.online:
-            try:
-                return self.client("set_cand_alphabet", self.lang, cand_alphabet)
-            except Exception:
-                self.online = False
-        from module.ocr.models import OCR_MODEL
-        return OCR_MODEL.__getattribute__(self.lang).set_cand_alphabet(cand_alphabet)
+        return self._call("set_cand_alphabet", cand_alphabet)
 
     def atomic_ocr(self, img_fp, cand_alphabet=None):
         """使用候选字符集对图像执行原子 OCR 识别。
@@ -139,14 +214,7 @@ class ModelProxy:
         Returns:
             OCR 识别结果。
         """
-        if self.online:
-            img_str = img_fp.dumps()
-            try:
-                return self.client("atomic_ocr", self.lang, img_str, cand_alphabet)
-            except Exception:
-                self.online = False
-        from module.ocr.models import OCR_MODEL
-        return OCR_MODEL.__getattribute__(self.lang).atomic_ocr(img_fp, cand_alphabet)
+        return self._call("atomic_ocr", img_fp, cand_alphabet)
 
     def atomic_ocr_for_single_line(self, img_fp, cand_alphabet=None):
         """使用候选字符集对单行文本图像执行原子 OCR 识别。
@@ -158,14 +226,7 @@ class ModelProxy:
         Returns:
             单行 OCR 识别结果。
         """
-        if self.online:
-            img_str = img_fp.dumps()
-            try:
-                return self.client("atomic_ocr_for_single_line", self.lang, img_str, cand_alphabet)
-            except Exception:
-                self.online = False
-        from module.ocr.models import OCR_MODEL
-        return OCR_MODEL.__getattribute__(self.lang).atomic_ocr_for_single_line(img_fp, cand_alphabet)
+        return self._call("atomic_ocr_for_single_line", img_fp, cand_alphabet)
 
     def atomic_ocr_for_single_lines(self, img_list, cand_alphabet=None):
         """使用候选字符集对多张单行文本图像批量执行原子 OCR 识别。
@@ -177,14 +238,7 @@ class ModelProxy:
         Returns:
             各图像对应的 OCR 识别结果列表。
         """
-        if self.online:
-            img_str_list = [img_fp.dumps() for img_fp in img_list]
-            try:
-                return self.client("atomic_ocr_for_single_lines", self.lang, img_str_list, cand_alphabet)
-            except Exception:
-                self.online = False
-        from module.ocr.models import OCR_MODEL
-        return OCR_MODEL.__getattribute__(self.lang).atomic_ocr_for_single_lines(img_list, cand_alphabet)
+        return self._call("atomic_ocr_for_single_lines", img_list, cand_alphabet)
 
     def debug(self, img_list):
         """对图像列表执行调试模式 OCR 识别。
@@ -195,21 +249,14 @@ class ModelProxy:
         Returns:
             调试信息。
         """
-        if self.online:
-            img_str_list = [img_fp.dumps() for img_fp in img_list]
-            try:
-                return self.client("debug", self.lang, img_str_list)
-            except Exception:
-                self.online = False
-        from module.ocr.models import OCR_MODEL
-        return OCR_MODEL.__getattribute__(self.lang).debug(img_list)
+        return self._call("debug", img_list)
 
 
 class ModelProxyFactory:
     """OCR 模型代理工厂。
 
     通过 __getattribute__ 拦截语言模型属性访问，返回对应的 ModelProxy 实例。
-    支持的语言模型：azur_lane、cnocr、jp、tw、azur_lane_jp。
+    支持的语言模型：azur_lane、ppocr_v6、cnocr、jp、tw、azur_lane_jp。
     """
 
     def __getattribute__(self, __name: str) -> ModelProxy:
@@ -221,9 +268,8 @@ class ModelProxyFactory:
         Returns:
             对应语言的 ModelProxy 实例，或父类属性。
         """
-        if __name in ["azur_lane", "cnocr", "jp", "tw", "azur_lane_jp"]:
-            if ModelProxy.client is None:
-                ModelProxy.init(address=State.deploy_config.OcrClientAddress)
+        if __name in ["azur_lane", "ppocr_v6", "cnocr", "jp", "tw", "azur_lane_jp"]:
+            ModelProxy._ensure_client()
             return ModelProxy(lang=__name)
         else:
             return super().__getattribute__(__name)
@@ -251,7 +297,11 @@ def start_ocr_server(port=22268):
         """OCR RPC 服务端实现，继承 OcrModel 以复用模型加载逻辑。"""
 
         def hello(self):
-            """心跳检测，用于客户端验证服务器是否存活。"""
+            """心跳检测，用于客户端验证服务器是否存活。
+
+            Returns:
+                str: 固定返回 'hello'。
+            """
             return "hello"
 
         def ocr(self, lang, img_fp):
@@ -372,9 +422,9 @@ def start_ocr_server(port=22268):
     try:
         server.bind(f"tcp://*:{port}")
     except zmq.error.ZMQError:
-        logger.error(f"Ocr server cannot bind on port {port}")
+        logger.error(f"[OCR-RPC] OCR 服务器无法绑定端口 {port}")
         return
-    logger.info(f"Ocr server listen on port {port}")
+    logger.info(f"[OCR-RPC] 服务器监听端口 {port}")
     server.run()
 
 

@@ -1,3 +1,7 @@
+"""商店 UI 导航处理，管理商店页面的标签切换和导航栏。
+支持 2025-08-14 新 UI 的底部导航栏和标签页切换。
+"""
+
 from module.base.button import ButtonGrid
 from module.base.decorator import cached_property
 from module.handler.assets import POPUP_CONFIRM
@@ -13,14 +17,13 @@ from module.ui.ui import UI
 class ShopUI(UI):
     @cached_property
     def _shop_bottom_navbar(self):
-        """
-        以下信息基于 shop_swipe 之后的布局。
-        shop_bottom_navbar 有 5 个选项：
-            medal（勋章）
-            guild（舰队）
-            prototype（原型）
-            core（核心）
-            merit（功勋）
+        """商店底部导航栏组件。
+
+        包含 5 个选项：medal（勋章）、guild（舰队）、prototype（原型）、
+        core（核心）、merit（功勋）。
+
+        Returns:
+            Navbar: 底部导航栏控制器实例。
         """
         shop_bottom_navbar = ButtonGrid(
             origin=(399, 619), delta=(182, 0),
@@ -32,9 +35,7 @@ class ShopUI(UI):
                       inactive_color=(181, 178, 181))
 
     def shop_bottom_navbar_ensure(self, left=None, right=None):
-        """
-        确保能够跳转到对应页面，且页面已完全加载。
-        以下信息基于 shop_swipe 之后的布局。
+        """确保能够跳转到对应页面，且页面已完全加载。
 
         Args:
             left (int): 取决于商店导航栏的位置
@@ -49,14 +50,15 @@ class ShopUI(UI):
 
     @cached_property
     def shop_nav_250814(self):
-        """
-        250814 版商店顶部导航栏切换器。
+        """250814 版商店顶部导航栏切换器。
 
-        包含「通用」和「月度」两个导航选项，
-        用于在不同商店大类之间切换。
+        包含「通用」和「月度」两个导航选项，用于在不同商店大类之间切换。
 
         Pages:
             in: page_munitions
+
+        Returns:
+            Switch: 顶部导航栏 Switch 状态机。
         """
         switch = Switch('shop_nav_250814', is_selector=True, offset=(20, 20))
         switch.add_state(NAV_GENERAL, check_button=NAV_GENERAL)
@@ -65,14 +67,16 @@ class ShopUI(UI):
 
     @cached_property
     def shop_tab_250814(self):
-        """
-        250814 版商店分类标签切换器。
+        """250814 版商店分类标签切换器。
 
         包含 9 个标签页：通用、功勋、舰队、META、奖励、
         核心限定、核心月度、勋章、原型，用于切换不同商店分类。
 
         Pages:
             in: page_munitions
+
+        Returns:
+            Switch: 分类标签 Switch 状态机。
         """
         switch = Switch('shop_tab_250814', is_selector=True, offset=(20, 20))
         switch.add_state(TAB_GENERAL, check_button=TAB_GENERAL)
@@ -99,7 +103,7 @@ class ShopUI(UI):
         Returns:
             bool: 是否刷新成功
         """
-        logger.info('Shop refresh')
+        logger.info('[商店-UI] 刷新商店')
         refreshed = False
 
         # 点击刷新按钮，等待确认弹窗出现
@@ -110,14 +114,14 @@ class ShopUI(UI):
             # SHOP_REFRESH 是带背景的刷新图标
             if self.appear(SHOP_REFRESH_CHECK, offset=(30, 30), interval=3):
                 # SHOP_REFRESH 激活时有两种颜色状态
-                if self.image_color_count(SHOP_REFRESH.button, color=(49, 142, 207), threshold=221, count=50):
+                if self.image_color_count(SHOP_REFRESH.button, color=(49, 142, 207), threshold=30, count=50):
                     self.device.click(SHOP_REFRESH)
                     continue
-                if self.image_color_count(SHOP_REFRESH.button, color=(54, 117, 161), threshold=221, count=50):
+                if self.image_color_count(SHOP_REFRESH.button, color=(54, 117, 161), threshold=30, count=50):
                     self.device.click(SHOP_REFRESH)
                     continue
-                if self.image_color_count(SHOP_REFRESH.button, color=(52, 74, 94), threshold=221, count=50):
-                    logger.info('Refresh not available')
+                if self.image_color_count(SHOP_REFRESH.button, color=(52, 74, 94), threshold=30, count=50):
+                    logger.info('[商店-UI] 刷新不可用')
                     break
                 # 不使用 continue，当作 SHOP_REFRESH 未匹配处理
                 self.interval_clear(SHOP_REFRESH)
@@ -127,7 +131,7 @@ class ShopUI(UI):
             if self.appear(SHOP_BACK_ARROW, offset=(30, 30)):
                 break
             if self.appear(SHOP_BUY_CONFIRM_MISTAKE, interval=3, offset=(200, 200)):
-                logger.warning('SHOP_BUY_CONFIRM_MISTAKE')
+                logger.warning('[商店-UI] 刷新确认错误')
                 self.ui_click(SHOP_CLICK_SAFE_AREA, appear_button=POPUP_CONFIRM, check_button=SHOP_BACK_ARROW,
                               offset=(20, 30), skip_first_screenshot=True)
                 refreshed = False
@@ -136,7 +140,8 @@ class ShopUI(UI):
                 refreshed = True
                 continue
 
-        self.handle_info_bar()
+        # 刷新后会出现信息栏，等待其消失再结束
+        self.ensure_no_info_bar(timeout=1)
         return refreshed
 
     def ui_goto_shop(self):
@@ -149,7 +154,7 @@ class ShopUI(UI):
             out: page_munitions
         """
         if self.ui_get_current_page() == page_munitions:
-            logger.info(f'Already at {page_munitions}')
+            logger.info(f'[商店-UI] 已在 {page_munitions}')
             return
 
         self.ui_ensure(page_academy)

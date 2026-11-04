@@ -1,0 +1,161 @@
+import { createServer } from 'node:http'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+import { pathToFileURL, fileURLToPath } from 'node:url'
+import { parseArgs } from 'node:util'
+import { WebSocketServer, WebSocket } from 'ws'
+import { createMockState, fail } from './state.mjs'
+
+// 物品图标与真实后端 module/api/app.py 一致：优先专用图标，缺失时使用同名领奖模板。
+// mock 也照挂，否则统计页的图标列全是裂图，看不出图标布局对不对。
+const ICON_DIRS = {
+  '/research-items/': ['../../assets/stats/research_items/', '../../assets/stats_basic/'].map(relative => fileURLToPath(new URL(relative, import.meta.url))),
+  '/opsi-items/': ['../../assets/stats/opsi_reward_items/', '../../assets/stats/opsi_items/'].map(relative => fileURLToPath(new URL(relative, import.meta.url))),
+  '/storage-items/': [fileURLToPath(new URL('../../assets/stats/', import.meta.url))],
+}
+
+async function readIcon(directories, name) {
+  for (const directory of directories) {
+    const target = path.resolve(directory, name)
+    if (!target.startsWith(path.resolve(directory) + path.sep)) continue
+    try { return await readFile(target) } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+  }
+  throw new Error('物品模板不存在')
+}
+
+export function createMockServer({password = '', empty = false} = {}) {
+  const state = createMockState({empty})
+  const server = createServer((request, response) => {
+    const iconPrefix = Object.keys(ICON_DIRS).find(prefix => request.url?.startsWith(prefix))
+    if (iconPrefix) {
+      // 仓库图标允许模板子目录，由 readIcon 检查目录边界。
+      const relative = decodeURIComponent(request.url).slice(iconPrefix.length)
+      const name = iconPrefix === '/storage-items/' ? relative : path.basename(relative)
+      if (name.endsWith('.png')) {
+        readIcon(ICON_DIRS[iconPrefix], name).then(buffer => {
+          response.setHeader('Content-Type', 'image/png')
+          response.writeHead(200)
+          response.end(buffer)
+        }).catch(() => {
+          response.writeHead(404)
+          response.end()
+        })
+        return
+      }
+    }
+    response.setHeader('Content-Type', 'application/json; charset=utf-8')
+    // 端到端场景开关：仅服务本地测试，例如 /__mock/updater?mode=diverged 切到 SHA 不匹配状态。
+    if (request.url?.startsWith('/__mock/updater')) {
+      const mode = new URL(request.url, 'http://localhost').searchParams.get('mode') ?? 'default'
+      state.setUpdateScenario(mode)
+      response.writeHead(200)
+      response.end(JSON.stringify({ok: true, mode}))
+      return
+    }
+    response.writeHead(request.url === '/healthz' ? 200 : 404)
+    response.end(JSON.stringify(request.url === '/healthz' ? {status: 'ok', protocolVersion: 1, mock: true} : {message: '请通过 Vite 打开前端'}))
+  })
+  const sockets = new WebSocketServer({noServer: true, maxPayload: 8 * 1024 * 1024})
+  server.on('upgrade', (request, socket, head) => {
+    let validOrigin = false
+    try {validOrigin = new URL(request.headers.origin).host === request.headers.host} catch { /* 缺少来源时拒绝连接。 */ }
+    if (request.url !== '/api/v1/ws' || !validOrigin) {socket.end('HTTP/1.1 403 Forbidden\r\n\r\n'); return}
+    sockets.handleUpgrade(request, socket, head, ws => sockets.emit('connection', ws))
+  })
+  const sessions = new Set()
+  sockets.on('connection', socket => {
+    const session = {socket, authenticated: !password, seq: 0, topics: [], instance: null, last: new Map(), ids: new Set()}
+    sessions.add(session)
+    const send = message => {
+      if (socket.readyState !== WebSocket.OPEN) return
+      if (socket.bufferedAmount > 4 * 1024 * 1024) {socket.close(1013); return}
+      socket.send(JSON.stringify(message))
+    }
+    session.event = (topic, data) => send({v: 1, type: 'event', topic, seq: ++session.seq, data})
+    session.event('session', {authRequired: !!password, protocolVersion: 1})
+    socket.on('message', async raw => {
+      let request
+      try {
+        request = JSON.parse(raw.toString())
+        if (!request || request.v !== 1 || request.type !== 'request' || typeof request.id !== 'string' || !request.id.length || request.id.length > 100 || typeof request.method !== 'string') fail('INVALID_REQUEST', '请求信封无效')
+        if (raw.length > 1024 * 1024 && !['mind.import', 'mind.recognize'].includes(request.method)) fail('INVALID_REQUEST', '请求超过 1 MiB 限制')
+        if (session.ids.has(request.id)) fail('DUPLICATE_REQUEST', '请求 ID 重复')
+        session.ids.add(request.id)
+        if (session.ids.size > 128) session.ids.delete(session.ids.values().next().value)
+        let result
+        if (request.method === 'auth.login') {
+          if ((request.params?.password ?? '') !== password) fail('UNAUTHORIZED', '访问密码不正确')
+          session.authenticated = true; result = {authenticated: true}
+        } else {
+          if (!session.authenticated) fail('UNAUTHORIZED', '请先登录')
+          result = await state.dispatch(request.method, request.params)
+          if (request.method === 'events.subscribe') {
+            session.unsubscribeStock?.();session.unsubscribeStock=undefined
+            session.topics = result.topics; session.instance = result.instance; session.last.clear()
+            if(session.topics.includes('stock'))session.unsubscribeStock=state.subscribeStock(data=>session.event('stock',{...data,instance:session.instance}))
+          }
+        }
+        send({v: 1, type: 'response', id: request.id, ok: true, result})
+        publish()
+      } catch (error) {
+        send({v: 1, type: 'response', id: request?.id ?? '', ok: false, error: {code: error.code ?? 'INVALID_REQUEST', message: error.code ? error.message : '请求格式无效', details: error.details ?? null}})
+      }
+    })
+    socket.on('close', () => {session.unsubscribeStock?.();sessions.delete(session)})
+    socket.on('error', () => {session.unsubscribeStock?.();sessions.delete(session)})
+  })
+  function publish() {
+    for (const session of sessions) {
+      if (!session.authenticated) continue
+      for (const topic of session.topics) {
+        if(topic==='stock')continue
+        try {
+          if (topic === 'preview' && session.last.has(topic) && Date.now() - (session.previewAt ?? 0) < 3000) continue
+          if (topic === 'preview') session.previewAt = Date.now()
+          const method = {instances: 'instances.list', overview: 'overview.get', logs: 'logs.get', preview: 'preview.capture'}[topic]
+          const data = state.dispatch(method, topic === 'instances' ? {} : {instance: session.instance})
+          const serialized = JSON.stringify(data)
+          if (session.last.get(topic) !== serialized) {session.event(topic, data); session.last.set(topic, serialized)}
+        } catch (error) {
+          const data = {topic, instance: session.instance, code: error.code, message: error.message}
+          const serialized = JSON.stringify(data)
+          if (session.last.get(topic) !== serialized) {session.event('subscription.error', data); session.last.set(topic, serialized)}
+        }
+      }
+    }
+  }
+  const interval = setInterval(() => {state.tick(); publish()}, 3000)
+  interval.unref()
+  const close = () => new Promise(resolve => {
+    clearInterval(interval)
+    state.close()
+    for (const socket of sockets.clients) socket.terminate()
+    sockets.close(() => server.close(resolve))
+  })
+  return {server, close}
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const {values: options} = parseArgs({options: {dev: {type: 'boolean'}, port: {type: 'string', default: '5173'}}})
+  const port = Number(process.env.AZURPILOT_MOCK_PORT ?? 22392)
+  const mock = createMockServer({password: process.env.AZURPILOT_MOCK_PASSWORD ?? '', empty: process.env.AZURPILOT_MOCK_SCENARIO === 'empty'})
+  mock.server.on('error', error => {console.error(`模拟服务启动失败：${error.message}`); process.exit(1)})
+  mock.server.listen(port, '127.0.0.1', () => console.info(`前端模拟服务：http://127.0.0.1:${port}（数据只保存在内存）`))
+  let vite
+  if (options.dev) {
+    const {createServer} = await import('vite')
+    vite = await createServer({mode: 'mock', server: {host: '127.0.0.1', port: Number(options.port)}})
+    await vite.listen()
+    vite.printUrls()
+  }
+  let closing = false
+  const shutdown = async () => {
+    if (closing) return
+    closing = true
+    await vite?.close(); await mock.close()
+  }
+  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
+}

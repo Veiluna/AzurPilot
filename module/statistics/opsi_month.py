@@ -1,3 +1,7 @@
+"""大世界（Operation Siren）月度统计模块。
+从加密 SQLite 数据库中读取战斗数据，
+计算月度练级效率、资源投入和战斗次数等汇总指标。"""
+
 # 此文件专门用于统计分析大世界（Operation Siren）的月度练级效率与资源投入数据。
 # 负责从加密 SQLite 数据库中读取统计数据，并具备计算概况与详细指标的功能。
 from __future__ import annotations
@@ -17,6 +21,15 @@ class OpsiMonthStats:
     def summary(
         self, year: int | None = None, month: int | None = None
     ) -> Dict[str, Any]:
+        """获取指定月份的 CL1 统计基础摘要。
+
+        Args:
+            year (int | None, optional): 统计年份。默认为当前年。
+            month (int | None, optional): 统计月份。默认为当前月。
+
+        Returns:
+            Dict[str, Any]: 包含总战斗次数、明石遭遇次数、塞壬装置数等摘要数据。
+        """
         now = datetime.now()
         if year is None:
             year = now.year
@@ -99,6 +112,14 @@ _singleton: Dict[str, OpsiMonthStats] = {}
 
 
 def get_opsi_stats(instance_name: str | None = None) -> OpsiMonthStats:
+    """获取指定实例的大世界月度统计单例对象。
+
+    Args:
+        instance_name (str | None, optional): 配置实例名称。默认为 "default"。
+
+    Returns:
+        OpsiMonthStats: 对应的月度统计管理器实例。
+    """
     global _singleton
     key = instance_name or "default"
     if key not in _singleton:
@@ -216,7 +237,7 @@ __all__ = [
     "compute_monthly_cl1_akashi_ap",
     "get_ap_timeline",
     "get_coins_timeline",
-    "get_virtual_asset_timeline",
+    "get_asset_timeline",
     "get_resource_timeline",
 ]
 
@@ -245,16 +266,10 @@ def get_resource_timeline(
     return _get_timeline(instance=instance_name, limit=limit)
 
 
-def get_virtual_asset_timeline(
+def get_asset_timeline(
     year: int | None = None, month: int | None = None, instance_name: str | None = None
 ) -> list:
-    """
-    Get virtual asset timeline from AP snapshots.
-
-    Existing asset/virtual_asset snapshot fields are the display source of truth.
-    Older snapshots without these fields are still returned so the WebUI can
-    reconstruct them for display.
-    """
+    """获取 AP 快照中的资产时间线。"""
     now = datetime.now()
     if year is None:
         year = now.year
@@ -264,4 +279,5 @@ def get_virtual_asset_timeline(
 
     data = cl1_db.get_stats(instance_name or "default", key_prefix)
     snapshots = data.get("ap_snapshots", [])
-    return sorted([s for s in snapshots if s.get("ts")], key=lambda e: e.get("ts", ""))
+    return sorted([s for s in snapshots if s.get("ts") and s.get("ap_total") is not None
+                   and s.get("source") != "hazard1_estimate"], key=lambda e: e.get("ts", ""))

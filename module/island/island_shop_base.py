@@ -1,6 +1,13 @@
+"""岛屿店铺基类模块。
+
+为烧烤店、茶馆、餐厅、制造工坊等所有岛屿店铺提供通用的岗位管理与商品生产框架。
+包含产品选择、厨师筛选、岗位填充循环、季节性商品处理等核心逻辑，是所有店铺模块的父类。
+"""
 from module.island.island import *
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import timedelta
+
+from module.config.time_source import now as current_time
 from module.handler.login import LoginHandler
 from module.island.warehouse import *
 from module.logger import logger
@@ -8,6 +15,34 @@ from module.island.island_season import get_global_season_config
 
 
 class IslandShopBase(Island, WarehouseOCR):
+    """岛屿店铺自动化基础抽象类。
+
+    继承 Island 与 WarehouseOCR，为餐厅、茶馆、烧烤店、工坊等岛屿商业店铺
+    提供商品排产、岗位巡检、厨师分配、原材料扣减与常驻/季节限定菜品调度的通用逻辑。
+
+    Attributes:
+        shop_items (list): 店铺支持的商品配置列表。
+        shop_type (str): 店铺类型标识（如 'grill', 'restaurant', 'teahouse'）。
+        filter_asset (str): 仓库筛选分类标识。
+        post_buttons (dict): 岗位按钮映射字典。
+        time_prefix (str): 记录岗位完成时间的变量名前缀。
+        special_character (bool): 是否使用特殊角色派遣。
+        special_food (str | None): 特殊商品标识。
+        chef_config (str): 厨师选择优先级配置字符串。
+        name_to_config (dict): 商品名称到配置字典的映射。
+        posts (dict): 岗位状态与按钮信息。
+        post_check_meal (dict): 正在生产中的商品统计。
+        post_products (list[tuple[str, int]]): 目标商品与配置需求列表。
+        warehouse_counts (dict): 仓库库存统计。
+        to_post_products (dict): 当前待生产的商品需求计划。
+        current_totals (dict): 当前总库存（仓库 + 在制品 + 本轮未入库）。
+        meal_compositions (dict): 套餐组成与所需单品配置。
+    """
+    _MAX_FILL_LOOP = 10  # while 循环填岗最大迭代次数
+    PRODUCT_SELECT_RETRY_LIMIT = 3  # 餐品选择识别失败后，退出重进的最大次数
+    POST_PRODUCE_LIMIT = 7  # 餐馆每个岗位单次最多生产数量
+    FILL_SPECIAL_FOOD = True  # 子类可关闭余岗的特殊餐品回退
+
     def __init__(self, config, device=None, task=None):
         # 分别初始化每个父类
         Island.__init__(self, config=config, device=device, task=task)
@@ -28,13 +63,19 @@ class IslandShopBase(Island, WarehouseOCR):
         self.name_to_config = {}
         self.posts = {}
         self.post_check_meal = {}  # 岗位生产中的产品
-        self.post_products = {}
+        self.post_products = []  # 有序列表，允许同名餐品出现在多个槽位
         self.warehouse_counts = {}  # 仓库识别到的产品
         self.to_post_products = {}
         self.current_totals = {}
+        # 保留线目标 {产品: 断点前槽位最高目标}，
+        # 排产时这些产品的仓库库存只能消耗超出自身目标的部分
+        self._reserved_targets = {}
 
         # 特殊材料（子类可覆盖）
         self.special_materials = {}
+
+        # 本轮因无可用角色而跳过生产的餐品（避免严格模式重复尝试）
+        self.chef_unavailable_products = set()
 
         # 套餐组成（子类可覆盖）
         self.meal_compositions = {}
@@ -47,32 +88,34 @@ class IslandShopBase(Island, WarehouseOCR):
 
         # 滑动配置（子类可覆盖）
         self.post_manage_swipe_count = 1  # 默认滑动1次450
+        # 店铺岗位位于列表较深处，调参滑动后仍识别不到岗位按钮时，
+        # 由 post_open 闭环补滑重新定位（模拟器/云手机滑动距离不够的兜底）
+        self.post_open_retry_swipe = True
 
     # ==================== 季节配置支持 ====================
 
     def _init_season_config(self):
-        """初始化季节配置"""
+        """初始化季节配置。"""
         self.season_config = get_global_season_config(self.config)
         self.current_season = self.season_config.season
         self.season_name = self.season_config.season_name
 
         if self.season_config.is_seasonal_enabled:
-            logger.info(f"当前季节: {self.season_name}，季节限定已启用")
+            logger.info(f"[岛屿] 当前季节: {self.season_name}，季节限定已启用")
         else:
-            logger.info("季节限定未启用")
+            logger.info("[岛屿] 季节限定未启用")
 
     def is_seasonal_item_enabled(self, item_name):
-        """
-        判断指定物品在当前季节是否启用
+        """判断指定物品在当前季节是否启用。
 
         如果季节限定未启用（none），则默认所有物品可用。
         如果季节限定启用，则只返回本季节的物品列表。
 
         Args:
-            item_name: 物品名称
+            item_name (str): 物品名称。
 
         Returns:
-            bool
+            bool: 物品在当前季节是否可用。
         """
         if not hasattr(self, 'season_config') or self.season_config is None:
             return True
@@ -90,10 +133,16 @@ class IslandShopBase(Island, WarehouseOCR):
             from module.island.island_season import SEASONAL_ITEMS
             other_items = SEASONAL_ITEMS.get(season_key, {}).get(self.shop_type, [])
             if item_name in other_items:
-                logger.info(f"物品 [{item_name}] 是 {season_key} 的限定品，当前 {self.season_name} 不可用")
+                logger.info(f"[岛屿] 物品 [{self._item_cn(item_name)}] 是 {season_key} 的限定品，当前 {self.season_name} 不可用")
                 return False
         return True
+
     def produce_check(self):
+        """检查生产确认按钮是否因原材料不足而呈灰色不可点击状态。
+
+        Returns:
+            bool: 原材料不足返回 True，原料充足可生产返回 False。
+        """
         self.device.sleep(0.5)
         image = self.device.screenshot()
         area = (493, 597, 621, 643)
@@ -102,9 +151,17 @@ class IslandShopBase(Island, WarehouseOCR):
             return True
         else:
             return False
+
     def setup_config(self, config_meal_prefix, config_number_prefix,
                      config_away_cook, config_post_number):
-        """从配置中读取餐品需求 - 修改为8种餐品"""
+        """从用户配置中读取各槽位的商品与需求数量配置。
+
+        Args:
+            config_meal_prefix (str): 商品配置键名前缀。
+            config_number_prefix (str): 数量配置键名前缀。
+            config_away_cook (str): 常驻挂机生产商品配置键名。
+            config_post_number (str): 开放岗位数量配置键名。
+        """
         # 设置配置前缀
         self.config_meal_prefix = config_meal_prefix
         self.config_number_prefix = config_number_prefix
@@ -112,7 +169,7 @@ class IslandShopBase(Island, WarehouseOCR):
         self.config_post_number = config_post_number
 
         # 读取8种餐品需求
-        self.post_products = {}
+        self.post_products = []
 
         for i in range(1, 9):  # 1到8
             meal_key = f'{self.config_meal_prefix}{i}'
@@ -121,10 +178,10 @@ class IslandShopBase(Island, WarehouseOCR):
             meal_name = getattr(self.config, meal_key, None)
             if meal_name is not None and meal_name != "None":
                 meal_number = getattr(self.config, number_key, 0)
-                self.post_products[meal_name] = meal_number
+                self.post_products.append((meal_name, meal_number))
 
     def initialize_shop(self):
-        """初始化店铺，子类必须在__init__中调用"""
+        """初始化店铺商品配置与岗位状态，子类必须在初始化时调用。"""
         self.name_to_config = {item['name']: item for item in self.shop_items}
 
         # 初始化岗位状态
@@ -133,7 +190,12 @@ class IslandShopBase(Island, WarehouseOCR):
 
     # ============ 通用方法 ============
     def post_check(self, post_id, time_var_name):
-        """检查岗位状态（通用）"""
+        """检查指定岗位的生产状态，并记录剩余完成时间或重置为空闲。
+
+        Args:
+            post_id (str): 岗位标识。
+            time_var_name (str): 存储该岗位完成时间的属性名。
+        """
         post_button = self.posts[post_id]['button']
         self.post_close()
         self.post_open(post_button)
@@ -149,7 +211,7 @@ class IslandShopBase(Island, WarehouseOCR):
             number = ocr_post_number.ocr(image)
             time_work = Duration(ISLAND_WORKING_TIME)
             time_value = time_work.ocr(self.device.image)
-            finish_time = datetime.now() + time_value
+            finish_time = current_time() + time_value
             setattr(self, time_var_name, finish_time)
             self.posts[post_id]['status'] = 'working'
             if product is not None:
@@ -164,28 +226,108 @@ class IslandShopBase(Island, WarehouseOCR):
         self.device.sleep(0.5)
 
     def post_product_check(self):
-        """检查岗位生产的产品（通用）"""
+        """识别当前岗位详情中正在生产的商品名称。
+
+        Returns:
+            str | None: 正在生产的商品名称，未匹配到返回 None。
+        """
         for item in self.shop_items:
             if self.appear(item['post_action']):
                 return item['name']
         return None
 
     def get_warehouse_counts(self):
-        """获取仓库数量（通用）"""
+        """切换仓库筛选并 OCR 识别店铺所有相关商品的库存数量。
+
+        Returns:
+            dict[str, int]: 各商品的仓库库存映射字典。
+        """
         self.warehouse_filter(self.filter_asset)
         image = self.device.screenshot()
 
         for dish in self.shop_items:
             self.warehouse_counts[dish['name']] = self.ocr_item_quantity(image, dish['template'])
             if self.warehouse_counts[dish['name']]:
-                logger.info(f"{dish['name']}: {self.warehouse_counts[dish['name']]}")
+                logger.info(f"{self._item_cn(dish['name'])}: {self.warehouse_counts[dish['name']]}")
         return self.warehouse_counts
-    def select_special_character(self,product):
-        self.select_character(character_list=self.chef_config)
+
+    def select_special_character(self, product):
+        """为特定商品选择派遣角色，默认回退至 chef_config 配置。
+
+        Args:
+            product (str): 目标商品标识。
+
+        Returns:
+            bool: 是否成功选择角色。
+        """
+        return self.select_character(character_list=self.chef_config)
+
     def produce_special_food(self):
+        """生产特殊商品的钩子方法，子类可按需实现。"""
         pass
+
+    def retry_product_selection_from_postmanage(self, post_button, product, failed_product, failed_count):
+        """餐品选择失败后退出岗位，重新进入同一岗位走完整派遣流程。
+
+        Args:
+            post_button (Button): 岗位入口按钮。
+            product (str): 目标商品名称。
+            failed_product (str): 未能识别选中的商品名称。
+            failed_count (int): 当前累计失败次数。
+
+        Raises:
+            GameStuckError: 连续失败达到上限或界面异常时抛出。
+        """
+        if failed_count >= self.PRODUCT_SELECT_RETRY_LIMIT:
+            raise GameStuckError(
+                f"{self._item_cn(product)}生产选择餐品时连续{failed_count}次未识别到 {self._item_cn(failed_product)}"
+            )
+
+        logger.warning(
+            f"{self._item_cn(product)}生产选择餐品时未识别到 {self._item_cn(failed_product)}，"
+            f"退出岗位后重新进入 ({failed_count}/{self.PRODUCT_SELECT_RETRY_LIMIT})"
+        )
+        if not self.back_to_postmanage_from_dispatch():
+            raise GameStuckError(f"{self._item_cn(product)}生产选择餐品失败后无法返回岗位管理页")
+
+        self.post_manage_mode(POST_MANAGE_PRODUCTION)
+        self.post_manage_swipe(self.post_manage_swipe_count)
+        if not self.post_open(post_button):
+            raise GameStuckError(f"{self._item_cn(product)}生产选择餐品失败后无法重新打开岗位")
+        self.device.sleep(0.5)
+
+    def increase_product_selection_failure(self, product_select_failures, failed_product):
+        """记录单个餐品的选择失败次数。
+
+        Args:
+            product_select_failures (dict[str, int]): 各商品失败计数记录字典。
+            failed_product (str): 失败商品名称。
+
+        Returns:
+            int: 递增后的失败次数。
+        """
+        failed_count = product_select_failures.get(failed_product, 0) + 1
+        product_select_failures[failed_product] = failed_count
+        return failed_count
+
     def post_produce(self, post_id, product, number, time_var_name,product2=None):
-        """生产产品（通用）"""
+        """进入岗位安排指定商品的生产流程。
+
+        若首选商品原料不足且传入了备选商品 product2，则尝试切换生产 product2。
+
+        Args:
+            post_id (str): 岗位标识。
+            product (str): 首选商品名称。
+            number (int): 计划生产数量。
+            time_var_name (str): 存储完成时间的属性名。
+            product2 (str, optional): 备选商品名称。
+
+        Returns:
+            int: 实际安排生产的数量，原料不足返回 0。
+
+        Raises:
+            GameStuckError: 派遣流程超时或界面卡死时抛出。
+        """
         post_button = self.posts[post_id]['button']
         self.post_close()
         self.post_open(post_button)
@@ -193,41 +335,54 @@ class IslandShopBase(Island, WarehouseOCR):
         time_work = Duration(ISLAND_WORKING_TIME)
         selection = self.name_to_config[product]['selection']
         selection_check = self.name_to_config[product]['selection_check']
-        while 1:
-            self.device.screenshot()
+        product_select_failures = {}
+        for _ in self.loop(timeout=120, skip_first=False):
             if self.appear_then_click(ISLAND_POST_SELECT, offset=1):
+                self.device.sleep(0.5)
                 continue
             if self.appear(ISLAND_SELECT_CHARACTER_CHECK, offset=1):
                 if self.special_character:
-                    self.select_special_character(product)
-                    self.device.sleep(0.5)
-                    self.appear_then_click(SELECT_UI_CONFIRM)
-                    self.device.sleep(0.5)
-                elif self.select_character(character_list=self.chef_config):
-                    self.device.sleep(0.5)
-                    self.appear_then_click(SELECT_UI_CONFIRM)
-                    self.device.sleep(0.5)
+                    selected = self.select_special_character(product)
+                    character_filter = "special"
+                else:
+                    selected = self.select_character(character_list=self.chef_config)
+                    character_filter = self.chef_config
+                if selected:
+                    if not self.confirm_selected_character(f"{self._item_cn(product)}生产派遣"):
+                        self.back_to_postmanage_from_dispatch()
+                        return 0
+                else:
+                    logger.warning(f"[岛屿] {self._item_cn(product)}生产派遣无可用角色: {character_filter}")
+                    self.chef_unavailable_products.add(product)
+                    self.back_to_postmanage_from_dispatch()
+                    return 0
                 continue
             if self.appear(ISLAND_SELECT_PRODUCT_CHECK, offset=1):
                 if self.select_product(selection, selection_check):
                     self.device.sleep(0.5)
                     if self.produce_check():
-                        logger.warning(f"原料不足，无法生产 {product}")
+                        logger.warning(f"[岛屿] 原料不足，无法生产 {self._item_cn(product)}")
                         self.device.sleep(0.5)
                         if product == self.special_food:
                             if product2:
                                 selection2 = self.name_to_config[product2]['selection']
                                 selection_check2 = self.name_to_config[product2]['selection_check']
-                                self.select_product(selection2, selection_check2)
+                                if not self.select_product(selection2, selection_check2):
+                                    failed_count = self.increase_product_selection_failure(
+                                        product_select_failures, product2
+                                    )
+                                    self.retry_product_selection_from_postmanage(
+                                        post_button, product, product2, failed_count
+                                    )
+                                    continue
                                 self.device.sleep(0.5)
                                 if self.produce_check():
-                                    logger.warning(f"原料不足，无法生产 {product2}")
+                                    logger.warning(f"[岛屿] 原料不足，无法生产 {self._item_cn(product2)}")
                                     self.device.click(ISLAND_BACK)
                                     self.device.sleep(0.5)
                                     return 0  # 返回0表示原料不足
                                 else:
-                                    for _ in range(number - 1):
-                                        self.device.click(POST_ADD_ONE)
+                                    self.post_add_one(number - 1)
                                     self.device.sleep(0.5)
                                     self.device.click(POST_ADD_ORDER)
                                     self.device.sleep(0.5)
@@ -244,13 +399,21 @@ class IslandShopBase(Island, WarehouseOCR):
                             self.device.sleep(0.5)
                             return 0  # 返回0表示原料不足
                     else:
-                        for _ in range(number - 1):
-                            self.device.click(POST_ADD_ONE)
+                        self.post_add_one(number - 1)
                         self.device.sleep(0.5)
                         self.device.click(POST_ADD_ORDER)
                         self.device.sleep(0.5)
                         break
+                else:
+                    failed_count = self.increase_product_selection_failure(
+                        product_select_failures, product
+                    )
+                    self.retry_product_selection_from_postmanage(
+                        post_button, product, product, failed_count
+                    )
                 continue
+        else:
+            raise GameStuckError(f"{self._item_cn(product)}生产派遣流程超时")
         self.wait_until_appear(ISLAND_POSTMANAGE_CHECK)
         self.device.sleep(0.5)
         self.post_manage_swipe(self.post_manage_swipe_count)
@@ -262,18 +425,23 @@ class IslandShopBase(Island, WarehouseOCR):
                                 alphabet='0123456789')
         actual_number = ocr_post_number.ocr(image)
         time_value = time_work.ocr(self.device.image)
-        finish_time = datetime.now() + time_value
+        finish_time = current_time() + time_value
         setattr(self, time_var_name, finish_time)
         self.posts[post_id]['status'] = 'working'
         # 扣除前置材料（子类可覆盖）
         self.deduct_materials(product, actual_number)
-        logger.info(f"已安排生产：{product} x{actual_number}")
+        logger.info(f"[岛屿] 已安排生产：{self._item_cn(product)} x{actual_number}")
         self.post_close()
         # 返回实际生产数量
         return actual_number
 
     def deduct_materials(self, product, number):
-        """扣除前置材料（包括套餐原材料）"""
+        """扣除前置材料（包括套餐原材料）。
+
+        Args:
+            product (str): 制作的商品名称。
+            number (int): 制作批次数量。
+        """
         # 扣除套餐原材料
         if product in self.meal_compositions:
             composition = self.meal_compositions[product]
@@ -282,17 +450,139 @@ class IslandShopBase(Island, WarehouseOCR):
                 material_needed = number * quantity_per
                 if material in self.warehouse_counts:
                     self.warehouse_counts[material] -= material_needed
-                    logger.info(f"扣除原材料：{material} -{material_needed} (用于制作 {product})")
+                    logger.info(f"[岛屿] 扣除原材料：{self._item_cn(material)} -{material_needed} (用于制作 {self._item_cn(product)})")
 
     def get_idle_posts(self):
-        """获取空闲的岗位ID列表（通用）"""
+        """获取当前所有处于空闲状态的岗位 ID 列表。
+
+        Returns:
+            list[str]: 空闲岗位 ID 列表。
+        """
         return [post_id for post_id, post_info in self.posts.items()
                 if post_info['status'] == 'idle']
 
     # ============ 核心逻辑 ============
 
+    def _schedule_and_track(self, produced_pass):
+        """排产并将本轮产出记录到 produced_pass。
+
+        produced_pass 跨多次排产累加，让后续 _compute_base_demands 的 current_totals
+        能看到刚生产但未入库的量（不修改 warehouse_counts——仓库里确实还没有）。
+
+        Args:
+            produced_pass (dict[str, int]): 跨多次排产累加的已产出数量映射。
+        """
+        if not self.to_post_products:
+            return
+        to_post_snapshot = dict(self.to_post_products)
+        self.schedule_production()
+        for name in to_post_snapshot:
+            remaining = self.to_post_products.get(name, 0)
+            produced_qty = to_post_snapshot[name] - remaining
+            if produced_qty > 0:
+                produced_pass[name] = produced_pass.get(name, 0) + produced_qty
+
+    def _rebuild_current_totals(self, produced_pass):
+        """重建当前总库存：仓库 + 在制品 + 本轮已下单未收获。
+
+        必须使用"当前"仓库账（套餐下单时 deduct_materials 已实时扣减原料），
+        而不是开跑前的库存快照，否则同一轮内被套餐消耗的原料
+        会在下一轮被误判为仍然可用，导致原料槽位目标漏排。
+
+        Args:
+            produced_pass (dict[str, int]): 本轮已下单的累计产出字典。
+
+        Returns:
+            dict[str, int]: 计算后的当前总库存映射。
+        """
+        totals = {}
+        all_product_names = set(name for name, _ in self.post_products)
+        for item in all_product_names | set(self.post_check_meal.keys()) | set(
+                self.warehouse_counts.keys()):
+            totals[item] = self.post_check_meal.get(item, 0) + self.warehouse_counts.get(item, 0)
+        for name, qty in produced_pass.items():
+            totals[name] = totals.get(name, 0) + qty
+        return totals
+
+    def _compute_base_demands(self, check_materials=False, force_skip=None):
+        """计算基础需求：严格按槽位顺序处理，找到第一个有缺口的槽位即停止。
+
+        保留线：取本轮已迭代槽位中各产品的最高目标（无缺口时覆盖全部
+        槽位，全部达标时保留线取最大目标），扣除后 current_totals 为
+        超额库存，可作为原料被后续槽位消费。
+
+        Args:
+            check_materials (bool): False（默认）需求计算，原料为0不阻断，留给
+                             process_meal_requirements 分解；True 排产失败后使用，严格检查零库存来跳过缺口。
+            force_skip (set[str], optional): 强制跳过的产品名集合。排产多次失败（非原料原因如
+                        角色被占）时使用，让本轮不再停留在这个缺口上。
+        """
+        # ============ 基础需求计算 ============
+        logger.info("[岛屿] 阶段：基础需求" + ("（严格模式）" if check_materials else ""))
+
+        self.to_post_products = {}
+        virtual_totals = dict(self.current_totals)
+        force_skip = force_skip or set()
+
+        # 遍历槽位，找到第一个有缺口且可生产的就只处理它
+        break_idx = len(self.post_products)
+        for idx, (name, target) in enumerate(self.post_products):
+            current = virtual_totals.get(name, 0)
+            if current < target:
+                if name in force_skip:
+                    logger.info(f"[岛屿] 槽位{idx + 1} {self._item_cn(name)} 本轮已尝试失败，强制跳过")
+                    continue
+                if name in self.chef_unavailable_products:
+                    logger.info(f"[岛屿] 槽位{idx + 1} {self._item_cn(name)} 无可用角色，本轮跳过")
+                    continue
+                deficit = target - current
+                # check_materials=True 时严格检查零库存，用于跳过无法生产的缺口
+                if self.get_max_producible(
+                        name, min(self.POST_PRODUCE_LIMIT, deficit),
+                        skip_zero_materials=not check_materials) <= 0:
+                    logger.info(f"[岛屿] 槽位{idx + 1} {self._item_cn(name)} 材料完全不足，本轮跳过")
+                    continue
+                self.to_post_products[name] = deficit
+                virtual_totals[name] = target
+                break_idx = idx
+                break
+
+        # 保留线：只取已迭代槽位（含 break 点）中的最高目标
+        max_targets = {}
+        for name, target in self.post_products[:break_idx + 1]:
+            max_targets[name] = max(max_targets.get(name, 0), target)
+        # 记录保留线目标，供排产阶段限制套餐对其库存的消耗
+        self._reserved_targets = dict(max_targets)
+        for name, max_target in max_targets.items():
+            current = self.current_totals.get(name, 0)
+            if current < max_target:
+                self.current_totals[name] = 0
+            else:
+                self.current_totals[name] = current - max_target
+
+    def get_priority_production(self):
+        """返回基础需求之前安排的产品及数量，由店铺声明季节规则。
+
+        Returns:
+            dict[str, int]: 优先排产商品名称到数量的映射。
+        """
+        return {}
+
     def run(self):
+        """运行店铺生产与岗位调度主流程。
+
+        巡检各岗位状态与仓库库存，计算并排产基础需求商品；
+        利用剩余空闲岗位填充特殊商品或常驻挂机商品，最后按最早完成时间更新任务定时器。
+
+        Raises:
+            GameBugError: 检测到游戏异常弹窗需要重启时抛出。
+        """
         self.island_error = False
+        self.chef_unavailable_products.clear()
+        self.unavailable_characters.clear()
+        # 在制品和保留线每轮重新建立，不能累加同一实例上轮的识别结果。
+        self.post_check_meal.clear()
+        self._reserved_targets.clear()
         self.goto_postmanage()
         self.post_manage_mode(POST_MANAGE_PRODUCTION)
         self.post_close()
@@ -319,52 +609,92 @@ class IslandShopBase(Island, WarehouseOCR):
             self.post_manage_swipe(self.post_manage_swipe_count)
 
             # 计算当前总库存
-            self.current_totals = {}
-            for item in set(self.post_products.keys()) | set(self.post_check_meal.keys()) | set(
-                    self.warehouse_counts.keys()):
-                self.current_totals[item] = self.post_check_meal.get(item, 0) + self.warehouse_counts.get(item, 0)
+            self.current_totals = self._rebuild_current_totals({})
 
             # ============ 调试信息 ============
-            logger.info(f"=== 调试信息 ===")
-            logger.info(f"仓库库存: {self.warehouse_counts}")
-            logger.info(f"生产中库存: {self.post_check_meal}")
-            logger.info(f"当前总库存: {self.current_totals}")
-            logger.info(f"基础需求配置: {self.post_products}")
+            logger.info(f"[岛屿] === 调试信息 ===")
+            logger.info(f"[岛屿] 仓库库存: {self._inv_cn(self.warehouse_counts)}")
+            logger.info(f"[岛屿] 生产中库存: {self._inv_cn(self.post_check_meal)}")
+            logger.info(f"[岛屿] 当前总库存: {self._inv_cn(self.current_totals)}")
+            logger.info(f"[岛屿] 基础需求配置（共{len(self.post_products)}个槽位）: {self._products_cn(self.post_products)}")
             logger.info("===============")
 
-            # 清空待生产列表
-            self.to_post_products = {}
+            self._compute_base_demands()
 
-            # ============ 基础需求计算 ============
-            logger.info("阶段：基础需求")
-            # 计算基础需求
-            for item, target in self.post_products.items():
-                current = self.current_totals.get(item, 0)
-                if current < target:
-                    self.to_post_products[item] = target - current
-                    self.current_totals[item] = 0
-                else:
-                    self.current_totals[item] = current - target
-            logger.info(f"待完成备餐: {self.to_post_products}")
-            logger.info(f"当前剩余库存: {self.current_totals}")
+            logger.info(f"[岛屿] 待完成备餐: {self._inv_cn(self.to_post_products)}")
+            logger.info(f"[岛屿] 当前剩余库存: {self._inv_cn(self.current_totals)}")
             # ============ 处理套餐分解 ============
             if self.to_post_products:
                 self.to_post_products = self.process_meal_requirements(self.to_post_products)
-                logger.info(f"基础需求生产计划: {self.to_post_products}")
+                logger.info(f"[岛屿] 基础需求生产计划: {self._inv_cn(self.to_post_products)}")
 
-            # ============ 安排基础需求生产 ============
-            if self.to_post_products:
-                # 安排基础需求生产
-                self.schedule_production()
-            else:
-                logger.info("基础需求已满足")
+            # ============ 安排基础需求生产（循环直到无空岗或无缺口） ============
+            _produced_pass = {}  # 本次 run() 调用中已生产的累计
+            _force_skip_run = set()  # 排产多次无法生产的缺口（非原料原因），本轮强制跳过
+            _loop_count = 0
+
+            # 季节优先排产也记入本轮在制品；基础需求必须按扣料后的库存重算。
+            priority_products = self.get_priority_production()
+            if priority_products:
+                self.to_post_products = priority_products
+                logger.info(f"[岛屿] 季节优先生产计划: {self._inv_cn(priority_products)}")
+                self._schedule_and_track(_produced_pass)
+                self.current_totals = self._rebuild_current_totals(_produced_pass)
+                self._compute_base_demands()
+                if self.to_post_products:
+                    self.to_post_products = self.process_meal_requirements(self.to_post_products)
+
+            self._schedule_and_track(_produced_pass)
+
+            while self.get_idle_posts():
+                _loop_count += 1
+                if _loop_count > self._MAX_FILL_LOOP:
+                    logger.warning(f"[岛屿] [循环] 已达最大迭代次数 {self._MAX_FILL_LOOP}，强制退出")
+                    break
+                self.current_totals = self._rebuild_current_totals(_produced_pass)
+
+                self._compute_base_demands(force_skip=_force_skip_run)
+                if not self.to_post_products:
+                    logger.info("[岛屿] 所有槽位需求已满足")
+                    break
+
+                self.to_post_products = self.process_meal_requirements(self.to_post_products)
+                logger.info(f"[岛屿] 基础需求生产计划: {self._inv_cn(self.to_post_products)}")
+
+                prev_pass_total = sum(_produced_pass.values())
+                self._schedule_and_track(_produced_pass)
+
+                if sum(_produced_pass.values()) == prev_pass_total and self.to_post_products:
+                    # 先切严格模式（绕"原料真没有"的坎儿）
+                    logger.info("[岛屿] [循环] 当前缺口排产失败，切换严格模式扫描")
+                    self.to_post_products = {}
+                    self.current_totals = self._rebuild_current_totals(_produced_pass)
+                    # 严格模式必须传入已有的 force_skip 集合；否则之前已被标记
+                    # 卡住的产品（如 seafood_rice）会被再次扫描、再次 schedule，
+                    # 造成 UI 层无效点击。
+                    self._compute_base_demands(check_materials=True, force_skip=_force_skip_run)
+                    if not self.to_post_products:
+                        break
+                    self.to_post_products = self.process_meal_requirements(self.to_post_products)
+                    logger.info(f"[岛屿] 基础需求生产计划（严格模式）: {self._inv_cn(self.to_post_products)}")
+
+                    strict_prev_total = sum(_produced_pass.values())
+                    self._schedule_and_track(_produced_pass)
+
+                    if sum(_produced_pass.values()) == strict_prev_total and self.to_post_products:
+                        # 严格模式也无产出 → 非原料原因（角色被占等），强制跳过
+                        stuck_now = set(self.to_post_products.keys())
+                        logger.info(f"[岛屿] [循环] 严格模式也无产出，强制跳过: {stuck_now}")
+                        _force_skip_run.update(stuck_now)
+                        self.to_post_products = {}
+                    continue
 
             # ============ 检查是否还有空闲岗位，安排特殊餐品或常驻餐品 ============
             # 重新检查空闲岗位（因为可能部分岗位被基础需求占用）
             idle_posts_after_basic = self.get_idle_posts()
 
             # 获取特殊餐品和常驻餐品配置
-            special_food = self.special_food
+            special_food = self.special_food if self.FILL_SPECIAL_FOOD else None
             away_cook = getattr(self.config, self.config_away_cook, None)
 
             # 检查特殊餐品是否为有效值（不为None且不为"None"）
@@ -376,7 +706,7 @@ class IslandShopBase(Island, WarehouseOCR):
                              away_cook in self.name_to_config)
 
             if idle_posts_after_basic and (has_special_food or has_away_cook):
-                logger.info(f"基础需求完成后，还有 {len(idle_posts_after_basic)} 个空闲岗位")
+                logger.info(f"[岛屿] 基础需求完成后，还有 {len(idle_posts_after_basic)} 个空闲岗位")
 
                 # 根据不同情况安排生产
                 for post_id in idle_posts_after_basic:
@@ -385,49 +715,49 @@ class IslandShopBase(Island, WarehouseOCR):
 
                     if has_special_food and has_away_cook:
                         # 情况1：既有特殊餐品又有常驻餐品
-                        logger.info(f"同时有特殊餐品 {special_food} 和常驻餐品 {away_cook}")
-                        logger.info(f"优先尝试生产特殊餐品，如果原料不足则生产常驻餐品")
+                        logger.info(f"[岛屿] 同时有特殊餐品 {self._item_cn(special_food)} 和常驻餐品 {self._item_cn(away_cook)}")
+                        logger.info(f"[岛屿] 优先尝试生产特殊餐品，如果原料不足则生产常驻餐品")
 
                         # 尝试生产特殊餐品（如果原料不足会自动尝试常驻餐品）
                         result = self.post_produce(
                             post_id,
                             product=special_food,
-                            number=6,  # 最大6个
+                            number=self.POST_PRODUCE_LIMIT,
                             time_var_name=time_var_name,
                             product2=away_cook
                         )
 
                         if result == 0:
                             # 特殊餐品和常驻餐品都原料不足
-                            logger.info(f"特殊餐品 {special_food} 和常驻餐品 {away_cook} 都原料不足，保持岗位空闲")
+                            logger.info(f"[岛屿] 特殊餐品 {self._item_cn(special_food)} 和常驻餐品 {self._item_cn(away_cook)} 都原料不足，保持岗位空闲")
                             break
                         else:
-                            logger.info(f"已为岗位 {post_id} 安排生产")
+                            logger.info(f"[岛屿] 已为岗位 {post_id} 安排生产")
 
                     elif has_special_food and not has_away_cook:
                         # 情况2：只有特殊餐品，没有常驻餐品
-                        logger.info(f"只有特殊餐品 {special_food}，没有常驻餐品")
+                        logger.info(f"[岛屿] 只有特殊餐品 {self._item_cn(special_food)}，没有常驻餐品")
 
                         result = self.post_produce(
                             post_id,
                             product=special_food,
-                            number=6,  # 最大6个
+                            number=self.POST_PRODUCE_LIMIT,
                             time_var_name=time_var_name
                         )
 
                         if result == 0:
                             # 特殊餐品原料不足
-                            logger.info(f"特殊餐品 {special_food} 原料不足，保持岗位空闲")
+                            logger.info(f"[岛屿] 特殊餐品 {self._item_cn(special_food)} 原料不足，保持岗位空闲")
                             break
                         else:
-                            logger.info(f"已为岗位 {post_id} 安排生产特殊餐品")
+                            logger.info(f"[岛屿] 已为岗位 {post_id} 安排生产特殊餐品")
 
                     elif not has_special_food and has_away_cook:
                         # 情况3：只有常驻餐品，没有特殊餐品
-                        logger.info(f"只有常驻餐品 {away_cook}，没有特殊餐品")
+                        logger.info(f"[岛屿] 只有常驻餐品 {self._item_cn(away_cook)}，没有特殊餐品")
 
                         # 检查材料限制
-                        batch_size = min(6, 9999)  # 最大6个
+                        batch_size = self.POST_PRODUCE_LIMIT
                         batch_size = self.get_max_producible(away_cook, batch_size)
 
                         if batch_size > 0:
@@ -439,22 +769,22 @@ class IslandShopBase(Island, WarehouseOCR):
                             )
 
                             if result == 0:
-                                logger.info(f"常驻餐品 {away_cook} 原料不足，保持岗位空闲")
+                                logger.info(f"[岛屿] 常驻餐品 {self._item_cn(away_cook)} 原料不足，保持岗位空闲")
                                 break
                             else:
-                                logger.info(f"已为岗位 {post_id} 安排常驻餐品 {away_cook} x{batch_size}")
+                                logger.info(f"[岛屿] 已为岗位 {post_id} 安排常驻餐品 {self._item_cn(away_cook)} x{batch_size}")
                         else:
-                            logger.info(f"生产 {away_cook} 的材料不足，跳过岗位 {post_id}")
+                            logger.info(f"[岛屿] 生产 {self._item_cn(away_cook)} 的材料不足，跳过岗位 {post_id}")
                             break
 
                     else:
                         # 情况4：既没有特殊餐品也没有常驻餐品
-                        logger.info("未设置特殊餐品或常驻餐品，保持空闲")
+                        logger.info("[岛屿] 未设置特殊餐品或常驻餐品，保持空闲")
                         break  # 退出循环，不再处理其他空闲岗位
 
             elif idle_posts_after_basic:
                 # 有空闲岗位但没有设置特殊餐品或常驻餐品
-                logger.info(f"有 {len(idle_posts_after_basic)} 个空闲岗位，但未设置特殊餐品或常驻餐品，保持空闲")
+                logger.info(f"[岛屿] 有 {len(idle_posts_after_basic)} 个空闲岗位，但未设置特殊餐品或常驻餐品，保持空闲")
 
         # ============ 设置任务延迟 ============
         finish_times = []
@@ -462,7 +792,7 @@ class IslandShopBase(Island, WarehouseOCR):
             time_value = getattr(self, var)
             if time_value is not None:
                 finish_times.append(time_value)
-        hours_later = datetime.now() + timedelta(hours=6)
+        hours_later = current_time() + timedelta(hours=6)
         finish_times.append(hours_later)
         finish_times.sort()
         self.config.task_delay(target=finish_times)
@@ -471,9 +801,16 @@ class IslandShopBase(Island, WarehouseOCR):
             raise GameBugError("检测到岛屿ERROR1，需要重启")
 
     def process_meal_requirements(self, source_products):
-        """处理套餐需求（修正版）"""
-        logger.info(f"=== 进入process_meal_requirements ===")
-        logger.info(f"传入的需求: {source_products}")
+        """分解套餐并计算考虑原材料补充后的完整生产需求计划。
+
+        Args:
+            source_products (dict[str, int]): 各商品的原始净需求映射。
+
+        Returns:
+            dict[str, int]: 经特殊材料约束调整后的最终生产需求计划。
+        """
+        logger.info(f"[岛屿] === 进入process_meal_requirements ===")
+        logger.info(f"[岛屿] 传入的需求: {self._inv_cn(source_products)}")
 
         result = {}
 
@@ -486,20 +823,20 @@ class IslandShopBase(Island, WarehouseOCR):
                 continue
             if product in self.meal_compositions:
                 meal_demands[product] = quantity
-                logger.info(f"  识别为套餐: {product} x{quantity}")
+                logger.info(f"[岛屿]   识别为套餐: {self._item_cn(product)} x{quantity}")
             else:
                 base_demands[product] = quantity
-                logger.info(f"  识别为基础餐品: {product} x{quantity}")
+                logger.info(f"[岛屿]   识别为基础餐品: {self._item_cn(product)} x{quantity}")
 
-        logger.info(f"套餐需求: {meal_demands}")
-        logger.info(f"基础需求: {base_demands}")
+        logger.info(f"[岛屿] 套餐需求: {self._inv_cn(meal_demands)}")
+        logger.info(f"[岛屿] 基础需求: {self._inv_cn(base_demands)}")
 
         # 2. 处理套餐需求 - 直接加入结果（套餐可以直接生产）
         # 注意：这里传入的已经是净需求，不需要再扣除库存
         for meal, meal_quantity in meal_demands.items():
             if meal_quantity > 0:
                 result[meal] = meal_quantity
-                logger.info(f"  套餐直接生产: {meal} x{meal_quantity}")
+                logger.info(f"[岛屿]   套餐直接生产: {self._item_cn(meal)} x{meal_quantity}")
 
         # 3. 处理基础需求（这些可能是套餐的原材料）
         material_needs = {}
@@ -511,13 +848,13 @@ class IslandShopBase(Island, WarehouseOCR):
                 for material in composition['required']:
                     needed = meal_quantity * composition.get('quantity_per', 1)
                     material_needs[material] = material_needs.get(material, 0) + needed
-                    logger.info(f"  套餐 {meal} 需要原材料: {material} x{needed}")
+                    logger.info(f"[岛屿]   套餐 {self._item_cn(meal)} 需要原材料: {self._item_cn(material)} x{needed}")
 
-        logger.info(f"原材料总需求: {material_needs}")
+        logger.info(f"[岛屿] 原材料总需求: {self._inv_cn(material_needs)}")
 
         # 4. 处理基础需求，并考虑原材料需求
         for base_product, base_quantity in base_demands.items():
-            logger.info(f"  处理基础餐品 {base_product}: 基础需求={base_quantity}")
+            logger.info(f"[岛屿]   处理基础餐品 {self._item_cn(base_product)}: 基础需求={base_quantity}")
 
             # 总需求 = 基础需求（已经是净需求） + 套餐原材料需求
             total_needed = base_quantity
@@ -529,53 +866,84 @@ class IslandShopBase(Island, WarehouseOCR):
 
                 # 检查原材料库存
                 current_stock = self.current_totals.get(base_product, 0)
-                logger.info(f"    原材料需求: +{raw_material_needed}, 当前库存: {current_stock}")
+                logger.info(f"[岛屿]     原材料需求: +{raw_material_needed}, 当前库存: {current_stock}")
 
                 # 计算原材料净需求
                 net_raw_needed = max(0, raw_material_needed - current_stock)
                 total_needed += net_raw_needed
 
-                logger.info(f"    原材料净需求: {net_raw_needed}, 总需求: {total_needed}")
+                logger.info(f"[岛屿]     原材料净需求: {net_raw_needed}, 总需求: {total_needed}")
 
                 # 从material_needs中移除，避免重复计算
                 del material_needs[base_product]
             else:
                 # 不是原材料，直接使用基础需求
-                logger.info(f"    总需求: {total_needed}")
+                logger.info(f"[岛屿]     总需求: {total_needed}")
 
             if total_needed > 0:
                 result[base_product] = total_needed
-                logger.info(f"    添加到生产计划: {base_product} x{total_needed}")
+                logger.info(f"[岛屿]     添加到生产计划: {self._item_cn(base_product)} x{total_needed}")
             else:
-                logger.info(f"    不需要生产")
+                logger.info(f"[岛屿]     不需要生产")
 
         # 5. 处理剩余的原材料需求（这些基础餐品不在基础需求列表中）
         for material, material_quantity in material_needs.items():
-            logger.info(f"  处理剩余原材料 {material}: 需求={material_quantity}")
+            logger.info(f"[岛屿]   处理剩余原材料 {self._item_cn(material)}: 需求={material_quantity}")
 
             current_stock = self.current_totals.get(material, 0)
-            logger.info(f"    当前总库存: {current_stock}")
+            logger.info(f"[岛屿]     当前总库存: {current_stock}")
 
             net_needed = max(0, material_quantity - current_stock)
             if net_needed > 0:
                 result[material] = net_needed
-                logger.info(f"    添加到生产计划: {material} x{net_needed}")
+                logger.info(f"[岛屿]     添加到生产计划: {self._item_cn(material)} x{net_needed}")
             else:
-                logger.info(f"    库存充足，不需要生产")
+                logger.info(f"[岛屿]     库存充足，不需要生产")
 
-        logger.info(f"无特殊材料限制下的生产计划: {result}")
+        logger.info(f"[岛屿] 无特殊材料限制下的生产计划: {self._inv_cn(result)}")
         # 6. 考虑特殊材料限制
         result = self.apply_special_material_constraints(result)
 
-        logger.info(f"最终生产计划: {result}")
-        logger.info(f"=== 离开process_meal_requirements ===")
+        logger.info(f"[岛屿] 最终生产计划: {self._inv_cn(result)}")
+        logger.info(f"[岛屿] === 离开process_meal_requirements ===")
 
         return result
 
-    def get_max_producible(self, product, requested_quantity):
-        """获取最大可生产数量（修正版）"""
+    def _get_usable_stock(self, material, material_stock):
+        """获取套餐制作时指定原材料的可用库存。
+
+        保留线内商品（_reserved_targets）只有在库存低于自身目标时才完全
+        禁止作为套餐原料；达到目标后允许先消耗，再由套餐分解补充回目标。
+        这样既保护尚未达标产品的保底库存，也避免库存恰好等于目标时把
+        可用量错误算成 0。在产数量不计入可用量（做套餐查原料时在产不算）。
+
+        Args:
+            material (str): 原料名称。
+            material_stock (int): 仓库实际库存数量。
+
+        Returns:
+            int: 允许被套餐消耗的可用库存数量。
+        """
+        if material in self._reserved_targets:
+            if material_stock < self._reserved_targets[material]:
+                return 0
+        return material_stock
+
+    def get_max_producible(self, product, requested_quantity, skip_zero_materials=False):
+        """计算指定商品在当前原材料库存和岗位限制下的最大可生产数量。
+
+        Args:
+            product (str): 产品名称。
+            requested_quantity (int): 请求生产的目标数量。
+            skip_zero_materials (bool): 需求计算阶段为 True，原料库存为 0 时不阻断套餐，
+                                 交给 process_meal_requirements 分解需求；
+                                 排产阶段为 False，严格检查避免游戏层拒绝导致卡顿。
+
+        Returns:
+            int: 允许生产的最大批次数量。
+        """
         max_producible = requested_quantity
-        logger.info(f"检查 {product} 的最大可生产数量，需求: {requested_quantity}")
+        logger.info(f"[岛屿] 检查 {self._item_cn(product)} 的最大可生产数量，需求: {requested_quantity}")
 
         # 1. 如果是套餐，检查原材料库存
         if product in self.meal_compositions:
@@ -586,60 +954,72 @@ class IslandShopBase(Island, WarehouseOCR):
                 quantity_per = composition.get('quantity_per', 1)
                 if quantity_per == 0:
                     continue
-                max_by_material = material_stock // quantity_per
-                max_producible = min(max_producible, max_by_material)
+                # 保留线内的产品低于目标时不能消耗（见 _get_usable_stock），
+                # 避免套餐吃掉前置项目尚未达标的保底库存；达到目标后允许
+                # 先消耗并由套餐分解补回。
+                usable_stock = self._get_usable_stock(material, material_stock)
+                max_by_material = usable_stock // quantity_per
                 if max_by_material <= 0:
-                    logger.info(f"  {product} 缺少原材料: {material} (库存: {material_stock})")
-                    return 0
-                else:
-                    logger.info(f"  {product} 原材料 {material}: 库存 {material_stock}，每个需要 {quantity_per}，最大生产 {max_by_material}")
+                    if skip_zero_materials and material_stock == 0:
+                        # 需求计算阶段且真零库存：不阻断，留给 process_meal_requirements 分解
+                        logger.info(f"[岛屿]   {self._item_cn(product)} 原材料 {self._item_cn(material)} 库存为 0，需求计算阶段跳过此原料限制")
+                        continue
+                    else:
+                        # 排产阶段 或 有但不满足一批：严格处理
+                        if material in self._reserved_targets:
+                            logger.info(f"[岛屿]   {self._item_cn(product)} 原材料 {self._item_cn(material)} 暂不可用（库存 {material_stock} 低于目标 {self._reserved_targets[material]}），暂不消耗其保底库存")
+                        else:
+                            logger.info(f"[岛屿]   {self._item_cn(product)} 缺少原材料: {self._item_cn(material)} (库存: {material_stock})")
+                        return 0
+                max_producible = min(max_producible, max_by_material)
+                logger.info(f"[岛屿]   {self._item_cn(product)} 原材料 {self._item_cn(material)}: 库存 {material_stock}，可用 {usable_stock}，每个需要 {quantity_per}，最大生产 {max_by_material}")
 
-        # 2. 检查岗位数量限制（每个岗位最多6个）
-        max_producible = min(max_producible, 6)
-        logger.info(f"岗位限制: 最多生产6个，当前限制后: {max_producible}")
+        # 2. 检查岗位数量限制
+        max_producible = min(max_producible, self.POST_PRODUCE_LIMIT)
+        logger.info(f"[岛屿] 岗位限制: 最多生产{self.POST_PRODUCE_LIMIT}个，当前限制后: {max_producible}")
 
         # 3. 检查特殊材料（被子类覆盖）
         max_producible = self.check_special_materials(product, max_producible)
-        logger.info(f"特殊材料检查后: {max_producible}")
+        logger.info(f"[岛屿] 特殊材料检查后: {max_producible}")
 
         return max_producible
 
     def apply_special_material_constraints(self, requirements):
-        """应用特殊材料限制（需求阶段）。子类可覆盖此方法。
+        """应用特殊原材料库存对生产计划的限制，子类可覆盖此方法。
 
         Args:
-            requirements: 字典，{产品名: 需求数量}
+            requirements (dict[str, int]): 商品名称到需求数量的映射字典。
 
         Returns:
-            调整后的需求字典
+            dict[str, int]: 调整后的需求字典。
         """
         return requirements
 
     def process_away_cook(self):
-        """处理常驻餐品"""
+        """初始化常驻挂机生产商品的生产需求队列。"""
         away_cook = getattr(self.config, self.config_away_cook, None)
 
         # 检查 away_cook 是否有效
         if away_cook and away_cook != "None" and away_cook in self.name_to_config:
             self.to_post_products = {away_cook: 9999}
-            logger.info(f"常驻餐品模式：生产 {away_cook}")
+            logger.info(f"[岛屿] 常驻餐品模式：生产 {self._item_cn(away_cook)}")
         else:
             self.to_post_products = {}
             if away_cook is None or away_cook == "None":
-                logger.info("未设置常驻餐品，保持空闲")
+                logger.info("[岛屿] 未设置常驻餐品，保持空闲")
             elif away_cook not in self.name_to_config:
-                logger.info(f"常驻餐品 '{away_cook}' 不在商品列表中，保持空闲")
+                logger.info(f"[岛屿] 常驻餐品 '{self._item_cn(away_cook)}' 不在商品列表中，保持空闲")
 
     def schedule_production(self):
-        """安排生产，利用所有空闲岗位"""
+        """遍历所有空闲岗位并按优先级分配生产任务。"""
         if not self.to_post_products:
-            logger.info("没有需要生产的餐品")
+            logger.info("[岛屿] 没有需要生产的餐品")
             return
 
         # 获取空闲岗位
         idle_posts = self.get_idle_posts()
         if not idle_posts:
-            logger.info("没有空闲的岗位")
+            logger.info("[岛屿] 没有空闲的岗位")
             return
 
         # 检查是否为常驻餐品模式（无限数量生产）
@@ -652,15 +1032,15 @@ class IslandShopBase(Island, WarehouseOCR):
                 break
 
         if is_away_cook_mode:
-            logger.info(f"常驻餐品模式：为所有空闲岗位安排生产 {away_cook_product}")
+            logger.info(f"[岛屿] 常驻餐品模式：为所有空闲岗位安排生产 {self._item_cn(away_cook_product)}")
             # 为每个空闲岗位安排生产
             for post_id in idle_posts:
                 # 检查材料限制
-                batch_size = min(6, 9999)  # 最大6个
+                batch_size = self.POST_PRODUCE_LIMIT
                 batch_size = self.get_max_producible(away_cook_product, batch_size)
 
                 if batch_size <= 0:
-                    logger.info(f"生产 {away_cook_product} 的前置材料不足，跳过岗位 {post_id}")
+                    logger.info(f"[岛屿] 生产 {self._item_cn(away_cook_product)} 的前置材料不足，跳过岗位 {post_id}")
                     continue
 
                 # 分配生产
@@ -668,37 +1048,49 @@ class IslandShopBase(Island, WarehouseOCR):
                 time_var_name = f'{self.time_prefix}{post_num}'
                 self.post_produce(post_id, away_cook_product, batch_size, time_var_name)
 
-            logger.info("常驻餐品模式：已为所有空闲岗位安排生产")
+            logger.info("[岛屿] 常驻餐品模式：已为所有空闲岗位安排生产")
             return
 
         # 非常驻餐品模式：处理所有产品需求
         products_to_process = list(self.to_post_products.items())
 
-        # 如果有多个产品需求，按优先级排序
+        # 如果有多个产品需求，按槽位顺序排序（原料优先）
         if len(products_to_process) > 1:
-            def production_priority(item):
-                product, quantity = item
-                if product in self.meal_compositions:
-                    # 检查套餐原材料是否充足
-                    max_producible = self.get_max_producible(product, min(6, quantity))
-                    if max_producible > 0:
-                        return 0  # 最高优先级：可立即生产的套餐
-                    else:
-                        return 2  # 低优先级：原材料不足的套餐
-                else:
-                    # 基础餐品：检查是否可以生产
-                    max_producible = self.get_max_producible(product, min(6, quantity))
-                    if max_producible > 0:
-                        return 1  # 中等优先级：可生产的基础餐品
-                    else:
-                        return 3  # 最低优先级：无法生产的基础餐品
+            # 构建槽位顺序映射
+            slot_index = {}
+            idx = 0
+            for name, _ in self.post_products:
+                if name not in slot_index:
+                    slot_index[name] = idx
+                    idx += 1
 
-            products_to_process = sorted(products_to_process, key=production_priority)
+            # 原料取其服务套餐中最早槽位的索引
+            for meal, comp in self.meal_compositions.items():
+                if meal in slot_index:
+                    meal_slot = slot_index[meal]
+                    for mat in comp['required']:
+                        if mat not in slot_index or slot_index[mat] > meal_slot:
+                            slot_index[mat] = meal_slot
 
-        # 记录无法生产的产品
-        products_removed = []
+            # 按槽位顺序排序，同槽位内原料优先于成品
+            # 从套餐组成中提取所有原料名，避免双重身份产品被误判为非原料
+            material_names = set()
+            for comp in self.meal_compositions.values():
+                material_names.update(comp['required'])
+
+            # 未在 slot_index 中的产品默认排在已知槽位之后
+            default_slot = len(slot_index) + 1
+
+            def slot_priority(item):
+                product, _ = item
+                slot = slot_index.get(product, default_slot)
+                is_material = product in material_names
+                return (slot, 0 if is_material else 1)
+
+            products_to_process.sort(key=slot_priority)
 
         # 为每个空闲岗位分配生产任务
+        _produced_any = set()  # 本轮至少产出了1个的产品
         post_index = 0
         total_idle_posts = len(idle_posts)
 
@@ -711,22 +1103,24 @@ class IslandShopBase(Island, WarehouseOCR):
             if remaining_need <= 0:
                 continue
 
-            logger.info(f"尝试安排生产 {product}，需求: {remaining_need}")
+            logger.info(f"[岛屿] 尝试安排生产 {self._item_cn(product)}，需求: {remaining_need}")
 
             # 为每个空闲岗位分配生产（直到需求满足或没有空闲岗位）
             while remaining_need > 0 and post_index < total_idle_posts:
                 post_id = idle_posts[post_index]
 
                 # 计算最大可生产数量
-                max_producible = self.get_max_producible(product, min(6, remaining_need))
+                max_producible = self.get_max_producible(
+                    product, min(self.POST_PRODUCE_LIMIT, remaining_need))
 
                 if max_producible <= 0:
-                    logger.warning(f"生产 {product} 的材料不足，从生产计划中移除")
-                    products_removed.append(product)
-                    # 从生产计划中移除该产品
-                    if product in self.to_post_products:
-                        del self.to_post_products[product]
-                    break  # 跳出当前产品的生产循环
+                    logger.info(f"[岛屿] 生产 {self._item_cn(product)} 的材料暂时不足，保留在计划中等待下一轮")
+                    # 标记为本轮已在排产阶段确认原料不足，后续 _compute_base_demands
+                    # 会通过 chef_unavailable_products 检查直接跳过，避免同一 run()
+                    # 内再次计算并实际 UI 点击（get_max_producible 对基础餐品漏算
+                    # 底层食材时，每轮都会重新加入计划造成重复尝试）
+                    self.chef_unavailable_products.add(product)
+                    break  # 跳过当前产品，但保留在 to_post_products 中
 
                 # 分配生产
                 post_num = post_id[-1]
@@ -737,13 +1131,16 @@ class IslandShopBase(Island, WarehouseOCR):
 
                 # 如果实际生产数量为0，说明原料不足
                 if actual_number == 0:
-                    logger.warning(f"生产 {product} 时检测到原料不足，从生产计划中移除")
-                    products_removed.append(product)
-                    # 从生产计划中移除该产品
-                    if product in self.to_post_products:
-                        del self.to_post_products[product]
-                    break  # 跳出当前产品的生产循环
+                    logger.info(f"[岛屿] 生产 {self._item_cn(product)} 时检测到原料不足，保留在计划中等待下一轮")
+                    # 游戏 UI 层实际拒绝了生产（常见于基础餐品 get_max_producible 未建模
+                    # 的底层食材，如海鲜饭的米/海鲜料）。标记为本轮不可用，后续所有
+                    # _compute_base_demands 扫描都会直接跳过，避免同一 run() 内在
+                    # while 循环、严格模式中反复执行无效 UI 点击
+                    self.chef_unavailable_products.add(product)
+                    break  # 跳过当前产品，但保留在 to_post_products 中
 
+                # 记录已产出（部分生产不算停滞）
+                _produced_any.add(product)
                 # 更新需求
                 if product in self.to_post_products:
                     self.to_post_products[product] -= actual_number
@@ -760,15 +1157,20 @@ class IslandShopBase(Island, WarehouseOCR):
             if post_index >= total_idle_posts:
                 break
 
-        if products_removed:
-            logger.warning(f"以下产品因原料不足已从生产计划中移除: {products_removed}")
-
         if self.to_post_products:
-            logger.info(f"生产安排完成，剩余需求: {self.to_post_products}")
+            logger.info(f"[岛屿] 生产安排完成，剩余需求: {self._inv_cn(self.to_post_products)}")
         else:
-            logger.info("所有可安排的产品已安排生产")
+            logger.info("[岛屿] 所有可安排的产品已安排生产")
 
     def check_special_materials(self, product, batch_size):
-        """检查特殊材料（子类可覆盖）"""
+        """检查特殊材料库存限制，子类可覆盖此方法。
+
+        Args:
+            product (str): 目标商品名称。
+            batch_size (int): 计划生产批次数。
+
+        Returns:
+            int: 考虑特殊材料后允许生产的最大批次数。
+        """
         # 默认实现不检查特殊材料
         return batch_size

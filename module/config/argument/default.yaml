@@ -3,8 +3,18 @@
 # --------------------
 
 # ==================== Alas ====================
+OpsiExploreCleanup:
+  Scheduler:
+    Enable: false
 
 # ==================== Farm ====================
+
+GemsFarming:
+  EnemyPriority:
+    EnemyScaleBalanceWeight: S1_enemy_first
+ThreeOilLowCost:
+  EnemyPriority:
+    EnemyScaleBalanceWeight: S1_enemy_first
 
 # ==================== Event ====================
 
@@ -27,14 +37,25 @@ EventD:
 
 # ==================== Reward ====================
 
+Commission:
+  Scheduler:
+    Enable: true
+Research:
+  Scheduler:
+    Enable: true
+Reward:
+  Scheduler:
+    Enable: true
+
 # ==================== DailyReward ====================
 
 # ==================== DailyMission ====================
 
-# ==================== Opsi ====================
-ThreeOilLowCost:
+LimitChallenge:
   Scheduler:
     Enable: false
+
+# ==================== Opsi ====================
 OpsiCrossMonth:
   Scheduler:
     Sensitive: true

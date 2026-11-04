@@ -1,3 +1,7 @@
+"""战斗通行证处理器，检测红点并领取战斗通行证奖励。
+通过颜色检测判断是否有可领取奖励，自动完成领取流程。
+"""
+
 from module.base.timer import Timer
 from module.base.utils import get_color
 from module.combat.combat import Combat
@@ -10,6 +14,12 @@ from module.ui_white.assets import POPUP_CONFIRM_WHITE_BATTLEPASS
 
 
 class BattlePass(Combat, UI):
+    """战斗通行证处理器。
+
+    检测并自动领取大月卡（战斗通行证）中的各类奖励，
+    包括普通奖励、特殊奖励、META舰船及皮肤弹窗处理。
+    """
+
     def battle_pass_red_dot_appear(self):
         """
         检测战斗通行证红点是否出现。
@@ -26,16 +36,21 @@ class BattlePass(Combat, UI):
             # 此处不使用 self.appear()，因为红点是透明的，颜色会随背景变化。
             r, _, _ = get_color(self.device.image, BATTLE_PASS_RED_DOT.button)
             if r > BATTLE_PASS_RED_DOT.color[0] - 40:
-                logger.info('Found battle pass red dot')
+                logger.info('[免费福利-通行证] 发现战斗通行证红点')
                 return True
             else:
-                logger.info('No battle pass red dot')
+                logger.info('[免费福利-通行证] 没有战斗通行证红点')
                 return False
         else:
-            logger.warning('No battle pass entrance')
+            logger.warning('[免费福利-通行证] 没有战斗通行证入口')
             return False
 
     def handle_battle_pass_popup(self):
+        """处理进入战斗通行证时可能弹出的购买宣传弹窗。
+
+        Returns:
+            bool: 是否处理了弹窗。
+        """
         return self.appear_then_click(PURCHASE_POPUP, offset=(20, 20), interval=2)
 
     def battle_pass_enter(self):
@@ -67,7 +82,7 @@ class BattlePass(Combat, UI):
             in: page_battle_pass
             out: page_battle_pass
         """
-        logger.hr('Battle pass receive', level=1)
+        logger.hr('领取战斗通行证奖励', level=1)
         self.battle_status_click_interval = 2
         confirm_timer = Timer(1, count=3).start()
         received = False
@@ -120,10 +135,16 @@ class BattlePass(Combat, UI):
             else:
                 confirm_timer.reset()
 
-        logger.info(f'Battle pass receive finished, received={received}')
+        logger.info(f'[免费福利-通行证] 战斗通行证奖励领取完成, received={received}')
         return received
 
     def run(self):
+        """执行战斗通行证奖励检查与领取主流程。
+
+        Pages:
+            in: 任意页面
+            out: page_reward 或 page_battle_pass
+        """
         self.ui_ensure(page_reward)
 
         if self.battle_pass_red_dot_appear():

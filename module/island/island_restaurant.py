@@ -1,9 +1,13 @@
+"""岛屿餐厅模块。
+
+继承 IslandShopBase，实现餐厅的菜品配置、季节性菜品管理与岗位运营。
+包含凉拌双笋、芦笋炒虾仁等时令菜品定义，支持固定位置按钮与菜品种类统计。
+"""
 from module.island_restaurant.assets import *
 from module.island.island_shop_base import IslandShopBase
 from module.island.assets import *
 from module.logger import logger
-from collections import Counter
-from datetime import datetime, timedelta
+
 from module.base.button import Button
 from module.island.island_season import SEASONAL_ITEMS
 
@@ -14,8 +18,81 @@ FIXED_SELECT_DOUBLE_BAMBOO_SHOOTS = Button(
     file={'cn': '', 'en': '', 'jp': '', 'tw': ''}
 )
 
+# 秋季高优先级菜品（松茸鸡汤，槽位2）的固定位置——固定第二格，
+# 与春/夏季高优先级菜品（凉拌双笋/苋菜饭团）所在格不同
+FIXED_SELECT_MATSUTAKE_CHICKEN_SOUP = Button(
+    area=(), color=(), button=(212, 300, 292, 360),
+    file={'cn': '', 'en': '', 'jp': '', 'tw': ''}
+)
+
+RESTAURANT_SEASONAL_DISHES = {
+    'double_bamboo_shoots': {
+        'name': 'double_bamboo_shoots', 'template': TEMPLATE_DOUBLE_BAMBOO_SHOOTS,
+        'selection': SELECT_DOUBLE_BAMBOO_SHOOTS, 'selection_check': SELECT_DOUBLE_BAMBOO_SHOOTS_CHECK,
+        'post_action': POST_DOUBLE_BAMBOO_SHOOTS, 'cn_name': '凉拌双笋'
+    },
+    'asparagus_shrimp': {
+        'name': 'asparagus_shrimp', 'template': TEMPLATE_ASPARAGUS_SHRIMP,
+        'selection': SELECT_ASPARAGUS_SHRIMP, 'selection_check': SELECT_ASPARAGUS_SHRIMP_CHECK,
+        'post_action': POST_ASPARAGUS_SHRIMP, 'cn_name': '芦笋炒虾仁'
+    },
+    'amaranth_rice_ball': {
+        'name': 'amaranth_rice_ball', 'template': TEMPLATE_AMARANTH_RICE_BALL,
+        'selection': SELECT_AMARANTH_RICE_BALL, 'selection_check': SELECT_AMARANTH_RICE_BALL_CHECK,
+        'post_action': POST_AMARANTH_RICE_BALL, 'cn_name': '苋菜饭团'
+    },
+    'tomato_egg': {
+        'name': 'tomato_egg', 'template': TEMPLATE_TOMATO_EGG,
+        'selection': SELECT_TOMATO_EGG, 'selection_check': SELECT_TOMATO_EGG_CHECK,
+        'post_action': POST_TOMATO_EGG, 'cn_name': '番茄炒蛋'
+    },
+    'matsutake_chicken_soup': {
+        'name': 'matsutake_chicken_soup', 'template': TEMPLATE_MATSUTAKE_CHICKEN_SOUP,
+        'selection': SELECT_MATSUTAKE_CHICKEN_SOUP, 'selection_check': SELECT_MATSUTAKE_CHICKEN_SOUP_CHECK,
+        'post_action': POST_MATSUTAKE_CHICKEN_SOUP, 'cn_name': '松茸鸡汤'
+    },
+    'persimmon_cake': {
+        'name': 'persimmon_cake', 'template': TEMPLATE_PERSIMMON_CAKE,
+        'selection': SELECT_PERSIMMON_CAKE, 'selection_check': SELECT_PERSIMMON_CAKE_CHECK,
+        'post_action': POST_PERSIMMON_CAKE, 'cn_name': '柿子饼'
+    },
+}
+
+HIGH_PRIORITY_SEASONAL_DISHES = {
+    name: {
+        **RESTAURANT_SEASONAL_DISHES[name],
+        'selection': FIXED_SELECT_DOUBLE_BAMBOO_SHOOTS,
+        'selection_check': FIXED_SELECT_DOUBLE_BAMBOO_SHOOTS,
+    }
+    for name in ('double_bamboo_shoots', 'amaranth_rice_ball')
+}
+# 秋季高优先级为松茸鸡汤，位于固定第二格（与春/夏季高优先级菜品不同格）
+HIGH_PRIORITY_SEASONAL_DISHES['matsutake_chicken_soup'] = {
+    **RESTAURANT_SEASONAL_DISHES['matsutake_chicken_soup'],
+    'selection': FIXED_SELECT_MATSUTAKE_CHICKEN_SOUP,
+    'selection_check': FIXED_SELECT_MATSUTAKE_CHICKEN_SOUP,
+}
+
 
 class IslandRestaurant(IslandShopBase):
+    """岛屿有鱼餐馆自动化管理器。
+
+    继承 IslandShopBase，管理餐馆的菜品烹饪、时令季节菜品切换与豆腐原料约束。
+
+    Attributes:
+        shop_type (str): 店铺类型标识。
+        time_prefix (str): 岗位完成时间前缀。
+        chef_config (str): 厨师角色筛选配置。
+        seasonal_dish_slot (dict | None): 当前季节高优先级菜品配置字典。
+        shop_items (list): 餐馆商品配置列表。
+        meal_compositions (dict): 套餐组成与所需单品数量。
+        special_materials (dict): 特殊材料库存映射。
+        post_buttons (dict): 岗位按钮映射。
+        filter_asset (str): 仓库筛选分类。
+    """
+    # 季节菜品只在优先阶段生产，余岗仅安排用户配置的常驻餐品。
+    FILL_SPECIAL_FOOD = False
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -26,39 +103,15 @@ class IslandRestaurant(IslandShopBase):
 
         # === 初始化全局季节配置 ===
         self._init_season_config()
-        # 兼容旧配置
-        old_double_enabled = getattr(self.config, 'IslandRestaurant_DoubleBambooShoots', False)
 
         # === 高优先级季节菜品映射 ===
-        self.seasonal_dish_slot = None
-        seasonal_items = self.season_config.get_seasonal_items('restaurant') if hasattr(self, 'season_config') else []
-
-        if 'double_bamboo_shoots' in seasonal_items:
-            self.seasonal_dish_slot = {
-                'name': 'double_bamboo_shoots', 'template': TEMPLATE_DOUBLE_BAMBOO_SHOOTS,
-                'selection': FIXED_SELECT_DOUBLE_BAMBOO_SHOOTS, 'selection_check': FIXED_SELECT_DOUBLE_BAMBOO_SHOOTS,
-                'post_action': POST_DOUBLE_BAMBOO_SHOOTS, 'cn_name': '凉拌双笋'
-            }
-        elif 'amaranth_rice_ball' in seasonal_items:
-            self.seasonal_dish_slot = {
-                'name': 'amaranth_rice_ball', 'template': TEMPLATE_AMARANTH_RICE_BALL,
-                'selection': FIXED_SELECT_DOUBLE_BAMBOO_SHOOTS, 'selection_check': FIXED_SELECT_DOUBLE_BAMBOO_SHOOTS,
-                'post_action': POST_AMARANTH_RICE_BALL, 'cn_name': '苋菜饭团'
-            }
-        elif old_double_enabled:
-            self.seasonal_dish_slot = {
-                'name': 'double_bamboo_shoots', 'template': TEMPLATE_DOUBLE_BAMBOO_SHOOTS,
-                'selection': FIXED_SELECT_DOUBLE_BAMBOO_SHOOTS, 'selection_check': FIXED_SELECT_DOUBLE_BAMBOO_SHOOTS,
-                'post_action': POST_DOUBLE_BAMBOO_SHOOTS, 'cn_name': '凉拌双笋'
-            }
+        self.seasonal_dish_slot = self._get_high_priority_seasonal_dish()
 
         if self.seasonal_dish_slot:
-            logger.info(f"高优先级季节菜品: {self.seasonal_dish_slot['cn_name']}")
+            logger.info(f"[岛屿-有鱼餐馆] 高优先级季节菜品: {self.seasonal_dish_slot['cn_name']}")
 
         # 设置商品列表（根据季节自动选择对应菜品）
-        self.shop_items = []
-        if self.seasonal_dish_slot:
-            self.shop_items.append(self.seasonal_dish_slot)
+        self.shop_items = self._get_current_seasonal_shop_items()
         # ---- 常规菜品 ----
         self.shop_items.extend([
             {'name': 'tofu', 'template': TEMPLATE_TOFU, 'var_name': 'tofu',
@@ -91,13 +144,6 @@ class IslandRestaurant(IslandShopBase):
             {'name': 'onion_fish', 'template': TEMPLATE_ONION_FISH, 'var_name': 'onion_fish',
              'selection': SELECT_ONION_FISH, 'selection_check': SELECT_ONION_FISH_CHECK,
              'post_action': POST_ONION_FISH},
-            # 季节限定菜品（需在 shop_items 中注册，以支持季节自动切换和配置读取）
-            {'name': 'asparagus_shrimp', 'template': TEMPLATE_ASPARAGUS_SHRIMP, 'var_name': 'asparagus_shrimp',
-             'selection': SELECT_ASPARAGUS_SHRIMP, 'selection_check': SELECT_ASPARAGUS_SHRIMP_CHECK,
-             'post_action': POST_ASPARAGUS_SHRIMP},
-            {'name': 'tomato_egg', 'template': TEMPLATE_TOMATO_EGG, 'var_name': 'tomato_egg',
-             'selection': SELECT_TOMATO_EGG, 'selection_check': SELECT_TOMATO_EGG_CHECK,
-             'post_action': POST_TOMATO_EGG},
         ])
 
         # 设置套餐组成
@@ -140,10 +186,51 @@ class IslandRestaurant(IslandShopBase):
         # 初始化店铺
         self.initialize_shop()
 
+    def _is_seasonal_priority_enabled(self):
+        """检查配置中是否启用了时令高优先级季节菜品优先制作。
+
+        Returns:
+            bool: 是否启用优先制作。
+        """
+        return getattr(self.config, 'IslandRestaurant_DoubleBambooShoots', False)
+
+    def _get_current_seasonal_shop_items(self):
+        """获取当前季节餐馆对应的时令菜品列表。
+
+        Returns:
+            list[dict]: 菜品配置字典列表。
+        """
+        if not hasattr(self, 'season_config') or not self.season_config:
+            return []
+
+        seasonal_items = self.season_config.get_seasonal_items('restaurant') or []
+        result = []
+        for item_name in seasonal_items:
+            dish = RESTAURANT_SEASONAL_DISHES.get(item_name)
+            if dish:
+                result.append(dish.copy())
+        return result
+
+    def _get_high_priority_seasonal_dish(self):
+        """获取当前季节高优先级且固定位置点击的时令菜品配置。
+
+        Returns:
+            dict | None: 高优先级菜品配置字典，未启用或未配置则返回 None。
+        """
+        if not self._is_seasonal_priority_enabled():
+            return None
+        if not hasattr(self, 'season_config') or not self.season_config:
+            return None
+
+        seasonal_items = self.season_config.get_seasonal_items('restaurant') or []
+        for item_name in seasonal_items:
+            dish = HIGH_PRIORITY_SEASONAL_DISHES.get(item_name)
+            if dish:
+                return dish.copy()
+        return None
+
     def _auto_switch_seasonal_meals(self):
-        """
-        自动切换用户配置中的春季限定餐品到当前季节对应餐品。
-        """
+        """自动切换用户配置中的春季限定餐品到当前季节对应餐品。"""
         SEASONAL_MEAL_SWITCH = {
             'double_bamboo_shoots': 0,
             'asparagus_shrimp': 1,
@@ -153,40 +240,62 @@ class IslandRestaurant(IslandShopBase):
         current_season = self.season_config.season
         current_restaurant_items = SEASONAL_ITEMS.get(current_season, {}).get('restaurant', [])
         for spring_item, slot_idx in SEASONAL_MEAL_SWITCH.items():
-            if spring_item not in self.post_products:
+            if not any(name == spring_item for name, _ in self.post_products):
                 continue
+            spring_name = '凉拌双笋' if spring_item == 'double_bamboo_shoots' else '芦笋炒虾仁'
             if slot_idx < len(current_restaurant_items):
                 seasonal_item = current_restaurant_items[slot_idx]
                 if seasonal_item != spring_item:
-                    qty = self.post_products.pop(spring_item)
-                    self.post_products[seasonal_item] = qty
-                    spring_name = '凉拌双笋' if spring_item == 'double_bamboo_shoots' else '芦笋炒虾仁'
+                    self.post_products = [
+                        (seasonal_item, target) if name == spring_item else (name, target)
+                        for name, target in self.post_products
+                    ]
                     logger.info(
-                        f"季节餐品自动切换: {spring_item}({spring_name}) -> {seasonal_item}"
+                        f"季节餐品自动切换: {self._item_cn(spring_item)}({spring_name}) -> {self._item_cn(seasonal_item)}"
                         f"（当前季节: {self.season_config.season_name}）"
                     )
             else:
-                qty = self.post_products.pop(spring_item)
-                spring_name = '凉拌双笋' if spring_item == 'double_bamboo_shoots' else '芦笋炒虾仁'
+                self.post_products = [
+                    (name, target) for name, target in self.post_products
+                    if name != spring_item
+                ]
                 logger.info(
-                    f"季节餐品自动移除: {spring_item}({spring_name}) x{qty}"
+                    f"季节餐品自动移除: {self._item_cn(spring_item)}({spring_name})"
                     f"（{self.season_config.season_name} 无对应槽位的季节餐品）"
                 )
 
     def select_product(self, product_selection, product_selection_check):
+        """选择制作菜品。
+
+        高优先级季节菜品使用固定坐标点击，不进行模板匹配和滑动；其他餐品走基类逻辑。
+
+        Args:
+            product_selection (Button): 产品选择按钮。
+            product_selection_check (Button): 产品选中确认检测按钮。
+
+        Returns:
+            bool: 是否成功选中目标菜品。
         """
-        覆盖父类 select_product：
-        高优先级季节菜品使用固定坐标点击，不进行模板匹配和滑动。
-        其他餐品走父类逻辑。
-        """
-        if self.seasonal_dish_slot and product_selection == self.seasonal_dish_slot['selection']:
-            self.device.click(FIXED_SELECT_DOUBLE_BAMBOO_SHOOTS)
-            self.device.sleep(0.5)
-            return True
+        if self.seasonal_dish_slot:
+            dish_name = self.seasonal_dish_slot['name']
+            fixed_selection = self.seasonal_dish_slot['selection']
+            normal_selection = self.name_to_config.get(dish_name, {}).get('selection')
+            if product_selection in (fixed_selection, normal_selection):
+                self.device.click(self.seasonal_dish_slot['selection'])
+                self.device.sleep(0.5)
+                return True
         return super().select_product(product_selection, product_selection_check)
 
     def check_special_materials(self, product, batch_size):
-        """覆盖：检查特殊材料（豆腐）限制"""
+        """检查特殊材料（豆腐）对制作批次的限制。
+
+        Args:
+            product (str): 目标菜品内部名称。
+            batch_size (int): 计划制作批次数。
+
+        Returns:
+            int: 考虑豆腐库存限制后允许的最大批次数。
+        """
         if batch_size <= 0:
             return 0
 
@@ -207,7 +316,12 @@ class IslandRestaurant(IslandShopBase):
         return batch_size
 
     def deduct_materials(self, product, number):
-        """覆盖：扣除前置材料，包括豆腐"""
+        """扣除制作指定菜品消耗的原材料（包括豆腐和套餐原材料）。
+
+        Args:
+            product (str): 制作的菜品名称。
+            number (int): 制作的批次数。
+        """
         # 先调用父类方法扣除套餐原材料
         super().deduct_materials(product, number)
 
@@ -216,17 +330,24 @@ class IslandRestaurant(IslandShopBase):
             tofu_needed = number * 1
             if 'tofu' in self.warehouse_counts:
                 self.warehouse_counts['tofu'] -= tofu_needed
-                logger.info(f"扣除豆腐：tofu -{tofu_needed} (用于制作 {product})")
+                logger.info(f"[岛屿-有鱼餐馆] 扣除豆腐：{self._item_cn('tofu')} -{tofu_needed} (用于制作 {self._item_cn(product)})")
 
         # tofu_meat需要扣除豆腐
         if product == 'tofu_meat':
             tofu_needed = number * 2
             if 'tofu' in self.warehouse_counts:
                 self.warehouse_counts['tofu'] -= tofu_needed
-                logger.info(f"扣除豆腐：tofu -{tofu_needed} (用于制作 {product})")
+                logger.info(f"[岛屿-有鱼餐馆] 扣除豆腐：{self._item_cn('tofu')} -{tofu_needed} (用于制作 {self._item_cn(product)})")
 
     def apply_special_material_constraints(self, requirements):
-        """覆盖：根据豆腐库存调整需求"""
+        """根据豆腐库存调整需求，豆腐不足时自动将缺口补入豆腐生产计划。
+
+        Args:
+            requirements (dict[str, int]): 各菜品的原始需求数量映射。
+
+        Returns:
+            dict[str, int]: 调整并追加豆腐生产后的需求映射。
+        """
         result = requirements.copy()
 
         # 获取豆腐库存
@@ -238,11 +359,14 @@ class IslandRestaurant(IslandShopBase):
             tofu_needed = cabbage_needed * 1  # 每个cabbage_tofu需要1个豆腐
 
             if tofu_stock < tofu_needed:
-                # 调整需求
                 max_cabbage = tofu_stock // 1
+                deficit = cabbage_needed - max_cabbage
                 result['cabbage_tofu'] = max_cabbage
-                logger.info(f"豆腐不足：cabbage_tofu需求从{cabbage_needed}调整为{max_cabbage}")
-                tofu_stock -= max_cabbage  # 更新剩余豆腐
+                # 豆腐本店可生产，限产的同时补入豆腐需求
+                if 'tofu' in self.name_to_config:
+                    result['tofu'] = result.get('tofu', 0) + deficit
+                    logger.info(f"[岛屿-有鱼餐馆] 豆腐不足：{self._item_cn('cabbage_tofu')} {cabbage_needed}→{max_cabbage}，补入 {self._item_cn('tofu')} x{deficit}")
+                tofu_stock -= max_cabbage
 
         # 处理tofu_meat的需求
         if 'tofu_meat' in result and result['tofu_meat'] > 0:
@@ -250,168 +374,29 @@ class IslandRestaurant(IslandShopBase):
             tofu_needed = tofu_meat_needed * 2  # 每个tofu_meat需要2个豆腐
 
             if tofu_stock < tofu_needed:
-                # 调整需求
                 max_tofu_meat = tofu_stock // 2
+                deficit = tofu_meat_needed - max_tofu_meat
                 result['tofu_meat'] = max_tofu_meat
-                logger.info(f"豆腐不足：tofu_meat需求从{tofu_meat_needed}调整为{max_tofu_meat}")
+                if 'tofu' in self.name_to_config:
+                    result['tofu'] = result.get('tofu', 0) + deficit * 2
+                    logger.info(f"[岛屿-有鱼餐馆] 豆腐不足：{self._item_cn('tofu_meat')} {tofu_meat_needed}→{max_tofu_meat}，补入 {self._item_cn('tofu')} x{deficit * 2}")
+                tofu_stock -= max_tofu_meat * 2
 
         return result
 
-    def run(self):
+    def get_priority_production(self):
+        """季节菜品先排额外一批，并合并当前基础需求中的同名缺口。
+
+        Returns:
+            dict[str, int]: 优先排产菜品名称到数量的映射。
         """
-        覆盖父类的run方法，实现季节菜品的优先级控制：
-          - 凉拌双笋（菜品1）：最高优先级，在基础需求前生产
-          - 芦笋炒虾仁（菜品2）：最低优先级，等所有其他菜品（包括菜品1）都完成且系统空闲时才生产
-        """
-        self.island_error = False
-        self.goto_postmanage()
-        self.post_manage_mode(POST_MANAGE_PRODUCTION)
-        self.post_close()
-        self.post_manage_swipe(self.post_manage_swipe_count)
-
-        # 检查岗位状态
-        post_count = getattr(self.config, self.config_post_number, 2)
-        time_vars = []
-        for i in range(post_count):
-            time_var_name = f'{self.time_prefix}{i + 1}'
-            time_vars.append(time_var_name)
-            setattr(self, time_var_name, None)
-            post_id = f'ISLAND_{self.shop_type.upper()}_POST{i + 1}'
-            self.post_check(post_id, time_var_name)
-
-        # 获取空闲岗位
-        idle_posts = self.get_idle_posts()
-
-        if idle_posts:
-            self.get_warehouse_counts()
-            self.goto_postmanage()
-            self.post_manage_mode(POST_MANAGE_PRODUCTION)
-            self.post_close()
-            self.post_manage_swipe(self.post_manage_swipe_count)
-
-            # 计算当前总库存
-            self.current_totals = {}
-            for item in set(self.post_products.keys()) | set(self.post_check_meal.keys()) | set(
-                    self.warehouse_counts.keys()):
-                self.current_totals[item] = self.post_check_meal.get(item, 0) + self.warehouse_counts.get(item, 0)
-
-            # ============ 调试信息 ============
-            logger.info(f"=== 调试信息 ===")
-            logger.info(f"仓库库存: {self.warehouse_counts}")
-            logger.info(f"生产中库存: {self.post_check_meal}")
-            logger.info(f"当前总库存: {self.current_totals}")
-            logger.info(f"基础需求配置: {self.post_products}")
-            logger.info("===============")
-
-            # 清空待生产列表
-            self.to_post_products = {}
-
-            # ============ 基础需求计算 ============
-            logger.info("阶段：基础需求")
-            for item, target in self.post_products.items():
-                current = self.current_totals.get(item, 0)
-                if current < target:
-                    self.to_post_products[item] = target - current
-                    self.current_totals[item] = 0
-                else:
-                    self.current_totals[item] = current - target
-            logger.info(f"待完成备餐: {self.to_post_products}")
-            logger.info(f"当前剩余库存: {self.current_totals}")
-
-            # ============ 处理套餐分解 ============
-            if self.to_post_products:
-                self.to_post_products = self.process_meal_requirements(self.to_post_products)
-                logger.info(f"基础需求生产计划: {self.to_post_products}")
-
-            # ================================================================
-            #  高优先级季节菜品
-            #  在所有基础需求之前单独生产，确保最高优先级
-            # ================================================================
-            if self.seasonal_dish_slot:
-                dish_name = self.seasonal_dish_slot['name']
-                dish_cn = self.seasonal_dish_slot['cn_name']
-                logger.info(f"阶段：高优先级季节菜品 — {dish_cn}")
-
-                # 从生产计划中提取，单独安排生产
-                slot1_qty = 6
-                if dish_name in self.to_post_products:
-                    slot1_qty += self.to_post_products.pop(dish_name)
-
-                # 临时只安排位置1的生产
-                temp_products = self.to_post_products.copy()
-                self.to_post_products = {dish_name: slot1_qty}
-                logger.info(f"单独安排{dish_cn}生产: {self.to_post_products}")
-
-                self.schedule_production()
-
-                # 恢复剩余的基础需求生产计划
-                self.to_post_products = temp_products
-                logger.info(f"剩余基础需求生产计划: {self.to_post_products}")
-
-            # ============ 安排基础需求生产 ============
-            if self.to_post_products:
-                self.schedule_production()
-            else:
-                logger.info("基础需求已满足")
-
-            # ============ 检查是否还有空闲岗位，安排常驻餐品 ============
-            idle_posts_after_basic = self.get_idle_posts()
-
-            # 获取常驻餐品配置（不再使用特殊餐品special_food，因为季节菜品已独立控制）
-            away_cook = getattr(self.config, self.config_away_cook, None)
-
-            # 检查常驻餐品是否为有效值
-            has_away_cook = (away_cook and away_cook != "None" and
-                             away_cook in self.name_to_config)
-
-            if idle_posts_after_basic and has_away_cook:
-                logger.info(f"基础需求完成后，还有 {len(idle_posts_after_basic)} 个空闲岗位")
-
-                for post_id in idle_posts_after_basic:
-                    post_num = post_id[-1]
-                    time_var_name = f'{self.time_prefix}{post_num}'
-
-                    logger.info(f"尝试生产常驻餐品 {away_cook}")
-
-                    # 检查材料限制
-                    batch_size = min(6, 9999)
-                    batch_size = self.get_max_producible(away_cook, batch_size)
-
-                    if batch_size > 0:
-                        result = self.post_produce(
-                            post_id,
-                            product=away_cook,
-                            number=batch_size,
-                            time_var_name=time_var_name
-                        )
-
-                        if result == 0:
-                            logger.info(f"常驻餐品 {away_cook} 原料不足，保持岗位空闲")
-                            break
-                        else:
-                            logger.info(f"已为岗位 {post_id} 安排常驻餐品 {away_cook} x{batch_size}")
-                    else:
-                        logger.info(f"生产 {away_cook} 的材料不足，跳过岗位 {post_id}")
-                        break
-
-            elif idle_posts_after_basic:
-                logger.info(f"有 {len(idle_posts_after_basic)} 个空闲岗位，但未设置常驻餐品，保持空闲")
-
-        # ============ 设置任务延迟 ============
-        finish_times = []
-        for var in time_vars:
-            time_value = getattr(self, var)
-            if time_value is not None:
-                finish_times.append(time_value)
-        hours_later = datetime.now() + timedelta(hours=6)
-        finish_times.append(hours_later)
-        finish_times.sort()
-        self.config.task_delay(target=finish_times)
-        if self.island_error:
-            from module.exception import GameBugError
-            raise GameBugError("检测到岛屿ERROR1，需要重启")
+        if not self.seasonal_dish_slot:
+            return {}
+        name = self.seasonal_dish_slot['name']
+        return {name: self.POST_PRODUCE_LIMIT + self.to_post_products.get(name, 0)}
 
     def test(self):
+        """测试餐厅厨师配置读取。"""
         chef_config = getattr(self.config, "IslandRestaurant_Chef", "WorkerJuu")
         logger.info(chef_config)
 

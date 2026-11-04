@@ -1,52 +1,51 @@
-import os
-import asyncio
-import logging
-import json
-import datetime
-from typing import List, Optional, Dict, Any
+"""AzurPilot MCP SSE 服务入口。
 
+提供基于 SSE（Server-Sent Events）传输通道的 MCP（Model Context Protocol）服务，
+供大语言模型（如 Claude / ChatGPT）查询 AzurPilot 状态、任务列表、读取截图与配置等。
+"""
+
+import logging
+import re
+from contextvars import ContextVar
+from typing import Any, Dict, List
+
+from mcp.server import Server
+from mcp.server.sse import SseServerTransport
+from mcp.types import (
+    ImageContent,
+    TextContent,
+    Tool,
+)
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
-from mcp.server import Server
-from mcp.server.models import InitializationOptions
-from mcp.server.sse import SseServerTransport
-from mcp.types import (
-    TextContent,
-    ImageContent,
-    Tool,
-)
-import base64
-import cv2
-import time
-import subprocess
-import threading
-import re
-from io import BytesIO
 
-from module.config.config import AzurLaneConfig
-from module.config.utils import DEFAULT_CONFIG_NAME, alas_instance
-from module.webui.process_manager import ProcessManager
-from module.config.mcp_helper import McpConfigHelper
-from module.webui.setting import State
+from module.mcp.lifecycle import lifespan
+from module.mcp.tools import Tools
+from module.runtime import mcp_auth
+from module.runtime.setting import State
 
-try:
-    from module.webui.fake_pil_module import remove_fake_pil_module
-except ImportError:
-    remove_fake_pil_module = None
 
 # 初始化日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("azurpilot-mcp")
 
-# 初始化配置助手
-helper = McpConfigHelper()
+# 每个挂载应用独享服务适配器，通过请求上下文传递。
+active_tools = ContextVar("mcp_tools", default=Tools())
 
 # 初始化 MCP 服务器
 mcp_server = Server("AzurPilot-MCP")
 
+ToolResponse = List[TextContent | ImageContent]
+
+
 @mcp_server.list_tools()
 async def list_tools() -> List[Tool]:
+    """列出 MCP 服务器当前支持的所有工具定义。
+
+    Returns:
+        List[Tool]: 工具对象列表。
+    """
     return [
         Tool(
             name="list_instances",
@@ -198,317 +197,320 @@ async def list_tools() -> List[Tool]:
         ),
     ]
 
+
 @mcp_server.call_tool()
-async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
-    try:
-        if name == "list_instances":
-            instances = alas_instance()
-            return [TextContent(type="text", text=json.dumps(instances, ensure_ascii=False, indent=2, default=str))]
-        
-        elif name == "get_status":
-            instances = alas_instance()
-            results = []
-            for inst in instances:
-                manager = ProcessManager.get_manager(inst)
-                results.append({"instance": inst, "running": manager.alive, "state": manager.state})
-            return [TextContent(type="text", text=json.dumps(results, ensure_ascii=False, indent=2, default=str))]
+async def call_tool(name: str, arguments: Dict[str, Any]) -> ToolResponse:
+    """调用指定的 MCP 工具并返回执行结果。
 
-        elif name == "list_tasks":
-            tasks = helper.get_tasks()
-            return [TextContent(type="text", text=json.dumps(tasks, ensure_ascii=False, indent=2, default=str))]
+    Args:
+        name (str): 工具名称。
+        arguments (Dict[str, Any]): 工具入参字典。
 
-        elif name == "get_task_help":
-            task_name = arguments["task_name"]
-            details = helper.get_task_details(task_name)
-            return [TextContent(type="text", text=json.dumps(details, ensure_ascii=False, indent=2, default=str))]
+    Returns:
+        ToolResponse: 工具执行结果（文本或图片列表）。
+    """
+    return await active_tools.get().call(name, arguments)
 
-        elif name == "get_resources":
-            inst = arguments["instance"]
-            config = AzurLaneConfig(inst)
-            res = helper.get_dashboard_resources(config.data)
-            return [TextContent(type="text", text=json.dumps(res, ensure_ascii=False, indent=2, default=str))]
-
-        elif name == "get_config":
-            inst = arguments["instance"]
-            task = arguments.get("task")
-            config = AzurLaneConfig(inst)
-            data = config.data.get(task, {}) if task else config.data
-            return [TextContent(type="text", text=json.dumps(data, ensure_ascii=False, indent=2, default=str))]
-
-        elif name == "update_config":
-            inst = arguments["instance"]
-            task = arguments["task"]
-            group = arguments["group"]
-            arg = arguments["arg"]
-            value = arguments["value"]
-            config = AzurLaneConfig(inst)
-            path = f"{task}.{group}.{arg}"
-            config.cross_set(path, value)
-            config.save()
-            return [TextContent(type="text", text=f"Success: Updated {path} to {value}")]
-
-        elif name == "get_recent_logs":
-            inst = arguments["instance"]
-            lines_count = arguments.get("lines", 50)
-            
-            # AzurPilot 日志命名规则通常是 YYYY-MM-DD_实例名.txt
-            date_str = datetime.date.today().strftime("%Y-%m-%d")
-            log_file = f"./log/{date_str}_{inst}.txt"
-            
-            if not os.path.exists(log_file):
-                # 尝试不带实例名的通用日志
-                log_file_alt = f"./log/{date_str}_alas.txt"
-                if os.path.exists(log_file_alt):
-                    log_file = log_file_alt
-            
-            if os.path.exists(log_file):
-                try:
-                    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-                        # 对于超大文件，使用 tail 逻辑更安全
-                        # 为了简单这里仍使用 readlines，但限制读取范围
-                        content = f.readlines()
-                        content = content[-lines_count:]
-                    return [TextContent(type="text", text="".join(content))]
-                except Exception as e:
-                    return [TextContent(type="text", text=f"Error reading log: {str(e)}")]
-            return [TextContent(type="text", text=f"Log file not found: {log_file}")]
-
-        elif name == "start_instance":
-            inst = arguments["instance"]
-            manager = ProcessManager.get_manager(inst)
-            if manager.alive:
-                return [TextContent(type="text", text=f"Error: {inst} is already running.")]
-            from module.submodule.utils import get_config_mod
-            func = get_config_mod(inst)
-            manager.start(func=func)
-            return [TextContent(type="text", text=f"Success: Started {inst} ({func})")]
-
-        elif name == "stop_instance":
-            inst = arguments["instance"]
-            manager = ProcessManager.get_manager(inst)
-            if not manager.alive:
-                return [TextContent(type="text", text=f"Error: {inst} is not running.")]
-            manager.stop()
-            return [TextContent(type="text", text=f"Success: Stopped {inst}")]
-        elif name == "get_screenshot":
-            inst = arguments["instance"]
-            if "ALAS_CONFIG_NAME" not in os.environ:
-                os.environ["ALAS_CONFIG_NAME"] = inst
-            if remove_fake_pil_module:
-                remove_fake_pil_module()
-            
-            from module.device.device import Device
-            from PIL import Image
-            try:
-                import PIL.JpegImagePlugin
-            except ImportError:
-                pass
-                
-            try:
-                config = AzurLaneConfig(inst)
-                device = Device(config)
-                image = device.screenshot()
-                image_pil = Image.fromarray(image)
-                
-                buffered = BytesIO()
-                image_pil.save(buffered, format="JPEG")
-                img_data = base64.b64encode(buffered.getvalue()).decode("utf-8")
-                return [ImageContent(type="image", data=img_data, mimeType="image/jpeg")]
-            except Exception as e:
-                import traceback
-                error_msg = f"Error getting screenshot: {str(e)}\n{traceback.format_exc()}"
-                return [TextContent(type="text", text=error_msg)]
-
-        elif name == "get_current_running_task":
-            inst = arguments["instance"]
-            manager = ProcessManager.get_manager(inst)
-            if not manager.alive:
-                return [TextContent(type="text", text="Error: Instance is not running.")]
-            task = "Unknown"
-            
-            date_str = datetime.date.today().strftime("%Y-%m-%d")
-            log_file = f"./log/{date_str}_{inst}.txt"
-            if not os.path.exists(log_file):
-                log_file = f"./log/{date_str}_alas.txt"
-                
-            if os.path.exists(log_file):
-                try:
-                    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-                        lines = f.readlines()
-                        for line in reversed(lines):
-                            import re
-                            # 适配现代 AzurPilot 日志格式: 调度器: 开始任务 `TaskName`
-                            m = re.search(r"调度器: 开始任务\s*[`'\" ](.*?)[`'\" ]", line)
-                            if not m:
-                                # 适配旧版或特殊格式: <<< Run task TaskName >>>
-                                m = re.search(r"<<<\s*Run task\s*(.*?)\s*>>>", line)
-                            
-                            if m:
-                                task = m.group(1)
-                                break
-                except:
-                    pass
-            return [TextContent(type="text", text=task)]
-
-        elif name == "get_scheduler_queue":
-            inst = arguments["instance"]
-            config = AzurLaneConfig(inst)
-            queue_data = []
-            for task_name in config.data:
-                if task_name in ["Alas", "Error", "MUMU", "MumuPlayer12", "EmulatorManagement", "Dashboard"]:
-                    continue
-                scheduler = config.data.get(task_name, {}).get("Scheduler", {})
-                if scheduler.get("Enable", False):
-                    next_run = scheduler.get("NextRun", "2050-01-01 00:00:00")
-                    queue_data.append({"task": task_name, "next_run": str(next_run)})
-            queue_data.sort(key=lambda x: str(x["next_run"]))
-            return [TextContent(type="text", text=json.dumps(queue_data, ensure_ascii=False, indent=2))]
-
-        elif name == "trigger_task":
-            inst = arguments["instance"]
-            task = arguments["task"]
-            config = AzurLaneConfig(inst)
-            config.cross_set(f"{task}.Scheduler.Enable", True)
-            now = datetime.datetime.now()
-            config.cross_set(f"{task}.Scheduler.NextRun", str(now))
-            config.save()
-            return [TextContent(type="text", text=f"Success: Task {task} scheduled for immediately.")]
-
-        elif name == "clear_scheduler_queue":
-            inst = arguments["instance"]
-            config = AzurLaneConfig(inst)
-            cleared = []
-            for task_name in config.data:
-                scheduler = config.data.get(task_name, {}).get("Scheduler", {})
-                if scheduler.get("Enable", False):
-                    config.cross_set(f"{task_name}.Scheduler.Enable", False)
-                    cleared.append(task_name)
-            if cleared:
-                config.save()
-            return [TextContent(type="text", text=f"Success: Cleared tasks: {', '.join(cleared)}")]
-
-        elif name == "restart_emulator":
-            inst = arguments["instance"]
-            if "ALAS_CONFIG_NAME" not in os.environ:
-                os.environ["ALAS_CONFIG_NAME"] = inst
-            manager = ProcessManager.get_manager(inst)
-            if remove_fake_pil_module:
-                remove_fake_pil_module()
-            
-            from module.device.device import Device
-            try:
-                config = AzurLaneConfig(inst)
-                device = Device(config)
-                device.emulator_stop()
-                time.sleep(60)
-                device.emulator_start()
-                return [TextContent(type="text", text=f"Success: Restarted emulator for {inst}")]
-            except Exception as e:
-                import traceback
-                error_msg = f"Error restarting emulator: {str(e)}\n{traceback.format_exc()}"
-                return [TextContent(type="text", text=error_msg)]
-
-        elif name == "restart_adb":
-            inst = arguments.get("instance", DEFAULT_CONFIG_NAME)
-            try:
-                # 尝试从 deploy.yaml 获取 ADB 路径
-                adb_path = State.deploy_config.AdbExecutable
-                if adb_path:
-                    adb_path = adb_path.replace('\\', '/')
-                
-                if not adb_path or not os.path.exists(adb_path):
-                    # 回退到 connection_attr 的查找逻辑
-                    adb_search_list = [
-                        './.venv/Scripts/adb.exe',
-                        './.venv/bin/adb',
-                        './bin/adb/adb.exe',
-                    ]
-                    for path in adb_search_list:
-                        if os.path.exists(path):
-                            adb_path = os.path.abspath(path)
-                            break
-                    else:
-                        adb_path = "adb"
-                
-                subprocess.run([adb_path, "kill-server"], check=False)
-                subprocess.run([adb_path, "start-server"], check=False)
-                return [TextContent(type="text", text=f"Success: Restarted ADB service using {adb_path}.")]
-            except Exception as e:
-                return [TextContent(type="text", text=f"Error: {str(e)}")]
-
-        elif name == "update_alas":
-            try:
-                from module.webui.updater import updater
-                def do_update():
-                    updater.update()
-                threading.Thread(target=do_update).start()
-                return [TextContent(type="text", text="Success: Triggered AzurPilot update in background.")]
-            except Exception as e:
-                return [TextContent(type="text", text=f"Error: {str(e)}")]
-
-        else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
-
-    except Exception as e:
-        logger.exception(f"Tool {name} error")
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
 
 # SSE 传输层初始化 - 固定端点（与 /mcp 挂载点匹配）
 transport = SseServerTransport("/mcp/messages")
 
+# 独立运行时的监听地址与端口
+STANDALONE_HOST = "0.0.0.0"
+STANDALONE_PORT = 22268
+
+# 从 endpoint 事件中提取 session_id
+SESSION_ID_PATTERN = re.compile(rb"session_id=([0-9a-fA-F]{32})")
+# 嗅探缓冲区上限，避免为体积无关的 SSE 消息长期占用内存
+SNIFF_BUFFER_LIMIT = 4096
+
+# 各拒绝状态对应的响应体
+DENIED_MESSAGES = {
+    401: "Unauthorized: 缺少或无效的凭据。MCP 复用 WebUI 密码，"
+         "请携带 Authorization: Bearer <密码>、X-API-Key 或 ?key=<密码>。",
+    405: "Method Not Allowed",
+    503: "Service Unavailable: 监听公网但未配置访问密码，MCP 已禁用。"
+         "请在 config/deploy.yaml 设置 Password 后重启。",
+}
+
+
+def configure_auth(key, public_bind=False):
+    """注入 MCP 的访问密码（复用 WebUI 密码）。
+
+    由 `module.api.app` 在挂载 /mcp 之前调用；独立模式的 `__main__`
+    也会调用。传入空值即关闭鉴权（仅在监听回环或演示环境下允许）。
+
+    Args:
+        key: 复用自 WebUI 的密码。
+        public_bind (bool, optional): 监听地址是否对公网开放。默认为 False。
+    """
+    mcp_auth.install_access_log_filter()
+    mcp_auth.configure(key, public_bind=public_bind)
+    logger.info(
+        "[MCP] 鉴权%s，监听公网=%s"
+        % ("已启用" if mcp_auth.enabled() else "未启用", bool(public_bind))
+    )
+
+
+def _sniff_session_id(message, buffer, captured):
+    """从 SSE 出站消息中捕获 MCP 下发给客户端的 session_id。
+
+    只用于"客户端只能在 URL 里填 key"的场景：这类客户端拿到的 POST 地址
+    由服务端下发，带不上请求头，因此把 session_id 视为该次已鉴权连接的凭据。
+
+    Args:
+        message (dict): ASGI 待发送的消息。
+        buffer (list[bytes]): 单元素列表，作为跨分块的嗅探缓冲区。
+        captured (list[str]): 已捕获的 session_id 列表。
+    """
+    if captured or message.get("type") != "http.response.body":
+        return
+    body = message.get("body") or b""
+    if not body:
+        return
+    buffer[0] = (buffer[0] + body)[-SNIFF_BUFFER_LIMIT:]
+    match = SESSION_ID_PATTERN.search(buffer[0])
+    if not match:
+        return
+    session_id = match.group(1).decode("ascii").lower()
+    captured.append(session_id)
+    buffer[0] = b""
+    mcp_auth.register_session(session_id)
+
+
+async def _run_sse(scope, receive, send):
+    """处理 /sse 端点的请求，建立并运行 SSE 流式连接。
+
+    Args:
+        scope: ASGI scope 字典。
+        receive: ASGI receive 异步可调用对象。
+        send: ASGI send 异步可调用对象。
+    """
+    logger.info("Matched endpoint: /sse. Opening SSE connection...")
+    captured = []
+    buffer = [b""]
+
+    async def send_wrapper(message):
+        _sniff_session_id(message, buffer, captured)
+        await send(message)
+
+    try:
+        async with transport.connect_sse(scope, receive, send_wrapper) as (read_stream, write_stream):
+            logger.info("SSE Stream connected. Running MCP server loop...")
+            try:
+                options = mcp_server.create_initialization_options()
+                await mcp_server.run(read_stream, write_stream, options)
+            except Exception as e:
+                logger.error(f"MCP Server Loop Error: {e}", exc_info=True)
+            logger.info("MCP Server Loop exited.")
+    finally:
+        # 断开后留一段宽限期，避免客户端最后一帧 POST 被误拒。
+        for session_id in captured:
+            mcp_auth.expire_session(session_id)
+
+
+def _is_mcp_client_disconnected(error: Exception) -> bool:
+    """判断异常是否属于客户端主动断开连接。
+
+    ClosedResourceError：SSE 已断开但客户端仍在宽限期内投递消息，属正常现象。
+
+    Args:
+        error (Exception): 捕获的异常对象。
+
+    Returns:
+        bool: 是否属于客户端正常断连。
+    """
+    return (
+        "BrokenResourceError" in str(type(error))
+        or "BrokenPipeError" in str(error)
+        or "ClosedResourceError" in str(type(error))
+    )
+
+
+async def _handle_mcp_post(scope, receive, send, method):
+    """处理客户端通过 POST /messages 发送过来的消息。
+
+    Args:
+        scope: ASGI scope 字典。
+        receive: ASGI receive 异步可调用对象。
+        send: ASGI send 异步可调用对象。
+        method (str): HTTP 请求方法。
+    """
+    logger.info(f"Matched endpoint: /messages. Method: {method}")
+    try:
+        await transport.handle_post_message(scope, receive, send)
+        logger.info("MCP Message POST handled.")
+    except Exception as e:
+        # 捕获常见的断开连接错误，避免服务器崩溃
+        if _is_mcp_client_disconnected(e):
+            logger.warning("MCP client disconnected during POST message.")
+        else:
+            logger.error(f"Error handling MCP message: {e}", exc_info=True)
+
+
+async def _send_not_found(send):
+    """返回 404 Not Found 响应。
+
+    Args:
+        send: ASGI send 异步可调用对象。
+    """
+    await send({
+        'type': 'http.response.start',
+        'status': 404,
+        'headers': [[b'content-type', b'text/plain']]
+    })
+    await send({
+        'type': 'http.response.body',
+        'body': b'Not Found'
+    })
+
+
+async def _send_denied(scope, send, status):
+    """发送鉴权失败或服务未就绪的拒绝响应。
+
+    刻意不返回 WWW-Authenticate：MCP 客户端会把该响应头判定为
+    "本服务要求 OAuth"并转去请求 resource metadata。
+
+    Args:
+        scope: ASGI scope 字典。
+        send: ASGI send 异步可调用对象。
+        status (int): HTTP 状态码。
+    """
+    body = DENIED_MESSAGES.get(status, "Forbidden").encode("utf-8")
+    client = scope.get("client") or ("unknown", 0)
+    logger.warning(
+        "[MCP] 拒绝请求 %s: %s %s from %s"
+        % (
+            status,
+            scope.get("method", ""),
+            mcp_auth.redact(scope.get("path", "")),
+            client[0],
+        )
+    )
+    await send({
+        'type': 'http.response.start',
+        'status': status,
+        'headers': [
+            [b'content-type', b'text/plain; charset=utf-8'],
+            [b'content-length', str(len(body)).encode('ascii')],
+        ],
+    })
+    await send({
+        'type': 'http.response.body',
+        'body': body,
+    })
+
+
 async def mcp_asgi_app(scope, receive, send):
-    """MCP 服务的纯 ASGI 应用，带增强日志记录。"""
+    """MCP 服务的纯 ASGI 应用，带鉴权与增强日志记录。
+
+    Args:
+        scope: ASGI scope 字典。
+        receive: ASGI receive 异步可调用对象。
+        send: ASGI send 异步可调用对象。
+    """
     path = scope.get("path", "")
     method = scope.get("method", "")
-    
-    if scope["type"] == "http":
-        logger.info(f"Incoming ASGI HTTP: {method} {path}")
-        
-        # 路由逻辑 - 使用末尾匹配以兼容各种挂载路径和斜线组合
-        if path.endswith("/sse"):
-            logger.info("Matched endpoint: /sse. Opening SSE connection...")
-            async with transport.connect_sse(scope, receive, send) as (read_stream, write_stream):
-                logger.info("SSE Stream connected. Running MCP server loop...")
-                try:
-                    options = mcp_server.create_initialization_options()
-                    await mcp_server.run(read_stream, write_stream, options)
-                except Exception as e:
-                    logger.error(f"MCP Server Loop Error: {e}", exc_info=True)
-                logger.info("MCP Server Loop exited.")
-        
-        elif path.endswith("/messages") or path.endswith("/messages/"):
-            logger.info(f"Matched endpoint: /messages. Method: {method}")
-            try:
-                await transport.handle_post_message(scope, receive, send)
-                logger.info("MCP Message POST handled.")
-            except Exception as e:
-                # 捕获常见的断开连接错误，避免服务器崩溃
-                if "BrokenResourceError" in str(type(e)) or "BrokenPipeError" in str(e):
-                    logger.warning("MCP client disconnected during POST message.")
-                else:
-                    logger.error(f"Error handling MCP message: {e}", exc_info=True)
-        
-        else:
-            # 未匹配路由，返回 404
-            await send({
-                'type': 'http.response.start',
-                'status': 404,
-                'headers': [[b'content-type', b'text/plain']]
-            })
-            await send({
-                'type': 'http.response.body',
-                'body': b'Not Found'
-            })
 
-# Starlette 应用包装
-app = Starlette(
-    middleware=[
-        Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-    ]
-)
-app.mount("/", mcp_asgi_app)
+    if scope["type"] != "http":
+        return
+
+    # 日志脱敏：查询串里的 key 与 session_id 本身就是可用凭据
+    query_string = scope.get("query_string") or b""
+    logger.info(
+        "[MCP] %s %s%s"
+        % (
+            method,
+            mcp_auth.redact(path),
+            mcp_auth.redact("?" + query_string.decode("latin-1"))
+            if query_string
+            else "",
+        )
+    )
+
+    allowed, status = mcp_auth.authorize(
+        path, method, scope.get("headers"), query_string
+    )
+    if not allowed:
+        await _send_denied(scope, send, status)
+        return
+
+    # 路由逻辑 - 使用末尾匹配以兼容各种挂载路径和斜线组合
+    if path.endswith("/sse"):
+        await _run_sse(scope, receive, send)
+
+    elif path.endswith("/messages") or path.endswith("/messages/"):
+        await _handle_mcp_post(scope, receive, send, method)
+
+    else:
+        await _send_not_found(send)
+
+
+def create_app(configs=None, runtime=None, *, manage_runtime=True):
+    """创建 Starlette 应用实例。
+
+    独立模式管理 State；挂载模式复用宿主注入的服务与生命周期。
+
+    Args:
+        configs: 配置映射字典。默认为 None。
+        runtime: 运行时管理服务。默认为 None。
+        manage_runtime (bool, optional): 是否由本应用接管生命周期。默认为 True。
+
+    Returns:
+        Starlette: 已配置好的 ASGI Starlette 应用。
+    """
+    tools = Tools(configs, runtime)
+
+    async def bound_app(scope, receive, send):
+        token = active_tools.set(tools)
+        try:
+            await mcp_asgi_app(scope, receive, send)
+        finally:
+            active_tools.reset(token)
+
+    application = Starlette(
+        lifespan=lifespan if manage_runtime else None,
+        middleware=[Middleware(CORSMiddleware, allow_origins=["*"],
+                               allow_methods=["*"], allow_headers=["*"])],
+    )
+    application.state.tools = tools
+    application.mount("/", bound_app)
+    return application
+
+
+app = create_app()
+
+
+def _resolve_standalone_password():
+    """独立模式解析访问密码，与 WebUI 共用同一份来源与生成规则。
+
+    顺序：``deploy.yaml`` 的 ``Password`` → 未设置且监听公网时自动生成并
+    写入 ``password.txt``（同时回写部署配置，保证 WebUI 与 MCP 始终一致）。
+
+    Returns:
+        str | None: 有效密码，None 表示未配置。
+    """
+    from module.runtime.password_utils import ensure_password_for_host, is_demo_mode
+
+    password = State.deploy_config.Password
+    try:
+        password = ensure_password_for_host(password, STANDALONE_HOST, demo=is_demo_mode())
+    except Exception as e:
+        logger.exception(f"[MCP] 自动生成密码失败: {e}")
+        return None
+
+    if password and password != State.deploy_config.Password:
+        # 触发部署配置落盘，避免每次重启都换一把新密码
+        State.deploy_config.Password = password
+        logger.warning(
+            "[MCP] 已自动生成密码，请在根目录 password.txt 或 config/deploy.yaml 查看。"
+        )
+    return password
+
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("启动 AzurPilot MCP 服务 (Port: 22268)")
-    uvicorn.run(app, host="0.0.0.0", port=22268)
+
+    logger.info(f"[MCP] 启动 AzurPilot MCP 服务 (Port: {STANDALONE_PORT})")
+    configure_auth(_resolve_standalone_password(), public_bind=True)
+    uvicorn.run(app, host=STANDALONE_HOST, port=STANDALONE_PORT)

@@ -1,3 +1,9 @@
+"""基础工具函数模块。
+
+提供图像处理（裁剪、颜色比较、模板匹配阈值调整）、随机坐标生成、
+图像加载与服务器回退、字母提取等底层工具函数。
+"""
+
 import random
 import re
 
@@ -12,19 +18,24 @@ TEMPLATE_MATCH_NON_NATIVE_720P_RESOLUTION = (1280, 720)
 
 
 def set_template_match_non_native_720p(enabled, resolution=(1280, 720)):
+    """设置非原生 720p 截图的模板匹配模式与分辨率。
+
+    Args:
+        enabled (bool): 是否启用非原生 720p 匹配调整。
+        resolution (tuple[int, int]): 当前截图分辨率 (宽, 高)。
+    """
     global TEMPLATE_MATCH_NON_NATIVE_720P, TEMPLATE_MATCH_NON_NATIVE_720P_RESOLUTION
     TEMPLATE_MATCH_NON_NATIVE_720P = bool(enabled)
     TEMPLATE_MATCH_NON_NATIVE_720P_RESOLUTION = resolution
 
 
 def lower_template_match_similarity(similarity):
-    """
-    对非原生 720p 截图放宽模板匹配阈值。
+    """对非原生 720p 截图放宽模板匹配阈值。
 
     当截图不是以 1280x720 原始分辨率捕获时，将严格阈值限制在 0.75。
 
     Args:
-        similarity: 0~1 范围的 cv2.TM_CCOEFF_NORMED 阈值。
+        similarity (float): 0~1 范围的 cv2.TM_CCOEFF_NORMED 阈值。
 
     Returns:
         float: 调整后的相似度阈值。
@@ -515,13 +526,27 @@ def location2node(location):
 
 
 def xywh2xyxy(area):
-    """将 (x, y, 宽度, 高度) 格式转换为 (x1, y1, x2, y2) 格式。"""
+    """将 (x, y, 宽度, 高度) 格式转换为 (x1, y1, x2, y2) 格式。
+
+    Args:
+        area (tuple): (x, y, 宽度, 高度)。
+
+    Returns:
+        tuple[int, int, int, int]: (x1, y1, x2, y2)。
+    """
     x, y, w, h = area
     return x, y, x + w, y + h
 
 
 def xyxy2xywh(area):
-    """将 (x1, y1, x2, y2) 格式转换为 (x, y, 宽度, 高度) 格式。"""
+    """将 (x1, y1, x2, y2) 格式转换为 (x, y, 宽度, 高度) 格式。
+
+    Args:
+        area (tuple): (x1, y1, x2, y2)。
+
+    Returns:
+        tuple[int, int, int, int]: (x, y, 宽度, 高度)。
+    """
     x1, y1, x2, y2 = area
     return min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1)
 
@@ -1027,6 +1052,13 @@ def color_similar_1d(image, color, threshold=10):
 def color_similarity_2d(image, color):
     """计算二维图像中每个像素与指定颜色的差异度。
 
+    逐像素颜色距离图：像素完全匹配 color 时结果为 255。
+
+    result = 255 - sat_add(max_c(sat_sub(image - c)), max_c(sat_sub(c - image)))
+    其中 c = (r, g, b)，sat_sub/sat_add 为 uint8 饱和运算，
+    max_c 取各通道间的逐像素最大值。
+
+
     Args:
         image: 二维图像数组。
         color: 目标颜色 (r, g, b)。
@@ -1039,39 +1071,122 @@ def color_similarity_2d(image, color):
     # r, g, b = cv2.split(cv2.subtract((*color, 0), image))
     # negative = cv2.max(cv2.max(r, g), b)
     # return cv2.subtract(255, cv2.add(positive, negative))
-    if isinstance(color, tuple) and len(color) == 3:
-        color = (*color, 0)
-    diff = cv2.subtract(image, color)
-    r, g, b = cv2.split(diff)
-    cv2.max(r, g, dst=r)
-    cv2.max(r, b, dst=r)
-    positive = r
-    cv2.subtract(color, image, dst=diff)
-    r, g, b = cv2.split(diff)
-    cv2.max(r, g, dst=r)
-    cv2.max(r, b, dst=r)
+    h, w = image.shape[:2]
+    if h * w < 30000:
+        # 3 通道路径在极小图上更快（单次调用开销占主导）
+        diff = cv2.subtract(image, (*color, 0))
+        r, g, b = cv2.split(diff)
+        cv2.max(r, g, dst=r)
+        cv2.max(r, b, dst=r)
+        positive = r
+        cv2.subtract((*color, 0), image, dst=diff)
+        r, g, b = cv2.split(diff)
+        cv2.max(r, g, dst=r)
+        cv2.max(r, b, dst=r)
+        negative = r
+        cv2.add(positive, negative, dst=positive)
+        cv2.bitwise_not(positive, dst=positive)
+        return positive
+    # 大图逐通道减法 + 缓冲区复用更优
+    r, g, b = cv2.split(image)
+    cr, cg, cb = color
+    positive = cv2.subtract(r, cr)
+    cv2.subtract(cr, r, dst=r)
     negative = r
+    diff = cv2.subtract(g, cg)
+    cv2.max(positive, diff, dst=positive)
+    cv2.subtract(cg, g, dst=diff)
+    cv2.max(negative, diff, dst=negative)
+    cv2.subtract(b, cb, dst=diff)
+    cv2.max(positive, diff, dst=positive)
+    cv2.subtract(cb, b, dst=diff)
+    cv2.max(negative, diff, dst=negative)
     cv2.add(positive, negative, dst=positive)
-    cv2.subtract(255, positive, dst=positive)
+    cv2.bitwise_not(positive, dst=positive)
     return positive
 
 
-def image_color_count(image, color, threshold=221, count=50):
-    """判断图像中与指定颜色相似的像素数量是否超过阈值。
+def image_color_count(image, color, threshold=34, count=50):
+    """判断图像中与指定颜色接近的像素数量是否超过阈值。
+
+    threshold 使用「容差」语义：0 表示完全相同，值越大越宽松，
+    与 color_mask() 保持一致。旧的「相似度」阈值 221 等价于容差 34。
 
     Args:
-        image (np.ndarray): 图像数组。
-        color (tuple): RGB 颜色。
-        threshold (int): 相似度阈值，255 表示完全相同，值越低越宽松。
+        image (np.ndarray): 图像数组，形状 (height, width, channel)。
+        color (tuple): 目标 RGB 颜色。
+        threshold (int): 颜色容差，0 表示完全相同，值越大越宽松。
         count (int): 像素计数阈值。
 
     Returns:
-        bool: 相似像素数超过 count 返回 True。
+        bool: 匹配像素数超过 count 返回 True。
     """
-    mask = color_similarity_2d(image, color=color)
-    cv2.inRange(mask, threshold, 255, dst=mask)
+    mask = color_mask(image, color, threshold=threshold)
     sum_ = cv2.countNonZero(mask)
     return sum_ > count
+
+
+def color_mask(image, color, threshold=30):
+    """生成与指定颜色接近的像素的二值掩码。
+
+    result = 255 if diff <= threshold else 0
+    其中 diff = sat_add(max_c(sat_sub(image - c)), max_c(sat_sub(c - image)))，
+    c = (r, g, b)，sat_sub/sat_add 为 uint8 饱和运算，
+    max_c 取各通道间的逐像素最大值。
+    该容差定义与 color_similar() 相同。
+
+    Args:
+        image: 形状为 (height, width, channel) 的图像数组。
+        color: (r, g, b)。
+        threshold (int): 默认 30。容差小于等于 threshold 的像素视为匹配。
+
+    Returns:
+        np.ndarray: 形状 (height, width) 的 uint8 数组，
+            匹配像素为 255，其余为 0。
+    """
+    # r, g, b = cv2.split(cv2.subtract(image, (*color, 0)))
+    # positive = cv2.max(cv2.max(r, g), b)
+    # r, g, b = cv2.split(cv2.subtract((*color, 0), image))
+    # negative = cv2.max(cv2.max(r, g), b)
+    # diff = cv2.add(positive, negative)
+    # return cv2.inRange(cv2.bitwise_not(diff), 255 - threshold, 255)
+    h, w = image.shape[:2]
+    if h * w < 30000:
+        # 3 通道路径在极小图上更快（单次调用开销占主导）
+        diff = cv2.subtract(image, (*color, 0))
+        r, g, b = cv2.split(diff)
+        cv2.max(r, g, dst=r)
+        cv2.max(r, b, dst=r)
+        positive = r
+        cv2.subtract((*color, 0), image, dst=diff)
+        r, g, b = cv2.split(diff)
+        cv2.max(r, g, dst=r)
+        cv2.max(r, b, dst=r)
+        negative = r
+        cv2.add(positive, negative, dst=positive)
+        # diff 恒非负，因此「diff <= threshold 处为 255」等价于
+        # inRange(255 - diff, 255 - threshold, 255)，
+        # 可省去 color_similarity_2d 中一次 bitwise_not
+        cv2.threshold(positive, threshold, 255, cv2.THRESH_BINARY_INV, dst=positive)
+        return positive
+    # 大图逐通道减法 + 缓冲区复用更优
+    r, g, b = cv2.split(image)
+    cr, cg, cb = color
+    positive = cv2.subtract(r, cr)
+    cv2.subtract(cr, r, dst=r)
+    negative = r
+    diff = cv2.subtract(g, cg)
+    cv2.max(positive, diff, dst=positive)
+    cv2.subtract(cg, g, dst=diff)
+    cv2.max(negative, diff, dst=negative)
+    cv2.subtract(b, cb, dst=diff)
+    cv2.max(positive, diff, dst=positive)
+    cv2.subtract(cb, b, dst=diff)
+    cv2.max(negative, diff, dst=negative)
+    cv2.add(positive, negative, dst=positive)
+    # 同上，diff 恒非负，直接用阈值化取代 inRange + bitwise_not
+    cv2.threshold(positive, threshold, 255, cv2.THRESH_BINARY_INV, dst=positive)
+    return positive
 
 
 def extract_letters(image, letter=(255, 255, 255), threshold=128):
@@ -1085,30 +1200,67 @@ def extract_letters(image, letter=(255, 255, 255), threshold=128):
     Returns:
         np.ndarray: 灰度图，形状 (height, width)。
     """
+    if tuple(letter) == (255, 255, 255):
+        # MAX of the inverted image == inverted MIN of the image
+        r, g, b = cv2.split(image)
+        cv2.min(r, g, dst=r)
+        cv2.min(r, b, dst=r)
+        cv2.bitwise_not(r, dst=r)
+        if threshold != 255:
+            cv2.convertScaleAbs(r, alpha=255.0 / threshold, dst=r)
+        return r
     # r, g, b = cv2.split(cv2.subtract(image, (*letter, 0)))
     # positive = cv2.max(cv2.max(r, g), b)
     # r, g, b = cv2.split(cv2.subtract((*letter, 0), image))
     # negative = cv2.max(cv2.max(r, g), b)
     # return cv2.multiply(cv2.add(positive, negative), 255.0 / threshold)
-    diff = cv2.subtract(image, letter)
-    r, g, b = cv2.split(diff)
-    cv2.max(r, g, dst=r)
-    cv2.max(r, b, dst=r)
-    positive = r
-    cv2.subtract(letter, image, dst=diff)
-    r, g, b = cv2.split(diff)
-    cv2.max(r, g, dst=r)
-    cv2.max(r, b, dst=r)
+    h, w = image.shape[:2]
+    if h * w < 30000:
+        # 3 通道路径在极小图上更快（单次调用开销占主导）
+        diff = cv2.subtract(image, (*letter, 0))
+        r, g, b = cv2.split(diff)
+        cv2.max(r, g, dst=r)
+        cv2.max(r, b, dst=r)
+        positive = r
+        cv2.subtract((*letter, 0), image, dst=diff)
+        r, g, b = cv2.split(diff)
+        cv2.max(r, g, dst=r)
+        cv2.max(r, b, dst=r)
+        negative = r
+        if threshold != 255:
+            cv2.addWeighted(positive, 255.0 / threshold, negative, 255.0 / threshold, 0, dst=positive)
+        else:
+            cv2.add(positive, negative, dst=positive)
+        return positive
+    # 大图逐通道减法 + 缓冲区复用更优
+    r, g, b = cv2.split(image)
+    lr, lg, lb = letter
+    positive = cv2.subtract(r, lr)
+    cv2.subtract(lr, r, dst=r)
     negative = r
-    cv2.add(positive, negative, dst=positive)
+    diff = cv2.subtract(g, lg)
+    cv2.max(positive, diff, dst=positive)
+    cv2.subtract(lg, g, dst=diff)
+    cv2.max(negative, diff, dst=negative)
+    cv2.subtract(b, lb, dst=diff)
+    cv2.max(positive, diff, dst=positive)
+    cv2.subtract(lb, b, dst=diff)
+    cv2.max(negative, diff, dst=negative)
     if threshold != 255:
-        cv2.convertScaleAbs(positive, alpha=255.0 / threshold, dst=positive)
+        cv2.addWeighted(positive, 255.0 / threshold, negative, 255.0 / threshold, 0, dst=positive)
+    else:
+        cv2.add(positive, negative, dst=positive)
     return positive
 
 
 def extract_white_letters(image, threshold=128):
     """将字母颜色设为黑色，背景颜色设为白色。
     此函数会抑制彩色像素（非灰度像素）。
+
+    result = sat_mul(max' - 0.5 * min', 255 / threshold)
+    where max' = max_c(255 - image) and min' = min_c(255 - image) are the
+    per-pixel max/min of the inverted image across channels, and the scale
+    step is skipped when threshold = 255.
 
     Args:
         image (np.ndarray): 图像数组，形状 (height, width, channel)。
@@ -1117,24 +1269,29 @@ def extract_white_letters(image, threshold=128):
     Returns:
         np.ndarray: 灰度图，形状 (height, width)。
     """
+    # r, g, b = cv2.split(cv2.subtract((255, 255, 255, 0), image))
     # minimum = cv2.min(cv2.min(r, g), b)
     # maximum = cv2.max(cv2.max(r, g), b)
+    # maximum = cv2.multiply(maximum, 0.5)
+    # minimum = cv2.multiply(minimum, 0.5)
     # return cv2.multiply(cv2.add(maximum, cv2.subtract(maximum, minimum)), 255.0 / threshold)
-    r, g, b = cv2.split(cv2.subtract((255, 255, 255), image))
+    r, g, b = cv2.split(image)
     maximum = cv2.max(r, g)
     cv2.min(r, g, dst=r)
     cv2.max(maximum, b, dst=maximum)
     cv2.min(r, b, dst=r)
-    # minimum = r
+    # r = MIN(r, g, b), maximum = MAX(r, g, b) in the original domain
+    cv2.bitwise_not(r, dst=r)
+    cv2.bitwise_not(maximum, dst=maximum)
 
-    cv2.convertScaleAbs(maximum, alpha=0.5, dst=maximum)
     cv2.convertScaleAbs(r, alpha=0.5, dst=r)
-    cv2.subtract(maximum, r, dst=r)
-    cv2.add(maximum, r, dst=maximum)
+    cv2.convertScaleAbs(maximum, alpha=0.5, dst=maximum)
+    cv2.subtract(r, maximum, dst=maximum)
     if threshold != 255:
-        cv2.convertScaleAbs(maximum, alpha=255.0 / threshold, dst=maximum)
-    return maximum
-
+        cv2.addWeighted(r, 255.0 / threshold, maximum, 255.0 / threshold, 0, dst=r)
+    else:
+        cv2.add(r, maximum, dst=r)
+    return r
 
 def crop_to_text(image, threshold=120, padding=2):
     """裁剪图像宽高以紧密贴合文本内容。

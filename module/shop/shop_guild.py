@@ -1,3 +1,7 @@
+"""舰队商店处理器，使用舰队币购买舰队商店专属商品。
+支持 2025-08-14 新 UI 布局，使用模板匹配识别商品。
+"""
+
 from module.base.decorator import cached_property
 from module.logger import logger
 from module.shop.assets import *
@@ -8,11 +12,6 @@ from module.shop.ui import ShopUI
 
 
 class GuildShop_250814(ShopClerk, ShopUI, ShopStatus):
-    """舰队商店处理器 (2025-08-14 新 UI)。
-
-    Pages: in: page_shop (guild shop tab)
-    """
-
     shop_template_folder = './assets/shop/guild'
 
     @cached_property
@@ -24,7 +23,7 @@ class GuildShop_250814(ShopClerk, ShopUI, ShopStatus):
         """
         return self.config.GuildShop_Filter.strip()
 
-    # 2025-08-14 新 UI
+    # New UI in 2025-08-14
     @cached_property
     def shop_guild_items(self):
         """加载舰队商店商品模板和配置。
@@ -66,7 +65,7 @@ class GuildShop_250814(ShopClerk, ShopUI, ShopStatus):
             int: 舰队币数量
         """
         self._currency = self.status_get_guild_coins()
-        logger.info(f'Guild coins: {self._currency}')
+        logger.info(f'[商店-舰队] 舰队币: {self._currency}')
         return self._currency
 
     def shop_interval_clear(self):
@@ -103,19 +102,23 @@ class GuildShop_250814(ShopClerk, ShopUI, ShopStatus):
         按照过滤器配置购买舰队商店商品，支持刷新。
         刷新消耗 50 舰队币，T4 部件箱价格 60，余额不足 110 时跳过刷新。
         """
+        # Base case; exit run if filter empty
         if not self.shop_filter:
             return
 
+        # When called, expected to be in
+        # correct Guild Shop interface
         logger.hr('Guild Shop', level=1)
 
-        # 执行购买操作，启用刷新时最多尝试 2 次
+        # Execute buy operations
+        # Refresh if enabled and available
         refresh = self.config.GuildShop_Refresh
         for _ in range(2):
             success = self.shop_buy()
             if not success:
                 break
             if refresh:
-                # 刷新消耗 50，T4 部件箱价格 60
+                # Refresh costs 50 and PlateT4 costs 60
                 if self._currency >= 110:
                     if self.shop_refresh():
                         continue

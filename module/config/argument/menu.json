@@ -32,6 +32,7 @@
       "RaidScuttle",
       "Hospital",
       "Coalition",
+      "CoalitionScuttle",
       "MaritimeEscort",
       "EventShop",
       "WarArchives"
@@ -57,11 +58,14 @@
       "Commission",
       "Tactical",
       "Research",
+      "StorageStatistics",
       "Dorm",
       "Meowfficer",
       "Guild",
       "Reward",
-      "Awaken"
+      "Awaken",
+      "Secretary",
+      "OperationHandover"
     ]
   },
   "DailyMission": {
@@ -69,6 +73,7 @@
     "page": "setting",
     "tasks": [
       "Daily",
+      "LimitChallenge",
       "Hard",
       "Exercise",
       "ShopFrequent",
@@ -86,8 +91,8 @@
     "tasks": [
       "OpsiGeneral",
       "OpsiAshBeacon",
-      "OpsiAshAssist",
       "OpsiExplore",
+      "OpsiExploreCleanup",
       "OpsiShop",
       "OpsiVoucher",
       "OpsiDaily",
@@ -99,6 +104,7 @@
       "OpsiMeowfficerFarming",
       "OpsiHazard1Leveling",
       "OpsiScheduling",
+      "OpsiPreventActionPointOverflow",
       "OpsiCrossMonth",
       "OpsiSimulator"
     ]
@@ -119,22 +125,45 @@
       "IslandJuuCoffee",
       "IslandManufacture",
       "IslandDailyGather",
-      "IslandAirDrop"
+      "IslandAirDrop",
+      "IslandCargoPreparation",
+      "IslandDailyOrder",
+      "IslandDailyInteract",
+      "IslandPearlSell"
+    ]
+  },
+  "FleetManagement": {
+    "menu": "collapse",
+    "page": "setting",
+    "tasks": [
+      "FleetInfo"
+    ]
+  },
+  "RunParams": {
+    "menu": "collapse",
+    "page": "setting",
+    "tasks": [
+      "RunParams"
     ]
   },
   "Tool": {
     "menu": "collapse",
     "page": "tool",
     "tasks": [
+      "FleetScan",
+      "DockScan",
       "Daemon",
       "OpsiDaemon",
       "EventStory",
       "BoxDisassemble",
+      "AutoEquip",
       "Benchmark",
       "OcrBenchmark",
       "AzurLaneUncensored",
       "GameManager",
-      "EmulatorManager"
+      "EmulatorManager",
+      "MeowfficerScore",
+      "IslandProductionPlanner"
     ]
   }
 }

@@ -1,6 +1,15 @@
+"""
+ADB 截图和输入方法。
+
+通过 Android Debug Bridge (ADB) 执行设备截图和触控操作。
+主要提供截图捕获（`screenshot_adb`）、XML 层级获取（`dump_hierarchy`）等方法。
+基于 `adb exec-out screencap -p` 命令捕获屏幕图像，
+通过 `adb shell input` 命令执行点击、滑动等触控操作。
+包含自动重试机制，处理 ADB 连接中断和图像截断等异常情况。
+"""
 import re
 import time
-from functools import wraps
+from functools import partial
 
 import cv2
 import numpy as np
@@ -10,80 +19,35 @@ from lxml import etree
 from module.base.decorator import Config
 from module.config.server import DICT_PACKAGE_TO_ACTIVITY
 from module.device.connection import Connection
+from module.device.method.retry import retry_backend, recover_adb, recover_truncated_image, recover_unknown
 from module.device.method.remove_warning import remove_screenshot_warning
-from module.device.method.utils import (ImageTruncated, PackageNotInstalled, RETRY_TRIES, handle_adb_error,
-                                        handle_unknown_host_service, retry_sleep)
-from module.exception import EmulatorNotRunningError, RequestHumanTakeover, ScriptError
+from module.device.method.utils import ImageTruncated, PackageNotInstalled
+from module.exception import EmulatorNotRunningError, ScriptError
 from module.logger import logger
 
 
-def retry(func):
-    @wraps(func)
-    def retry_wrapper(self, *args, **kwargs):
-        """
-        Args:
-            self (Adb):
-        """
-        init = None
-        for _ in range(RETRY_TRIES):
-            try:
-                if callable(init):
-                    time.sleep(retry_sleep(_))
-                    init()
-                return func(self, *args, **kwargs)
-            # 无法处理
-            except RequestHumanTakeover:
-                break
-            # 无法处理 - 必须向上抛出以触发模拟器重启
-            except EmulatorNotRunningError:
-                raise
-            # ADB 服务被终止时
-            except ConnectionResetError as e:
-                logger.error(e)
+def _retry_recover(self, error, trial):
+    """ADB 操作失败后的异常恢复策略。
 
-                def init():
-                    self.adb_reconnect()
-            # ADB 错误
-            except AdbError as e:
-                if handle_adb_error(e):
-                    def init():
-                        self.adb_reconnect()
-                elif handle_unknown_host_service(e):
-                    def init():
-                        self.adb_start_server()
-                        self.adb_reconnect()
-                else:
-                    break
-            # 应用未安装
-            except PackageNotInstalled as e:
-                logger.error(e)
+    Args:
+        self: 设备实例。
+        error: 捕获的异常对象。
+        trial: 当前重试轮次。
 
-                def init():
-                    self.detect_package()
-            # 图像数据截断
-            except ImageTruncated as e:
-                from module.device.method.utils import handle_image_truncated
-                handle_image_truncated(self, e)
+    Returns:
+        可调用的恢复函数，若无法恢复则返回 None。
+    """
+    if isinstance(error, (ConnectionResetError, AdbError)):
+        return recover_adb(self, error)
+    if isinstance(error, PackageNotInstalled):
+        logger.error(error)
+        return self.detect_package
+    if isinstance(error, ImageTruncated):
+        return recover_truncated_image(self, error)
+    return recover_unknown(error)
 
-                def init():
-                    pass
-            # 未知异常
-            except Exception as e:
-                logger.exception(e)
 
-                def init():
-                    pass
-
-        if func.__name__ in [
-            'screenshot_adb', 'screenshot_adb_nc',
-            '_app_start_adb_am', '_app_start_adb_monkey',
-        ]:
-            logger.critical(f'重试 {func.__name__}() 失败')
-            raise EmulatorNotRunningError
-        logger.critical(f'重试 {func.__name__}() 失败')
-        raise RequestHumanTakeover
-
-    return retry_wrapper
+retry = partial(retry_backend, recover=_retry_recover, label='设备-ADB')
 
 
 def load_screencap(data):
@@ -130,6 +94,19 @@ class Adb(Connection):
 
     @staticmethod
     def __load_screenshot(screenshot, method):
+        """将截图原始字节数据根据不同换行符模式解析为 RGB 图像。
+
+        Args:
+            screenshot (bytes): 截图二进制数据。
+            method (int): 换行符替换模式（0: 原样, 1: \\r\\n -> \\n, 2: \\r\\r\\n -> \\n）。
+
+        Returns:
+            np.ndarray: 解析得到的 RGB 图像。
+
+        Raises:
+            ScriptError: 未知的解析模式。
+            ImageTruncated: 图像数据为空或截断损坏。
+        """
         if method == 0:
             pass
         elif method == 1:
@@ -159,6 +136,17 @@ class Adb(Connection):
         return image
 
     def __process_screenshot(self, screenshot):
+        """尝试多种换行符模式解析截图数据，并记录成功模式。
+
+        Args:
+            screenshot (bytes): screencap 输出的原始字节流。
+
+        Returns:
+            np.ndarray: 解析成功的 RGB 图像。
+
+        Raises:
+            OSError: 所有解析模式均失败。
+        """
         for method in self.__screenshot_method_fixed:
             try:
                 result = self.__load_screenshot(screenshot, method=method)
@@ -169,39 +157,60 @@ class Adb(Connection):
 
         self.__screenshot_method_fixed = self.__screenshot_method
         if len(screenshot) < 500:
-            logger.warning(f'Unexpected screenshot: {screenshot}')
+            logger.warning(f'[设备-ADB] 异常截图: {screenshot}')
         raise OSError(f'cannot load screenshot')
 
-    @retry
+    @retry(on_exhausted=EmulatorNotRunningError)
     @Config.when(DEVICE_OVER_HTTP=False)
     def screenshot_adb(self):
+        """通过 ADB screencap -p 截取屏幕图像（非 HTTP 设备流式传输）。
+
+        Returns:
+            np.ndarray: RGB 格式的屏幕截图。
+        """
         data = self.adb_shell(['screencap', '-p'], stream=True)
         if len(data) < 500:
-            logger.warning(f'Unexpected screenshot: {data}')
+            logger.warning(f'[设备-ADB] 异常截图: {data}')
 
         return self.__process_screenshot(data)
 
-    @retry
+    @retry(on_exhausted=EmulatorNotRunningError)
     @Config.when(DEVICE_OVER_HTTP=True)
     def screenshot_adb(self):
+        """通过 ADB screencap 截取屏幕原始图像（HTTP 设备流式传输）。
+
+        Returns:
+            np.ndarray: RGB 格式的屏幕截图。
+        """
         data = self.adb_shell(['screencap'], stream=True)
         data = remove_screenshot_warning(data)
         if len(data) < 500:
-            logger.warning(f'Unexpected screenshot: {data}')
+            logger.warning(f'[设备-ADB] 异常截图: {data}')
 
         return load_screencap(data)
 
-    @retry
+    @retry(on_exhausted=EmulatorNotRunningError)
     def screenshot_adb_nc(self):
+        """通过 netcat 直连 ADB 截取屏幕原始图像。
+
+        Returns:
+            np.ndarray: RGB 格式的屏幕截图。
+        """
         data = self.adb_shell_nc(['screencap'])
         data = remove_screenshot_warning(data)
         if len(data) < 500:
-            logger.warning(f'Unexpected screenshot: {data}')
+            logger.warning(f'[设备-ADB] 异常截图: {data}')
 
         return load_screencap(data)
 
     @retry
     def click_adb(self, x, y):
+        """通过 ADB input tap 点击指定坐标。
+
+        Args:
+            x (int): 目标 X 坐标。
+            y (int): 目标 Y 坐标。
+        """
         start = time.time()
         self.adb_shell(['input', 'tap', x, y])
         if time.time() - start <= 0.05:
@@ -209,6 +218,13 @@ class Adb(Connection):
 
     @retry
     def swipe_adb(self, p1, p2, duration=0.1):
+        """通过 ADB input swipe 执行滑动操作。
+
+        Args:
+            p1 (tuple[int, int]): 起始坐标 (x, y)。
+            p2 (tuple[int, int]): 终点坐标 (x, y)。
+            duration (float): 滑动持续时间（秒）。
+        """
         duration = int(duration * 1000)
         self.adb_shell(['input', 'swipe', *p1, *p2, duration])
 
@@ -254,7 +270,7 @@ class Adb(Connection):
             return ret
         raise OSError("Couldn't get focused app")
 
-    @retry
+    @retry(on_exhausted=EmulatorNotRunningError)
     def _app_start_adb_monkey(self, package_name=None, allow_failure=False):
         """
         通过 monkey 命令启动应用。
@@ -290,7 +306,7 @@ class Adb(Connection):
             # ## Network stats: elapsed time=4ms (0ms mobile, 0ms wifi, 4ms not connected)
             return True
 
-    @retry
+    @retry(on_exhausted=EmulatorNotRunningError)
     def _app_start_adb_am(self, package_name=None, activity_name=None, allow_failure=False):
         """
         通过 am start 命令启动应用。
@@ -319,7 +335,7 @@ class Adb(Connection):
                 try:
                     activity_name = activity_name.split('/')[-1]
                 except IndexError:
-                    logger.error(f'No activity name from {activity_name}')
+                    logger.error(f'无Activity名称 {activity_name}')
                     return False
             else:
                 if allow_failure:
@@ -346,7 +362,7 @@ class Adb(Connection):
         # 已在运行
         # Warning: Activity not started, intent has been delivered to currently running top-most instance.
         if 'Warning: Activity not started' in ret:
-            logger.info('App activity is already started')
+            logger.info('应用Activity已启动')
             return True
         # 权限拒绝
         # Starting: Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] cmp=com.YoStarEN.AzurLane/com.manjuu.azurlane.MainActivity }
@@ -356,7 +372,7 @@ class Adb(Connection):
                 return False
             else:
                 logger.error(ret)
-                logger.error('Permission Denial while starting app, probably because activity invalid')
+                logger.error('[设备-ADB] 启动应用权限被拒绝，可能是 Activity 无效')
                 return False
         # 启动成功
         # Starting: Intent...
@@ -393,12 +409,16 @@ class Adb(Connection):
         if self._app_start_adb_am(package_name, activity_name, allow_failure):
             return True
 
-        logger.error('app_start_adb: All trials failed')
+        logger.error('所有尝试失败')
         return False
 
     @retry
     def app_stop_adb(self, package_name=None):
-        """停止应用：am force-stop。"""
+        """通过 am force-stop 强制停止应用。
+
+        Args:
+            package_name (str, optional): 待停止的应用包名，默认为当前配置包名。
+        """
         if not package_name:
             package_name = self.package
         self.adb_shell(['am', 'force-stop', package_name])

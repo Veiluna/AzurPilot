@@ -1,53 +1,96 @@
-import traceback
-import os
-from module.logger import logger
+"""LLM 错误分析模块。
+
+使用 OpenAI 兼容 API 对脚本运行中捕获的异常进行智能分析。
+当配置启用 LLM 错误分析时，会将异常堆栈发送给 LLM，
+获取错误原因分析和修复建议，帮助用户快速定位问题。
+
+配置项：
+- Error_LlmAnalysis: 是否启用 LLM 错误分析
+- Error_LlmApiKey: OpenAI API Key
+- Error_LlmApiBase: API 基础 URL（默认 https://api.openai.com/v1）
+- Error_LlmModel: 使用的模型名称（默认 gpt-4o-mini）
+
+特性：
+- 相同错误的分析结果会缓存，避免重复调用 API
+- 使用 MD5 哈希进行错误去重
+- API 调用失败时静默降级，不影响正常运行
+"""
 
 import hashlib
+import os
+import traceback
 
+from module.logger import logger
+
+# 已分析错误的缓存，键为堆栈信息的 MD5 哈希
 _analyzed_errors_cache = {}
+LLM_CONFIG_WARNING = 'LLM 错误分析不可用，请检查 LLM 配置、API Key、API Base、模型名称以及账户余额。'
+LLM_EMPTY_RESULT_WARNING = 'LLM API 返回了空结果，请检查模型服务配置、模型名称或账户余额。'
+
+
+def _get_analysis_from_response(response):
+    """从 OpenAI 兼容响应中提取分析文本。
+
+    Args:
+        response: OpenAI 客户端返回的 ChatCompletion 对象。
+
+    Returns:
+        str: 提取的分析文本内容，提取失败则返回空字符串。
+    """
+    choices = getattr(response, 'choices', None)
+    if not choices:
+        return ''
+    message = getattr(choices[0], 'message', None)
+    if message is None:
+        return ''
+    content = getattr(message, 'content', None)
+    if content is None:
+        return ''
+    return content.strip()
+
 
 def analyze_exception(config, e):
-    """
-    使用 LLM 分析异常原因。
+    """使用 LLM 分析异常原因。
 
     Args:
         config (AzurLaneConfig): 配置对象。
-        e (Exception): 异常对象。
+        e (Exception): 捕获到的异常对象。
     """
     if not hasattr(config, 'Error_LlmAnalysis') or not config.Error_LlmAnalysis:
         return
-        
+
     tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-    
+
     error_hash = hashlib.md5(tb.encode('utf-8')).hexdigest()
     if error_hash in _analyzed_errors_cache:
         cached_result = _analyzed_errors_cache[error_hash]
         model = getattr(config, 'Error_LlmModel', 'gpt-4o-mini')
-        logger.hr('LLM 错误分析（严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊）', level=1)
-        logger.info('该错误已被 LLM 分析过，直接复用上次的分析结果以节省 API （严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊） ...')
-        logger.info(f"\n[LLM 分析报告 (由 {model} 提供, 复用缓存)（严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊）]\n{cached_result}\n")
-        logger.hr('LLM 分析结束', level=1)
+        logger.hr('[LLM] LLM 错误分析（严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊）', level=1)
+        logger.info('[LLM] 该错误已被 LLM 分析过，直接复用上次的分析结果以节省 API （严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊） ...')
+        logger.info(f"[LLM] \n[LLM 分析报告 (由 {model} 提供, 复用缓存)（严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊）]\n{cached_result}\n")
+        logger.hr('[LLM] LLM 分析结束', level=1)
         return
-        
-    _analyzed_errors_cache[error_hash] = "该错误正在被 LLM 分析中或上次分析失败，暂无结果。（严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊）"
-    if len(_analyzed_errors_cache) > 50:
-        _analyzed_errors_cache.clear()
-        _analyzed_errors_cache[error_hash] = "该错误正在被 LLM 分析中或上次分析失败，暂无结果。（严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊）"
-    
+
     api_key = getattr(config, 'Error_LlmApiKey', '')
     api_base = getattr(config, 'Error_LlmApiBase', 'https://api.openai.com/v1')
     model = getattr(config, 'Error_LlmModel', 'gpt-4o-mini')
-    
+
     if not api_key:
-        logger.warning('LLM Analysis is enabled but API Key is empty.')
+        logger.warning('[LLM] LLM 错误分析已启用，但 API Key 未配置。')
+        logger.warning(LLM_CONFIG_WARNING)
         return
 
-    logger.hr('LLM 错误分析（严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊）', level=1)
-    logger.info('正在调用 LLM 分析异常原因...')
-    
+    _analyzed_errors_cache[error_hash] = "该错误正在被 LLM 分析中，暂无结果。（严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊）"
+    if len(_analyzed_errors_cache) > 50:
+        _analyzed_errors_cache.clear()
+        _analyzed_errors_cache[error_hash] = "该错误正在被 LLM 分析中，暂无结果。（严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊）"
+
+    logger.hr('[LLM] LLM 错误分析（严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊）', level=1)
+    logger.info('[LLM] 正在调用 LLM 分析异常原因...')
+
     try:
         from openai import OpenAI
-        
+
         log_context = ""
         try:
             if hasattr(logger, 'log_file') and logger.log_file and os.path.exists(logger.log_file):
@@ -58,7 +101,7 @@ def analyze_exception(config, e):
             pass
 
         tb = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-        
+
         # 将总上下文限制在 64K 字符以内
         def truncate(text, limit):
             if len(text) > limit:
@@ -93,15 +136,25 @@ def analyze_exception(config, e):
             ],
             timeout=60
         )
-        
-        analysis = response.choices[0].message.content.strip()
+
+        analysis = _get_analysis_from_response(response)
+        if not analysis:
+            _analyzed_errors_cache.pop(error_hash, None)
+            logger.warning(LLM_EMPTY_RESULT_WARNING)
+            logger.warning(LLM_CONFIG_WARNING)
+            logger.hr('[LLM] LLM 分析结束', level=1)
+            return
+
         # 覆写真正的成果进字典
         _analyzed_errors_cache[error_hash] = analysis
-        logger.info(f"\n[LLM 分析报告 (由 {model} 提供)]\n{analysis}\n")
-        logger.hr('LLM 分析结束', level=1)
-        
+        logger.info(f"[LLM] \n[LLM 分析报告 (由 {model} 提供)]\n{analysis}\n")
+        logger.hr('[LLM] LLM 分析结束', level=1)
+
     except ImportError:
-        logger.error('未安装 openai 库。请运行: pip install openai')
+        _analyzed_errors_cache.pop(error_hash, None)
+        logger.error('[LLM] 未安装 openai 库，无法进行 LLM 错误分析。')
     except Exception as ex:
+        _analyzed_errors_cache.pop(error_hash, None)
         # 避免循环日志问题，LLM 本身失败时使用简化的错误日志
-        logger.error(f'LLM 分析调用失败（严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊）: {ex}')
+        logger.error(f'[LLM] LLM 分析调用失败（严禁提交此模块的相关日志 群内机器人检测到将自动移出群聊）: {ex}')
+        logger.warning(LLM_CONFIG_WARNING)

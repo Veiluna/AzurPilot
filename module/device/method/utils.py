@@ -1,15 +1,24 @@
+"""设备方法层通用工具。包含 ADB 错误处理、重试策略、序列号解析、
+UI 层级解析（HierarchyButton）和 Shell 命令辅助函数。"""
+
 import os
 import random
 import re
 import socket
+import tarfile
+import tempfile
 import time
 import typing as t
+import zlib
 
+import requests
 import uiautomator2 as u2
 import uiautomator2cache
 from adbutils import AdbTimeout
 from lxml import etree
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
+from module.base import http
 from module.device.method.remove_warning import remove_shell_warning
 
 try:
@@ -50,11 +59,9 @@ except ImportError:
     adbutils._device.BaseDevice.shell = shell
 
 from module.base.decorator import cached_property
+from module.base.runtime_params import RETRY_DELAY, RETRY_TRIES, IMAGE_TRUNCATED_THRESHOLD
+from module.exception import EmulatorNotRunningError, RequestHumanTakeover
 from module.logger import logger
-
-RETRY_TRIES = 5
-RETRY_DELAY = 3
-IMAGE_TRUNCATED_THRESHOLD = 3
 
 # Track consecutive ImageTruncated counts per device serial
 _image_truncated_counts: dict = {}
@@ -79,28 +86,34 @@ def handle_image_truncated(obj, exc: Exception) -> None:
     """
     serial = getattr(obj, 'serial', None)
     cnt = report_image_truncated(serial)
-    logger.error(f'ImageTruncated occurred ({cnt}) for device {serial}: {exc}')
+    logger.error(f'图像截断发生 ({cnt}) for device {serial}: {exc}')
 
     if cnt >= IMAGE_TRUNCATED_THRESHOLD:
-        logger.warning(f'ImageTruncated reached threshold ({IMAGE_TRUNCATED_THRESHOLD}) for {serial}, attempting recovery')
+        logger.warning(f'[设备-工具] 图像截断达到阈值 ({IMAGE_TRUNCATED_THRESHOLD}) 对于 {serial}，尝试恢复')
         # Try specific recoveries in order of likelihood
         try:
             if hasattr(obj, 'droidcast_init'):
-                logger.info('Attempting to restart DroidCast service')
+                logger.info('尝试重启DroidCast服务')
                 try:
                     obj.droidcast_init()
+                except (RequestHumanTakeover, EmulatorNotRunningError):
+                    raise
                 except Exception:
                     logger.exception('Failed to restart DroidCast')
             # Try ascreencap init if available
             if hasattr(obj, 'ascreencap_init'):
                 try:
                     obj.ascreencap_init()
+                except (RequestHumanTakeover, EmulatorNotRunningError):
+                    raise
                 except Exception:
                     logger.exception('Failed to init ascreencap')
             # Reconnect adb as a final attempt
             if hasattr(obj, 'adb_reconnect'):
                 try:
                     obj.adb_reconnect()
+                except (RequestHumanTakeover, EmulatorNotRunningError):
+                    raise
                 except Exception:
                     logger.exception('Failed to adb_reconnect')
         finally:
@@ -126,6 +139,29 @@ u2.setup_logger = setup_logger
 u2.init.setup_logger = setup_logger
 
 
+_u2_mirror_download = u2.init.mirror_download
+
+
+def mirror_download(url, filename=None, logger=u2_logger):
+    """优先下载 ATX 镜像，失败时使用同版本、同架构的 GitHub 发布包。"""
+    if not url.startswith('https://atx.azurpilot.com/'):
+        return _u2_mirror_download(url, filename, logger=logger)
+
+    storepath = u2.init.gen_cachepath(url)
+    try:
+        return http.download_file(url, storepath)
+    except (http.RequestException, requests.RequestException, Urllib3HTTPError,
+            FileNotFoundError, AssertionError, TypeError, ValueError) as exc:
+        logger.warning('ATX Agent 镜像下载失败，回退 GitHub：%s', exc)
+
+    github_url = u2.init.GITHUB_BASEURL + '/atx-agent/releases/download/%s/%s' % (
+        u2.version.__atx_agent_version__, os.path.basename(url))
+    return u2.init.cache_download(github_url, filename, storepath=storepath, logger=logger)
+
+
+u2.init.mirror_download = mirror_download
+
+
 # Patch Initer
 class PatchedIniter(u2.init.Initer):
     @property
@@ -147,8 +183,67 @@ class PatchedIniter(u2.init.Initer):
             raise Exception(
                 "arch(%s) need to be supported yet, please report an issue in github"
                 % self.abis)
-        return u2.init.GITHUB_BASEURL + '/atx-agent/releases/download/%s/%s' % (
-            u2.version.__atx_agent_version__, name.format(v=u2.version.__atx_agent_version__))
+        return 'https://atx.azurpilot.com/%s' % (
+            name.format(v=u2.version.__atx_agent_version__))
+
+    @staticmethod
+    def _atx_archive_valid(path):
+        """确认缓存是包含完整 agent 文件的 gzip 归档，排除错误页和下载残片。"""
+        try:
+            with tarfile.open(path, 'r:gz') as archive:
+                member = archive.getmember('atx-agent')
+                if not member.isfile() or member.size <= 0:
+                    return False
+                with archive.extractfile(member) as binary:
+                    while binary.read(64 * 1024):
+                        pass
+            return True
+        except (OSError, EOFError, tarfile.TarError, KeyError, zlib.error):
+            return False
+
+    def _cache_atx_agent(self, url):
+        """预填上游缓存，避免下载器的固定 Origin 触发 CNB 跨域拒绝。"""
+        path = u2.init.gen_cachepath(url)
+        if self._atx_archive_valid(path):
+            return
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        version = u2.version.__atx_agent_version__
+        official = f'https://github.com/openatx/atx-agent/releases/download/{version}/{os.path.basename(url)}'
+        last_error = None
+        for source in (url, official):
+            partial = None
+            try:
+                self.logger.info(f'[设备-ATX] 下载 {source}')
+                # 上游固定发送 Origin: https://github.com，重定向到 CNB 后会得到 403。
+                with http.get(source, download=True, stream=True, headers={'Accept-Encoding': 'identity'},
+                              timeout=(5, 30)) as response:
+                    response.raise_for_status()
+                    with tempfile.NamedTemporaryFile(dir=os.path.dirname(path), suffix='.part',
+                                                     delete=False) as output:
+                        partial = output.name
+                        for chunk in response.iter_content(64 * 1024):
+                            output.write(chunk)
+                    expected = response.headers.get('Content-Length')
+                    if expected is not None and os.path.getsize(partial) != int(expected):
+                        raise ValueError('atx-agent 下载长度不完整')
+                if not self._atx_archive_valid(partial):
+                    raise ValueError('atx-agent 下载内容不是有效的 agent 归档')
+                os.replace(partial, path)
+                return
+            except (http.RequestException, ValueError) as error:
+                self.logger.warning(f'[设备-ATX] 下载失败 {source}: {error}')
+                last_error = error
+            finally:
+                if partial is not None and os.path.exists(partial):
+                    os.unlink(partial)
+        raise last_error
+
+    def push_url(self, url, dest=None, mode=0o755, tgz=False, extract_name=None):
+        """仅修正 agent 下载，解包、推送及其他资源沿用上游安装流程。"""
+        if tgz and extract_name == 'atx-agent' and url == self.atx_agent_url:
+            self._cache_atx_agent(url)
+        return super().push_url(url, dest=dest, mode=mode, tgz=tgz, extract_name=extract_name)
 
     @property
     def minicap_urls(self):
@@ -159,7 +254,14 @@ u2.init.Initer = PatchedIniter
 
 
 def is_port_using(port_num):
-    """ if port is using by others, return True. else return False """
+    """检查本地端口是否已被占用。
+
+    Args:
+        port_num (int): 待检测的端口号。
+
+    Returns:
+        bool: 端口被占用返回 True，否则返回 False。
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(2)
 
@@ -167,14 +269,21 @@ def is_port_using(port_num):
         s.bind(('127.0.0.1', port_num))
         return False
     except OSError:
-        # Address already bind
+        # 地址已被绑定
         return True
     finally:
         s.close()
 
 
 def random_port(port_range):
-    """ get a random port from port set """
+    """从指定的端口号范围内随机获取一个未占用的端口。
+
+    Args:
+        port_range (tuple[int, int]): 端口范围 (start, end)。
+
+    Returns:
+        int: 未被占用的可用端口号。
+    """
     new_port = random.choice(list(range(*port_range)))
     if is_port_using(new_port):
         return random_port(port_range)
@@ -183,17 +292,18 @@ def random_port(port_range):
 
 
 def recv_all(stream, chunk_size=4096, recv_interval=0.000) -> bytes:
-    """
+    """从 Socket 或流中持续读取所有可用数据直至结束。
+
     Args:
-        stream:
-        chunk_size:
-        recv_interval (float): Default to 0.000, use 0.001 if receiving as server
+        stream: 可读取数据的 Socket 或流对象。
+        chunk_size (int): 每次读取的缓冲区大小（字节）。
+        recv_interval (float): 每次读取后的休眠间隔（秒）。
 
     Returns:
-        bytes:
+        bytes: 聚合后的二进制数据。
 
     Raises:
-        AdbTimeout
+        AdbTimeout: 读取超时。
     """
     if isinstance(stream, AdbConnection):
         stream = stream.conn
@@ -207,7 +317,7 @@ def recv_all(stream, chunk_size=4096, recv_interval=0.000) -> bytes:
             chunk = stream.recv(chunk_size)
             if chunk:
                 fragments.append(chunk)
-                # See https://stackoverflow.com/questions/23837827/python-server-program-has-high-cpu-usage/41749820#41749820
+                # 参见 https://stackoverflow.com/questions/23837827/python-server-program-has-high-cpu-usage/41749820#41749820
                 time.sleep(recv_interval)
             else:
                 break
@@ -217,52 +327,61 @@ def recv_all(stream, chunk_size=4096, recv_interval=0.000) -> bytes:
 
 
 def possible_reasons(*args):
-    """
-    Show possible reasons
+    """打印可能导致设备连接/操作失败的原因列表。
 
-        Possible reason #1: <reason_1>
-        Possible reason #2: <reason_2>
+    Args:
+        *args: 错误原因描述字符串。
     """
     for index, reason in enumerate(args):
         index += 1
-        logger.critical(f'Possible reason #{index}: {reason}')
+        logger.critical(f'[设备-工具] 可能原因 #{index}: {reason}')
 
 
 class PackageNotInstalled(Exception):
+    """应用未安装异常。"""
     pass
 
 
 class ImageTruncated(Exception):
+    """截屏图像数据不完整/截断异常。"""
     pass
 
 
 def retry_sleep(trial):
-    # First trial
+    """根据当前重试轮次计算休眠等待时间（秒）。
+
+    Args:
+        trial (int): 重试次数（从 0 开始）。
+
+    Returns:
+        int: 休眠等待秒数。
+    """
+    # 首次尝试
     if trial == 0:
         return 0
-    # Failed once, fast retry
+    # 失败一次，快速重试
     elif trial == 1:
         return 0
-    # Failed twice
+    # 失败两次
     elif trial == 2:
         return 1
-    # Failed more
+    # 失败更多次，按标准间隔等待
     else:
         return RETRY_DELAY
 
 
 def handle_adb_error(e):
-    """
+    """根据 ADB 错误类型判断是否应该触发重试并输出对应的诊断信息。
+
     Args:
-        e (Exception):
+        e (Exception): 捕获到的异常实例。
 
     Returns:
-        bool: If should retry
+        bool: 如果可以通过重连/重试恢复则返回 True，否则返回 False。
     """
     text = str(e)
     if 'not found' in text:
-        # When you call `adb disconnect <serial>`
-        # Or when adb server was killed (low possibility)
+        # 当执行 `adb disconnect <serial>` 或 adb server 意外被杀时触发
         # AdbError(device '127.0.0.1:59865' not found)
         logger.error(e)
         return True
@@ -272,54 +391,55 @@ def handle_adb_error(e):
         return True
     elif 'closed' in text:
         # AdbError(closed)
-        # Usually after AdbTimeout(adb read timeout)
-        # Disconnect and re-connect should fix this.
+        # 通常发生于 AdbTimeout 之后，断开并重连即可恢复
         logger.error(e)
         return True
     elif 'device offline' in text:
         # AdbError(device offline)
-        # When a device that has been connected wirelessly is disconnected passively,
-        # it does not disappear from the adb device list,
-        # but will be displayed as offline.
-        # In many cases, such as disconnection and recovery caused by network fluctuations,
-        # or after VMOS reboot when running Alas on a phone,
-        # the device is still available, but it needs to be disconnected and re-connected.
+        # 无线连接的设备被动断开后不会从 adb 列表消失，而是显示为 offline
+        # 网络波动断开恢复后或手机 VMOS 重启后，需要断开并重新连接
         logger.error(e)
         return True
     elif 'is offline' in text:
         # RuntimeError: USB device 127.0.0.1:7555 is offline
-        # Raised by uiautomator2 when current adb service is killed by another version of adb service.
+        # 当当前 ADB 服务被另一个版本的 ADB 抢占关闭时由 uiautomator2 抛出
         logger.error(e)
         return True
     elif text == 'rest':
         # AdbError(rest)
-        # Response telling adbd service has reset, client should reconnect
+        # 服务端响应表明 adbd 服务已重置，客户端应重新建立连接
+        logger.error(e)
+        return True
+    elif text == '':
+        # AdbError('')
+        # 空错误消息，通常是 ADB 连接被模拟器意外关闭（如网络弹窗导致 atx-agent 崩溃）
+        # 断开重连通常可以修复
         logger.error(e)
         return True
     else:
-        # AdbError()
+        # 未知 AdbError
         logger.exception(e)
         possible_reasons(
-            'If you are using BlueStacks or LD player or WSA, please enable ADB in the settings of your emulator',
-            'Emulator died, please restart emulator',
-            'Serial incorrect, no such device exists or emulator is not running'
+            '如果使用 BlueStacks、雷电模拟器或 WSA，请在模拟器设置中启用 ADB',
+            '模拟器已崩溃，请重启模拟器',
+            '序列号错误，设备不存在或模拟器未运行'
         )
         return False
 
 
 def handle_unknown_host_service(e):
-    """
+    """处理 unknown host service 错误（通常由不同版本 ADB 相互抢占引发）。
+
     Args:
-        e (Exception):
+        e (Exception): 捕获到的异常实例。
 
     Returns:
-        bool: If should retry
+        bool: 是否应触发重试。
     """
     text = str(e)
     if 'unknown host service' in text:
-        # AdbError(unknown host service)
-        # Another version of ADB service started, current ADB service has been killed.
-        # Usually because user opened a Chinese emulator, which uses ADB from the Stone Age.
+        # 启动了另一个版本的 ADB 服务，导致当前 ADB 服务被终止
+        # 常见于启动了自带古老版本 ADB 的国产模拟器
         logger.error(e)
         return True
     else:
@@ -327,12 +447,13 @@ def handle_unknown_host_service(e):
 
 
 def get_serial_pair(serial):
-    """
+    """将序列号解析为 (port_serial, emulator_serial) 对。
+
     Args:
-        serial (str):
+        serial (str): 原始序列号字符串。
 
     Returns:
-        tuple[Optional[str], Optional[str]]: `127.0.0.1:5555+{X}` and `emulator-5554+{X}`, 0 <= X <= 32
+        tuple[str | None, str | None]: `127.0.0.1:5555+{X}` 和 `emulator-5554+{X}` 二元组 (0 <= X <= 64)。
     """
     if serial.startswith('127.0.0.1:'):
         try:
@@ -369,15 +490,14 @@ def removesuffix(s: bytes, suffix: bytes) -> bytes: ...
 
 
 def removeprefix(s, prefix):
-    """
-    Backport `string.removeprefix(prefix)`, which is on Python>=3.9
+    """移除字符串或字节串的前缀（兼容 Python 3.9 之前版本）。
 
     Args:
-        s (str | bytes):
-        prefix (str | bytes):
+        s (str | bytes): 目标字符串或字节串。
+        prefix (str | bytes): 待移除的前缀。
 
     Returns:
-        str | bytes:
+        str | bytes: 移除前缀后的结果。
     """
     if s.startswith(prefix):
         return s[len(prefix):]
@@ -385,54 +505,67 @@ def removeprefix(s, prefix):
 
 
 def removesuffix(s, suffix):
-    """
-    Backport `string.removesuffix(suffix)`, which is on Python>=3.9
+    """移除字符串或字节串的后缀（兼容 Python 3.9 之前版本）。
 
     Args:
-        s (str | bytes):
-        suffix (str | bytes):
+        s (str | bytes): 目标字符串或字节串。
+        suffix (str | bytes): 待移除的后缀。
 
     Returns:
-        str | bytes:
+        str | bytes: 移除后缀后的结果。
     """
-    # s[:-0] is empty string, so we need to check if suffix is empty
+    # suffix 为空时 s[:-0] 会导致空字符串，故需特别判断
     if suffix and s.endswith(suffix):
         return s[:-len(suffix)]
     return s
 
 
 class IniterNoMinicap(u2.init.Initer):
+    """禁止在模拟器上安装 minicap 的 Initer。"""
+
     @property
     def minicap_urls(self):
-        """
-        Don't install minicap on emulators, return empty urls.
-
-        binary from https://github.com/openatx/stf-binaries
-        only got abi: armeabi-v7a and arm64-v8a
-        """
+        """返回空 URL 列表，禁止在模拟器上下载安装 minicap。"""
         return []
 
 
 class Device(u2.Device):
+    """继承 u2.Device，兼容辅助 APK 检查并禁用悬浮窗。"""
+
+    def _is_apk_required(self) -> bool:
+        """按安装路径检查辅助 APK，避免解析测试包未声明的 versionName。
+
+        uiautomator2 旧实现用版本解析判断存在性；新版 packaging 拒绝空版本，
+        但随库分发的测试 APK 本身没有 versionName，不能据此要求重新安装。
+        """
+        for package in ('com.github.uiautomator', 'com.github.uiautomator.test'):
+            result = self.shell(['pm', 'path', package])
+            if result.exit_code != 0 or not any(
+                    line.strip().startswith('package:/') for line in result.output.splitlines()):
+                return True
+        return False
+
     def show_float_window(self, show=True):
-        """
-        Don't show float windows.
-        """
+        """禁止弹出悬浮窗。"""
         pass
 
 
-# Monkey patch
+# 猴子补丁
 u2.init.Initer = IniterNoMinicap
 u2.Device = Device
 
 
 class HierarchyButton:
-    """
-    Convert UI hierarchy to an object like the Button in Alas.
-    """
+    """将 UI 层级结构转换为类似 Alas 中 Button 的对象。"""
     _name_regex = re.compile('@.*?=[\'\"](.*?)[\'\"]')
 
     def __init__(self, hierarchy: etree._Element, xpath: str):
+        """初始化层级按钮。
+
+        Args:
+            hierarchy (etree._Element): XML UI 树根节点。
+            xpath (str): 目标节点的 XPath 表达式。
+        """
         self.hierarchy = hierarchy
         self.xpath = xpath
         self.nodes = hierarchy.xpath(xpath)

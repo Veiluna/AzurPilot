@@ -1,4 +1,15 @@
+"""大世界塞壬要塞任务模块。
+
+执行大世界塞壬要塞（Stronghold）的清理任务，包括：
+- 在地球仪上检索塞壬要塞入口
+- 轮换配置的 Boss 舰队进行多轮攻坚
+- 潜艇支援与弹药耗尽判断
+- 战后港口舰队维修与补给
+- 代币资源保护与无内容调度推迟
+"""
+
 from module.config.config import TaskEnd
+from module.exception import RequestHumanTakeover
 from module.logger import logger
 from module.os.fleet import BossFleet
 from module.os.map import OSMap
@@ -8,13 +19,11 @@ from module.ui.page import page_os
 
 
 class OpsiStronghold(CoinTaskMixin, OSMap):
-    
     def clear_stronghold(self):
-        """
-        清理一个塞壬要塞。
+        """清理一个塞壬要塞。
 
         在地球仪地图上找到塞壬要塞，进入并清理，完成后在港口修理舰队。
-        如果没有找到要塞，会尝试切换到其他黄币补充任务。
+        若没有找到要塞，会标记本轮无可执行内容。
 
         Raises:
             ActionPointLimit: 行动力不足。
@@ -25,7 +34,7 @@ class OpsiStronghold(CoinTaskMixin, OSMap):
             in: page_os, 大世界地球仪
             out: page_os, 大世界地图
         """
-        logger.hr('OS clear stronghold', level=1)
+        logger.hr('大世界-塞壬要塞', level=1)
         with self.config.multi_set():
             self.config.OpsiStronghold_HasStronghold = True
             self.cl1_ap_preserve()
@@ -34,19 +43,21 @@ class OpsiStronghold(CoinTaskMixin, OSMap):
             self.globe_update()
             zone = self.find_siren_stronghold()
             if zone is None:
-                # 没有塞壬要塞，尝试切换到其他任务
                 self.config.OpsiStronghold_HasStronghold = False
-                if self._handle_no_content_and_try_other_tasks('塞壬要塞', '塞壬要塞没有可执行内容'):
+                self._postpone_stronghold_check('塞壬要塞没有可执行内容')
+                self.os_globe_goto_map()
+                if self._handle_coin_task_no_content('塞壬要塞', '塞壬要塞没有可执行内容'):
                     return
 
         self.globe_enter(zone)
         self.zone_init()
         self.os_order_execute(recon_scan=True, submarine_call=False)
-        self.run_stronghold(submarine=self.config.OpsiStronghold_SubmarineEveryCombat)
+        if not self.run_stronghold(submarine=self.config.OpsiStronghold_SubmarineEveryCombat):
+            raise RequestHumanTakeover
 
         if self.config.OpsiStronghold_SubmarineEveryCombat:
             if self.zone.is_azur_port:
-                logger.info('Already in azur port')
+                logger.info('[大世界-要塞] 已在碧蓝港口')
             else:
                 self.globe_goto(self.zone_nearest_azur_port(self.zone))
         self.handle_fleet_repair_by_config(revert=False)
@@ -57,43 +68,40 @@ class OpsiStronghold(CoinTaskMixin, OSMap):
         self.globe_update()
         next_zone = self.find_siren_stronghold()
         if next_zone is None:
-            # 没有更多要塞，尝试切换到其他任务
             self.config.OpsiStronghold_HasStronghold = False
-            if self._handle_no_content_and_try_other_tasks('塞壬要塞', '塞壬要塞没有更多可执行内容'):
+            self._postpone_stronghold_check('塞壬要塞没有更多可执行内容')
+            self.os_globe_goto_map()
+            if self._handle_coin_task_no_content('塞壬要塞', '塞壬要塞没有更多可执行内容'):
                 return
 
     def os_stronghold(self):
-        # ===== 任务开始前黄币检查 =====
-        # 如果启用了CL1且黄币充足，直接返回CL1，不执行塞壬要塞
-        if self.is_cl1_enabled:
-            return_threshold, cl1_preserve = self._get_operation_coins_return_threshold()
-            if return_threshold is None:
-                logger.info('OperationCoinsReturnThreshold 为 0，禁用黄币检查，仅使用行动力阈值控制')
-            elif self._check_yellow_coins_and_return_to_cl1("任务开始前", "塞壬要塞"):
-                return
-        
+        """执行大世界塞壬要塞清理任务主流程。"""
         while True:
             self.clear_stronghold()
-            # ===== 循环中黄币充足检查 =====
-            # 在每次循环后检查黄币是否充足，如果充足则返回侵蚀1
-            if self.is_cl1_enabled:
-                if self._check_yellow_coins_and_return_to_cl1("循环中", "塞壬要塞"):
-                    return
             self.config.check_task_switch()
 
     def os_sumbarine_empty(self):
+        """检查潜艇弹药是否已耗尽。
+
+        Returns:
+            bool: 若潜艇弹药为空图标匹配成功返回 True，否则返回 False。
+        """
         return self.match_template_color(OS_SUBMARINE_EMPTY, offset=(20, 20))
 
     def stronghold_interrupt_check(self):
+        """检查要塞战斗自律寻敌是否应当中断。
+
+        Returns:
+            bool: 潜艇弹药耗尽且无指挥喵正在寻敌时返回 True，否则返回 False。
+        """
         return self.os_sumbarine_empty() and self.no_meowfficer_searching()
 
     def run_stronghold_one_fleet(self, fleet, submarine=False):
-        """
-        使用单支舰队清理要塞。最多尝试 3 次（舰队可能卡在迷雾中）。
+        """使用单支舰队清理要塞。最多尝试 3 次（防止舰队卡在迷雾中）。
 
         Args:
             fleet (BossFleet): 舰队对象。
-            submarine (bool): 是否每场战斗都呼叫潜艇。
+            submarine (bool): 是否每场战斗都呼叫潜艇。默认 False。
 
         Returns:
             bool: 是否全部清理完毕。
@@ -117,10 +125,10 @@ class OpsiStronghold(CoinTaskMixin, OSMap):
 
             # 判断结果
             if self.get_stronghold_percentage() == '0':
-                logger.info('BOSS clear')
+                logger.info('[大世界-要塞] Boss已清除')
                 return True
             elif any(self.need_repair):
-                logger.info('Auto search stopped, because fleet died')
+                logger.info('[大世界-要塞] 自动搜索停止，因为舰队阵亡')
                 # 重新进入以重置舰队位置
                 prev = self.zone
                 self.globe_goto(self.zone_nearest_azur_port(self.zone))
@@ -128,12 +136,12 @@ class OpsiStronghold(CoinTaskMixin, OSMap):
                 self.globe_goto(prev, types='STRONGHOLD')
                 return False
             elif submarine and self.os_sumbarine_empty():
-                logger.info('Submarine ammo exhausted, wait for the next clear')
+                logger.info('[大世界-要塞] 潜艇弹药耗尽，等待下次清理')
                 # 潜艇弹药耗尽，等待下次清理
                 self.globe_goto(self.zone_nearest_azur_port(self.zone))
                 return True
             else:
-                logger.info('Auto search stopped, because fleet stuck')
+                logger.info('[大世界-要塞] 自动搜索停止，因为舰队卡住')
                 # 重新进入以重置舰队位置
                 prev = self.zone
                 self.globe_goto(self.zone_nearest_azur_port(self.zone))
@@ -142,11 +150,10 @@ class OpsiStronghold(CoinTaskMixin, OSMap):
                 continue
 
     def run_stronghold(self, submarine=False):
-        """
-        所有舰队轮流攻击塞壬要塞。
+        """所有舰队轮流攻击塞壬要塞。
 
         Args:
-            submarine (bool): 是否每场战斗都呼叫潜艇。
+            submarine (bool): 是否每场战斗都呼叫潜艇。默认 False。
 
         Returns:
             bool: 是否成功清理。
@@ -155,10 +162,10 @@ class OpsiStronghold(CoinTaskMixin, OSMap):
             in: 塞壬日志仪（深渊），Boss 已出现。
             out: 成功时为危险或安全海域，失败时仍在深渊中。
         """
-        logger.hr(f'Stronghold clear', level=1)
+        logger.hr('塞壬要塞清理', level=1)
         fleets = self.parse_fleet_filter()
         for fleet in fleets:
-            logger.hr(f'Turn: {fleet}', level=2)
+            logger.hr(f'[大世界-要塞] 回合: {fleet}', level=2)
             if not isinstance(fleet, BossFleet):
                 self.os_order_execute(recon_scan=False, submarine_call=True)
                 continue
@@ -169,5 +176,5 @@ class OpsiStronghold(CoinTaskMixin, OSMap):
             else:
                 continue
 
-        logger.critical('无法击败boss，舰队已耗尽')
+        logger.critical('[大世界-塞壬要塞] 无法击败boss，舰队已耗尽')
         return False

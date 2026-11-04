@@ -1,6 +1,14 @@
-from time import time, sleep
-from datetime import datetime, timedelta
+"""计时器与时间工具模块。
+
+提供双重计时器 Timer 类（用于时间计数和访问计数）、调试用 timer 装饰器，
+以及 future_time 等时间字符串解析工具函数。
+"""
+
+from time import monotonic as time, sleep
+from datetime import timedelta
 from functools import wraps
+
+from module.config.time_source import now as current_time
 
 
 def timer(function):
@@ -27,8 +35,9 @@ def future_time(string):
         datetime.datetime: 未来最近的对应时分时刻。
     """
     hour, minute = [int(x) for x in string.split(':')]
-    future = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
-    future = future + timedelta(days=1) if future < datetime.now() else future
+    now = current_time()
+    future = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    future = future + timedelta(days=1) if future < now else future
     return future
 
 
@@ -42,8 +51,9 @@ def past_time(string):
         datetime.datetime: 过去最近的对应时分时刻。
     """
     hour, minute = [int(x) for x in string.split(':')]
-    past = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
-    past = past - timedelta(days=1) if past > datetime.now() else past
+    now = current_time()
+    past = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    past = past - timedelta(days=1) if past > now else past
     return past
 
 
@@ -71,7 +81,7 @@ def time_range_active(time_range):
     Returns:
         bool: 当前时间在范围内返回 True。
     """
-    return time_range[0] < datetime.now() < time_range[1]
+    return time_range[0] < current_time() < time_range[1]
 
 
 class Timer:
@@ -79,6 +89,10 @@ class Timer:
 
     访问计数可以在慢速设备上提供鲁棒性——当截图耗时超过计时器限制时，
     仍能通过访问次数判断是否达到触发条件。
+
+    Attributes:
+        limit (int | float): 时间限制（秒）。
+        count (int): 访问次数限制。
     """
 
     def __init__(self, limit, count=0):
@@ -105,7 +119,7 @@ class Timer:
         count = int(limit / speed)
         return cls(limit, count=count)
 
-    def start(self):
+    def start(self) -> Timer:
         """启动计时器。
 
         如果计时器未启动，reached() 始终返回 True，从而实现首次快速尝试：

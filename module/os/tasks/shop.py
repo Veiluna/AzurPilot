@@ -1,55 +1,100 @@
+"""大世界港口商店模块。
+
+执行大世界港口商店的补给物资购买，包括：
+- 遍历所有友方港口购买补给
+- 黄币和紫币余额检查
+- 月度购买限制日期配置
+- 港口间的自动导航和购买执行
+
+继承自 OSMap，提供港口导航和商店购买的完整操作链路，
+是大世界代币消耗的重要途径之一。
+"""
+
 from datetime import datetime, timedelta
 
+from module.config.time_source import now as current_time
 from module.config.utils import get_server_next_update, get_os_reset_remain, get_os_next_reset
 from module.logger import logger
+from module.exception import GameStuckError
 from module.os.map import OSMap
 from module.os_shop.assets import OS_SHOP_CHECK
 
 
 class OpsiShop(OSMap):
     def os_shop(self):
-        """
-        购买所有港口的补给物资。
+        """购买所有港口的补给物资。
 
-        如果黄币或紫币不足，跳过下一个港口的补给购买。
+        若黄币或紫币不足，跳过下一个港口的补给购买。
 
         Pages:
             in: page_os, 大世界地图
             out: page_os, 大世界地图
         """
-        logger.hr('OS port daily', level=1)
-        today = datetime.now().day
+        logger.hr('大世界-大世界商店+', level=1)
+        today = current_time().day
         limit = self.config.OpsiShop_DisableBeforeDate
         if today <= limit:
-            logger.info(f'Delay Opsi shop, today\'s date {today} <= limit {limit}')
+            logger.info(f'大世界商店+延迟运行，今日日期 {today} <= 限制日期 {limit}')
             self.config.task_delay(server_update=True)
             self.config.task_stop()
 
+        not_empty = self.perform_port_shop_purchase()
+
+        next_reset = self._os_shop_delay(not_empty)
+        if not_empty:
+            logger.info('大世界商店+已完成，延迟到下次重置')
+        else:
+            logger.warning('[大世界-商店] 港口中没有商店，跳到下个月')
+        logger.attr('大世界商店下次重置', next_reset)
+
+        self.config.task_delay(target=next_reset)
+        self.config.task_stop()
+
+    def perform_port_shop_purchase(self, action_point_only=False):
+        """执行一次港口商店购买流程，不包含任务延迟和停止逻辑。
+
+        供 os_shop 和智能调度月末清理共用。前往最近友方港口，
+        进入商店购买所有补给，购买完成后退出港口。
+
+        Args:
+            action_point_only (bool): 专购全部行动力箱，不更新普通商店购买状态，不再扫描核验其他商品。
+
+        Returns:
+            bool: 普通购买返回商店是否非空；专购正常完成流程即返回 True，已无可购行动力也算完成。
+
+        Pages:
+            in: page_os, 大世界地图
+            out: page_os, 大世界地图
+        """
         if not self.zone.is_azur_port:
             self.globe_goto(self.zone_nearest_azur_port(self.zone))
 
         self.port_enter()
         self.port_shop_enter()
 
-        if self.appear(OS_SHOP_CHECK):
-            not_empty = self.handle_port_supply_buy()
-            next_reset = self._os_shop_delay(not_empty)
-            logger.info('OS port daily finished, delay to next reset')
-            logger.attr('OpsiShopNextReset', next_reset)
-        else:
-            next_reset = get_os_next_reset()
-            logger.warning('There is no shop in the port, skip to the next month.')
-            logger.attr('OpsiShopNextReset', next_reset)
+        previous = getattr(self, '_opsi_action_point_purchase', False)
+        self._opsi_action_point_purchase = action_point_only
+        try:
+            if self.appear(OS_SHOP_CHECK):
+                not_empty = self.handle_port_supply_buy()
+                if action_point_only:
+                    # 第一轮已开 29 张普通海域，超过全部行动力解锁所需的 25 张。
+                    # 不以其他商品是否解锁或可识别来确认行动力售罄；中断续购无库存也算完成。
+                    not_empty = True
+            else:
+                not_empty = False
+                logger.warning('[大世界-商店] 港口中没有商店')
+                if action_point_only:
+                    raise GameStuckError('未确认港口商店，无法完成行动力购买')
+        finally:
+            self._opsi_action_point_purchase = previous
 
         self.port_shop_quit()
         self.port_quit()
-
-        self.config.task_delay(target=next_reset)
-        self.config.task_stop()
+        return not_empty
 
     def _os_shop_delay(self, not_empty) -> datetime:
-        """
-        计算大世界商店的延迟时间。
+        """计算大世界商店+的延迟时间。
 
         根据商店是否为空和距月底重置的天数决定下次运行时间。
 

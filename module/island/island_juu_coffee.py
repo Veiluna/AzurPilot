@@ -1,3 +1,8 @@
+"""岛屿 JUU 咖啡店模块。
+
+继承 IslandShopBase，配置咖啡店的商品列表与岗位参数。
+包含冰咖啡、蛋卷、拿铁、柑橘咖啡等饮品的模板、选择与制作流程定义。
+"""
 from module.island_juu_coffee.assets import *
 from module.island.island_shop_base import IslandShopBase
 from module.island.assets import *
@@ -6,6 +11,23 @@ from module.logger import logger
 
 
 class IslandJuuCoffee(IslandShopBase):
+    """岛屿啾咖啡店自动化管理器。
+
+    继承 IslandShopBase，管理啾咖啡的商品制作、牛奶库存约束与特定角色派遣。
+
+    Attributes:
+        shop_type (str): 店铺类型标识。
+        time_prefix (str): 岗位完成时间前缀。
+        chef_config (str): 厨师角色筛选配置。
+        special_character (bool): 是否启用特殊角色制作配置。
+        shop_items (list): 咖啡店商品配置列表。
+        meal_compositions (dict): 套餐组成与所需单品数量。
+        post_buttons (dict): 岗位按钮资源映射。
+        filter_asset (str): 仓库筛选分类。
+        post_manage_swipe_count (int): 岗位管理页面滑动次数。
+        milk_stock (int): 当前牧场牛奶库存数量。
+        special_materials (dict): 特殊材料库存映射。
+    """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -91,7 +113,11 @@ class IslandJuuCoffee(IslandShopBase):
         self.initialize_shop()
 
     def get_warehouse_counts(self):
-        """覆盖：获取仓库数量，包括牛奶"""
+        """获取咖啡店商品及牧场牛奶的仓库库存数量。
+
+        Returns:
+            dict[str, int]: 包含所有商品与牛奶库存的字典。
+        """
         # 先调用父类方法获取基础库存
         super().get_warehouse_counts()
 
@@ -100,7 +126,7 @@ class IslandJuuCoffee(IslandShopBase):
         image = self.device.screenshot()
         self.milk_stock = self.ocr_item_quantity(image, TEMPLATE_MILK)
         self.special_materials['milk'] = self.milk_stock
-        logger.info(f"牛奶数量: {self.milk_stock}")
+        logger.info(f"[岛屿-啾咖啡] 牛奶数量: {self.milk_stock}")
 
         # 将牛奶库存也存入warehouse_counts，便于统一处理
         self.warehouse_counts['milk'] = self.milk_stock
@@ -108,7 +134,15 @@ class IslandJuuCoffee(IslandShopBase):
         return self.warehouse_counts
 
     def check_special_materials(self, product, batch_size):
-        """覆盖：检查特殊材料（牛奶）限制"""
+        """检查特殊材料（牛奶）库存对生产批次的限制。
+
+        Args:
+            product (str): 目标商品名称。
+            batch_size (int): 计划生产的批次数。
+
+        Returns:
+            int: 考虑牛奶库存限制后允许的最大批次数。
+        """
         if batch_size <= 0:
             return 0
 
@@ -118,7 +152,7 @@ class IslandJuuCoffee(IslandShopBase):
             milk_available = self.milk_stock
             max_by_milk = milk_available // milk_needed_per_batch
             batch_size = min(batch_size, max_by_milk)
-            logger.info(f"  {product} 牛奶限制: 可用{milk_available}, 每批{milk_needed_per_batch}, 最大{max_by_milk}")
+            logger.info(f"[岛屿-啾咖啡]   {self._item_cn(product)} 牛奶限制: 可用{milk_available}, 每批{milk_needed_per_batch}, 最大{max_by_milk}")
 
         # strawberry_milkshake需要1个牛奶
         elif product == 'strawberry_milkshake':
@@ -126,7 +160,7 @@ class IslandJuuCoffee(IslandShopBase):
             milk_available = self.milk_stock
             max_by_milk = milk_available // milk_needed_per_batch
             batch_size = min(batch_size, max_by_milk)
-            logger.info(f"  {product} 牛奶限制: 可用{milk_available}, 每批{milk_needed_per_batch}, 最大{max_by_milk}")
+            logger.info(f"[岛屿-啾咖啡]   {self._item_cn(product)} 牛奶限制: 可用{milk_available}, 每批{milk_needed_per_batch}, 最大{max_by_milk}")
 
         # cheese需要8个牛奶
         if product == 'cheese':
@@ -134,57 +168,42 @@ class IslandJuuCoffee(IslandShopBase):
             milk_available = self.milk_stock
             max_by_milk = milk_available // milk_needed_per_batch
             batch_size = min(batch_size, max_by_milk)
-            logger.info(f"  {product} 牛奶限制: 可用{milk_available}, 每批{milk_needed_per_batch}, 最大{max_by_milk}")
+            logger.info(f"[岛屿-啾咖啡]   {self._item_cn(product)} 牛奶限制: 可用{milk_available}, 每批{milk_needed_per_batch}, 最大{max_by_milk}")
         return batch_size
 
-    def _is_friedrich_available(self):
-        """
-        只读检查大帝(Friedrich)是否可用于生产（空闲且有体力），不进行任何选择操作。
-        """
-        screenshot = self.device.screenshot()
-        all_characters = self.recognize_all_characters(screenshot)
-        for char_info in all_characters:
-            if char_info["character_name"] == "Friedrich":
-                available = not char_info["is_working"] and char_info["has_stamina"]
-                logger.info(f"大帝(Friedrich)状态: working={char_info['is_working']}, stamina={char_info['has_stamina']}, 可用={available}")
-                return available
-        logger.info("大帝(Friedrich)不在角色列表中")
-        return False
+    def select_special_character(self, product):
+        """为特定商品派遣特定厨师角色。
 
-    def post_produce(self, post_id, product, number, time_var_name, product2=None):
-        """
-        覆盖父类 post_produce：
-        醒神套餐(wake_up_call)若大帝(Friedrich)不可用则跳过烹饪。
-        """
-        if product == 'wake_up_call' and self.special_character:
-            post_button = self.posts[post_id]['button']
-            self.post_close()
-            self.post_open(post_button)
-            self.device.sleep(0.5)
-            while 1:
-                self.device.screenshot()
-                if self.appear(ISLAND_SELECT_CHARACTER_CHECK, offset=1):
-                    break
-                if self.appear_then_click(ISLAND_POST_SELECT, offset=1):
-                    continue
-            if not self._is_friedrich_available():
-                logger.warning(f"醒神套餐({product})需要大帝(Friedrich)但不可用，跳过生产")
-                self.device.click(ISLAND_BACK)
-                self.device.sleep(0.5)
-                self.post_close()
-                return 0
-            self.device.click(ISLAND_BACK)
-            self.device.sleep(0.5)
-            self.post_close()
-        return super().post_produce(post_id, product, number, time_var_name, product2)
+        芝士(cheese)优先大帝(Friedrich)制作，大帝不可选时回退普通厨师；
+        醒神套餐(wake_up_call)必须由大帝制作。
+        大帝需通过向下滚动查找，且体力必须大于 50。
+        普通餐品先回到列表顶部再按配置选择。
 
-    def select_special_character(self,product):
-        if product in ['cheese','wake_up_call',]:
-            self.select_character("Friedrich")
-        else:
-            self.select_character(self.chef_config)
+        Args:
+            product (str): 目标商品名称。
+
+        Returns:
+            bool: 是否成功选择并确认角色。
+        """
+        if product == 'wake_up_call':
+            return self.select_specific_character_with_scroll("Friedrich", stamina_threshold=50)
+        if product == 'cheese':
+            if self.select_specific_character_with_scroll("Friedrich", stamina_threshold=50):
+                return True
+            # 大帝不可选（未找到/体力不足），回退普通厨师；先回到列表顶部再按配置选择
+            self._swipe_character_list_to_top()
+            return self.select_character(self.chef_config)
+        # 普通餐品：先回到列表顶部再按配置选择，避免上个岗位遗留的滚动位置导致找不到黄鸡
+        self._swipe_character_list_to_top()
+        return self.select_character(self.chef_config)
+
     def deduct_materials(self, product, number):
-        """覆盖：扣除前置材料，包括牛奶和套餐原材料"""
+        """扣除制作指定商品消耗的前置材料（包括牛奶和套餐原材料）。
+
+        Args:
+            product (str): 生产的商品名称。
+            number (int): 生产的商品批次数。
+        """
         # 先调用父类方法扣除套餐原材料
         super().deduct_materials(product, number)
 
@@ -195,7 +214,7 @@ class IslandJuuCoffee(IslandShopBase):
             self.special_materials['milk'] = self.milk_stock
             if 'milk' in self.warehouse_counts:
                 self.warehouse_counts['milk'] = self.milk_stock
-            logger.info(f"扣除牛奶：milk -{milk_needed} (用于制作 {product})")
+            logger.info(f"[岛屿-啾咖啡] 扣除牛奶：{self._item_cn('milk')} -{milk_needed} (用于制作 {self._item_cn(product)})")
 
         # strawberry_milkshake需要扣除牛奶
         elif product == 'strawberry_milkshake':
@@ -204,7 +223,7 @@ class IslandJuuCoffee(IslandShopBase):
             self.special_materials['milk'] = self.milk_stock
             if 'milk' in self.warehouse_counts:
                 self.warehouse_counts['milk'] = self.milk_stock
-            logger.info(f"扣除牛奶：milk -{milk_needed} (用于制作 {product})")
+            logger.info(f"[岛屿-啾咖啡] 扣除牛奶：{self._item_cn('milk')} -{milk_needed} (用于制作 {self._item_cn(product)})")
         # cheese需要扣除牛奶
         elif product == 'cheese':
             milk_needed = number * 8
@@ -212,10 +231,19 @@ class IslandJuuCoffee(IslandShopBase):
             self.special_materials['milk'] = self.milk_stock
             if 'milk' in self.warehouse_counts:
                 self.warehouse_counts['milk'] = self.milk_stock
-            logger.info(f"扣除牛奶：milk -{milk_needed} (用于制作 {product})")
+            logger.info(f"[岛屿-啾咖啡] 扣除牛奶：{self._item_cn('milk')} -{milk_needed} (用于制作 {self._item_cn(product)})")
 
     def apply_special_material_constraints(self, requirements):
-        """覆盖：根据牛奶库存调整需求"""
+        """根据当前牛奶库存调整各商品的需求排产计划。
+
+        按拿铁、草莓奶昔、芝士的优先级依次扣减分配可用牛奶。
+
+        Args:
+            requirements (dict[str, int]): 各商品的原始需求数量映射。
+
+        Returns:
+            dict[str, int]: 调整后受牛奶库存约束的需求数量映射。
+        """
         result = requirements.copy()
 
         # 计算所有需要牛奶的产品总需求
@@ -237,7 +265,7 @@ class IslandJuuCoffee(IslandShopBase):
         milk_available = self.milk_stock
 
         if milk_demand > milk_available:
-            logger.info(f"牛奶不足：总需求{milk_demand}，可用{milk_available}")
+            logger.info(f"[岛屿-啾咖啡] 牛奶不足：总需求{milk_demand}，可用{milk_available}")
 
             # 按优先级调整需求（这里可以根据需要调整优先级）
             # 例如：先满足latte，然后是strawberry_milkshake，最后是cheese
@@ -251,11 +279,11 @@ class IslandJuuCoffee(IslandShopBase):
                 if remaining_milk < milk_for_latte:
                     max_latte = remaining_milk // 2
                     result['latte'] = max_latte
-                    logger.info(f"牛奶不足完成latte，需求从{latte_needed}调整为{max_latte}，剩余牛奶{remaining_milk}调整为{remaining_milk - max_latte * 2}")
+                    logger.info(f"[岛屿-啾咖啡] 牛奶不足完成{self._item_cn('latte')}，需求从{latte_needed}调整为{max_latte}，剩余牛奶{remaining_milk}调整为{remaining_milk - max_latte * 2}")
                     remaining_milk -= max_latte * 2
                 else:
                     remaining_milk -= milk_for_latte
-                    logger.info(f"牛奶足够完成latte，扣除{milk_for_latte}，剩余牛奶{remaining_milk}")
+                    logger.info(f"[岛屿-啾咖啡] 牛奶足够完成{self._item_cn('latte')}，扣除{milk_for_latte}，剩余牛奶{remaining_milk}")
                     
 
             # 调整strawberry_milkshake需求
@@ -266,11 +294,11 @@ class IslandJuuCoffee(IslandShopBase):
                 if remaining_milk < milk_for_milkshake:
                     max_milkshake = remaining_milk // 1
                     result['strawberry_milkshake'] = max_milkshake
-                    logger.info(f"牛奶不足完成strawberry_milkshake，需求从{milkshake_needed}调整为{max_milkshake}，剩余牛奶{remaining_milk}调整为{remaining_milk - max_milkshake * 1}")
+                    logger.info(f"[岛屿-啾咖啡] 牛奶不足完成{self._item_cn('strawberry_milkshake')}，需求从{milkshake_needed}调整为{max_milkshake}，剩余牛奶{remaining_milk}调整为{remaining_milk - max_milkshake * 1}")
                     remaining_milk -= max_milkshake * 1
                 else:
                     remaining_milk -= milk_for_milkshake
-                    logger.info(f"牛奶足够完成strawberry_milkshake，扣除{milk_for_milkshake}，剩余牛奶{remaining_milk}")
+                    logger.info(f"[岛屿-啾咖啡] 牛奶足够完成{self._item_cn('strawberry_milkshake')}，扣除{milk_for_milkshake}，剩余牛奶{remaining_milk}")
 
             # 调整cheese需求
             if 'cheese' in result and result['cheese'] > 0:
@@ -280,24 +308,31 @@ class IslandJuuCoffee(IslandShopBase):
                 if remaining_milk < milk_for_cheese:
                     max_cheese = remaining_milk // 8
                     result['cheese'] = max_cheese
-                    logger.info(f"牛奶不足完成cheese，需求从{cheese_needed}调整为{max_cheese}，剩余牛奶{remaining_milk}调整为{remaining_milk - max_cheese * 8}")
+                    logger.info(f"[岛屿-啾咖啡] 牛奶不足完成{self._item_cn('cheese')}，需求从{cheese_needed}调整为{max_cheese}，剩余牛奶{remaining_milk}调整为{remaining_milk - max_cheese * 8}")
                     remaining_milk -= max_cheese * 8
                 else:
                     remaining_milk -= milk_for_cheese
-                    logger.info(f"牛奶足够完成cheese，扣除{milk_for_cheese}，剩余牛奶{remaining_milk}")
+                    logger.info(f"[岛屿-啾咖啡] 牛奶足够完成{self._item_cn('cheese')}，扣除{milk_for_cheese}，剩余牛奶{remaining_milk}")
 
         return result
 
     def process_meal_requirements(self, source_products):
-        """覆盖：处理套餐需求，添加调试信息"""
+        """处理套餐需求并计算所需原材料数量。
+
+        Args:
+            source_products (dict[str, int]): 原始商品与套餐需求映射。
+
+        Returns:
+            dict[str, int]: 拆解套餐后的最终单品与原材料需求映射。
+        """
         logger.info(f"=== IslandJuuCoffee.process_meal_requirements ===")
-        logger.info(f"传入的需求: {source_products}")
+        logger.info(f"[岛屿-啾咖啡] 传入的需求: {self._inv_cn(source_products)}")
 
         # 调用父类方法
         result = super().process_meal_requirements(source_products)
 
-        logger.info(f"返回结果: {result}")
-        logger.info(f"=== 结束IslandJuuCoffee.process_meal_requirements ===")
+        logger.info(f"[岛屿-啾咖啡] 返回结果: {self._inv_cn(result)}")
+        logger.info(f"[岛屿-啾咖啡] === 结束IslandJuuCoffee.process_meal_requirements ===")
 
         return result
 

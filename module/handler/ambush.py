@@ -1,3 +1,5 @@
+"""伏击和空袭处理器。处理地图探索中的伏击回避/迎击和空袭等待。"""
+
 from module.base.timer import Timer
 from module.base.utils import get_color, red_overlay_transparency
 from module.combat.combat import Combat
@@ -12,27 +14,45 @@ TEMPLATE_MAP_WALK_OUT_OF_STEP.pre_process = info_letter_preprocess
 
 
 class AmbushHandler(Combat):
+    """伏击和空袭处理器。
+
+    通过红色覆盖层透明度检测地图探索中的伏击与空袭事件，并执行回避、迎击或等待操作。
+
+    Attributes:
+        MAP_AMBUSH_OVERLAY_TRANSPARENCY_THRESHOLD (float): 伏击红色覆盖层透明度阈值。
+        MAP_AIR_RAID_OVERLAY_TRANSPARENCY_THRESHOLD (float): 空袭红色覆盖层透明度阈值。
+        MAP_AIR_RAID_CONFIRM_SECOND (float): 空袭确认等待秒数。
+    """
     MAP_AMBUSH_OVERLAY_TRANSPARENCY_THRESHOLD = 0.40
     MAP_AIR_RAID_OVERLAY_TRANSPARENCY_THRESHOLD = 0.35  # 通常值为 (0.50, 0.53)
     MAP_AIR_RAID_CONFIRM_SECOND = 0.5
 
     def ambush_color_initial(self):
+        """初始化伏击和空袭的颜色参考值。"""
         MAP_AMBUSH.load_color(self.device.image)
         MAP_AIR_RAID.load_color(self.device.image)
 
     def _ambush_appear(self):
+        """检测伏击是否出现。
+
+        Returns:
+            bool: 是否出现伏击。
+        """
         return red_overlay_transparency(MAP_AMBUSH.color, get_color(self.device.image, MAP_AMBUSH.area)) > \
                self.MAP_AMBUSH_OVERLAY_TRANSPARENCY_THRESHOLD
 
     def _air_raid_appear(self):
+        """检测空袭是否出现。
+
+        Returns:
+            bool: 是否出现空袭。
+        """
         return red_overlay_transparency(MAP_AIR_RAID.color, get_color(self.device.image, MAP_AIR_RAID.area)) > \
                self.MAP_AIR_RAID_OVERLAY_TRANSPARENCY_THRESHOLD
 
     def _handle_air_raid(self):
-        """
-        等待空袭动画消失。
-        """
-        logger.info('Map air raid')
+        """等待空袭动画消失。"""
+        logger.info('[地图-伏击] 空袭')
         disappear = Timer(self.MAP_AIR_RAID_CONFIRM_SECOND).start()
         timeout = Timer(2.5, count=2).start()
 
@@ -40,7 +60,7 @@ class AmbushHandler(Combat):
             self.device.screenshot()
             # 超时处理
             if timeout.reached():
-                logger.warning('_handle_air_raid timeout, assume air raid disappeared')
+                logger.warning('[地图-伏击] 空袭处理超时，假设空袭已消失')
                 break
             # 检测是否消失
             if self._air_raid_appear():
@@ -50,7 +70,8 @@ class AmbushHandler(Combat):
                     break
 
     def _handle_ambush_evade(self):
-        logger.info('Map ambushed')
+        """处理伏击回避事件。"""
+        logger.info('[地图-伏击] 遭遇伏击')
         # 等待 MAP_AMBUSH_EVADE 出现
         self.wait_until_appear(MAP_AMBUSH_EVADE, offset=(30, 30))
         self.handle_info_bar()
@@ -73,18 +94,19 @@ class AmbushHandler(Combat):
         # 处理回避成功和失败
         image = info_letter_preprocess(self.image_crop(INFO_BAR_DETECT, copy=False))
         if TEMPLATE_AMBUSH_EVADE_SUCCESS.match(image):
-            logger.attr('Ambush_evade', 'success')
+            logger.attr('伏击回避', '成功')
         elif TEMPLATE_AMBUSH_EVADE_FAILED.match(image):
-            logger.attr('Ambush_evade', 'failed')
+            logger.attr('伏击回避', '失败')
             self.combat(expected_end='no_searching', fleet_index=self.fleet_show_index)
         else:
-            logger.warning('Unrecognized info when ambush evade.')
+            logger.warning('[地图-伏击] 无法识别的伏击回避信息')
             self.ensure_no_info_bar()
             if self.combat_appear():
                 self.combat(fleet_index=self.fleet_show_index)
 
     def _handle_ambush_attack(self):
-        logger.info('Map ambushed')
+        """处理伏击迎击事件。"""
+        logger.info('[地图-伏击] 遭遇伏击')
         # 等待 MAP_AMBUSH_ATTACK 出现
         self.wait_until_appear(MAP_AMBUSH_ATTACK, offset=(30, 30))
 
@@ -108,16 +130,22 @@ class AmbushHandler(Combat):
                 continue
 
         # 进入战斗
-        logger.attr('Ambush_evade', 'attack')
+        logger.attr('伏击回避', '迎击')
         self.combat(expected_end='no_searching', fleet_index=self.fleet_show_index)
 
     def _handle_ambush(self):
+        """根据配置选择回避或迎击。"""
         if self.config.Campaign_AmbushEvade:
             return self._handle_ambush_evade()
         else:
             return self._handle_ambush_attack()
 
     def handle_ambush(self):
+        """统一的伏击与空袭处理入口。
+
+        Returns:
+            bool: 是否检测并处理了伏击或空袭。
+        """
         if not self.config.MAP_HAS_AMBUSH:
             return False
 
@@ -135,6 +163,11 @@ class AmbushHandler(Combat):
         return False
 
     def handle_walk_out_of_step(self):
+        """处理舰队步数不足的提示。
+
+        Returns:
+            bool: 是否检测并处理了步数不足提示。
+        """
         if not self.config.MAP_HAS_FLEET_STEP:
             return False
         if not self.info_bar_count():
@@ -142,7 +175,7 @@ class AmbushHandler(Combat):
 
         image = info_letter_preprocess(self.image_crop(INFO_BAR_DETECT, copy=False))
         if TEMPLATE_MAP_WALK_OUT_OF_STEP.match(image):
-            logger.warning('Map walk out of step.')
+            logger.warning('[地图-伏击] 舰队步数不足')
             self.handle_info_bar()
             return True
 

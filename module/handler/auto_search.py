@@ -1,3 +1,17 @@
+"""自动搜索处理器。
+
+管理游戏的自动搜索（Auto Search）功能，包括：
+- 舰队准备界面的侧边栏切换（编队/指挥喵/自动搜索设置）
+- 自动搜索设置选项的切换（如舰队1打道中/舰队2打Boss等）
+- 地图中自动搜索开关的检测和控制
+- 自动搜索菜单的继续/退出操作
+
+自动搜索是碧蓝航线的核心功能之一，允许玩家在通关模式下
+自动进行地图探索，无需手动操作。
+
+继承自 EnemySearchingHandler，在 FastForwardHandler 中被进一步扩展。
+"""
+
 import numpy as np
 
 from module.base.button import ButtonGrid
@@ -8,14 +22,16 @@ from module.handler.enemy_searching import EnemySearchingHandler
 from module.logger import logger
 from module.map.assets import FLEET_PREPARATION_CHECK
 
+# 自动搜索设置按钮列表，对应游戏界面中的 6 个选项
 AUTO_SEARCH_SETTINGS = [
-    AUTO_SEARCH_SET_MOB,
-    AUTO_SEARCH_SET_BOSS,
-    AUTO_SEARCH_SET_ALL,
-    AUTO_SEARCH_SET_STANDBY,
-    AUTO_SEARCH_SET_SUB_AUTO,
-    AUTO_SEARCH_SET_SUB_STANDBY
+    AUTO_SEARCH_SET_MOB,       # 舰队1打道中，舰队2打Boss
+    AUTO_SEARCH_SET_BOSS,      # 舰队1打Boss，舰队2打道中
+    AUTO_SEARCH_SET_ALL,       # 舰队1全出击，舰队2待命
+    AUTO_SEARCH_SET_STANDBY,   # 舰队1待命，舰队2全出击
+    AUTO_SEARCH_SET_SUB_AUTO,  # 潜艇自动呼叫
+    AUTO_SEARCH_SET_SUB_STANDBY  # 潜艇待命
 ]
+# 设置名称到按钮索引的映射
 dic_setting_name_to_index = {
     'fleet1_mob_fleet2_boss': 0,
     'fleet1_boss_fleet2_mob': 1,
@@ -24,12 +40,29 @@ dic_setting_name_to_index = {
     'sub_auto_call': 4,
     'sub_standby': 5,
 }
+# 按钮索引到设置名称的反向映射
 dic_setting_index_to_name = {v: k for k, v in dic_setting_name_to_index.items()}
 
 
 class AutoSearchHandler(EnemySearchingHandler):
+    """自动搜索功能处理器。
+
+    管理舰队准备界面和地图中的自动搜索相关操作。
+    不同服务器的 UI 布局略有差异（侧边栏按钮位置和大小），
+    通过 @Config.when 装饰器实现服务器特定的适配。
+
+    Attributes:
+        _auto_search_offset (tuple): 自动搜索选项的匹配偏移量。
+        _auto_search_menu_offset (tuple): 自动搜索菜单的匹配偏移量，
+            当 MULTIPLE_SORTIE 出现时向左偏移 213px。
+    """
     @Config.when(SERVER='en')
     def _fleet_sidebar(self):
+        """获取美服舰队准备界面的侧边栏按钮网格。
+
+        Returns:
+            ButtonGrid: 侧边栏按钮网格对象。
+        """
         if FLEET_PREPARATION_CHECK.match(self.device.image, offset=(20, 80)):
             offset = np.subtract(FLEET_PREPARATION_CHECK.button, FLEET_PREPARATION_CHECK._button)[1]
         else:
@@ -41,6 +74,11 @@ class AutoSearchHandler(EnemySearchingHandler):
 
     @Config.when(SERVER=None)
     def _fleet_sidebar(self):
+        """获取舰队准备界面的侧边栏按钮网格。
+
+        Returns:
+            ButtonGrid: 侧边栏按钮网格对象。
+        """
         if FLEET_PREPARATION_CHECK.match(self.device.image, offset=(20, 80)):
             offset = np.subtract(FLEET_PREPARATION_CHECK.button, FLEET_PREPARATION_CHECK._button)[1]
         else:
@@ -51,50 +89,41 @@ class AutoSearchHandler(EnemySearchingHandler):
             button_shape=(53, 104), grid_shape=(1, 3), name='FLEET_SIDEBAR')
 
     def _fleet_preparation_get(self):
-        """
-        获取舰队准备界面当前选中的侧边栏索引。
+        """获取舰队准备界面当前选中的侧边栏索引。
 
         Returns:
-            int:
-                1 表示编队
-                2 表示指挥喵
-                3 表示自动搜索设置
+            int: 侧边栏索引。1 表示编队，2 表示指挥喵，3 表示自动搜索设置，0 表示未识别。
         """
         current = 0
         total = 0
         sidebar = self._fleet_sidebar()
 
         for idx, button in enumerate(sidebar.buttons):
-            if self.image_color_count(button, color=(99, 235, 255), threshold=221, count=50):
+            if self.image_color_count(button, color=(99, 235, 255), threshold=30, count=50):
                 current = idx + 1
                 total = idx + 1
                 continue
-            if self.image_color_count(button, color=(255, 255, 255), threshold=221, count=100):
+            if self.image_color_count(button, color=(255, 255, 255), threshold=30, count=100):
                 total = idx + 1
             else:
                 break
 
         if not current:
-            logger.warning('No fleet sidebar active.')
-        logger.attr('Fleet_sidebar', f'{current}/{total}')
+            logger.warning('[处理器-自动搜索] 没有活跃的舰队侧边栏')
+        logger.attr('舰队侧边栏', f'{current}/{total}')
         return current
 
     def fleet_preparation_sidebar_ensure(self, index):
-        """
-        确保舰队准备界面切换到指定的侧边栏标签。
+        """确保舰队准备界面切换到指定的侧边栏标签。
 
         Args:
-            index (int):
-                1 表示编队
-                2 表示指挥喵
-                3 表示自动搜索设置
+            index (int): 侧边栏索引。1 表示编队，2 表示指挥喵，3 表示自动搜索设置。
 
         Returns:
-            bool: 是否成功切换到目标侧边栏，最多尝试 3 次，
-                  超过则返回 False，成功则返回 True。
+            bool: 是否成功切换到目标侧边栏。
         """
         if index <= 0 or index > 5:
-            logger.warning(f'Sidebar index cannot be ensured, {index}, limit 1 through 5 only')
+            logger.warning(f'[处理器-自动搜索] 无法确保侧边栏索引，{index}，限制为1到5')
             return False
 
         interval = Timer(1, count=2)
@@ -108,55 +137,50 @@ class AutoSearchHandler(EnemySearchingHandler):
                 interval.reset()
                 continue
         else:
-            logger.warning('Sidebar could not be ensured')
+            logger.warning('[处理器-自动搜索] 无法确保侧边栏切换')
             return False
 
     def _auto_search_set_click(self, setting):
-        """
-        点击自动搜索设置选项。
+        """点击自动搜索设置选项。
 
         Args:
             setting (str): 目标设置名称。
 
         Returns:
-            bool: 是否已选中正确的选项。
+            bool: 目标选项是否已被正确选中。
         """
         active = []
 
         for index, button in enumerate(AUTO_SEARCH_SETTINGS):
-            if self.image_color_count(button.button, color=(156, 255, 82), threshold=221, count=20):
+            if self.image_color_count(button.button, color=(156, 255, 82), threshold=30, count=20):
                 active.append(index)
 
         if not active:
-            logger.warning('No active auto search setting found')
+            logger.warning('[处理器-自动搜索] 未找到活跃的自动搜索设置')
             return False
 
-        logger.attr('Auto_Search_Setting', ', '.join([dic_setting_index_to_name[index] for index in active]))
+        logger.attr('自动搜索设置', ', '.join([dic_setting_index_to_name[index] for index in active]))
 
         if setting not in dic_setting_name_to_index:
-            logger.warning(f'Unknown auto search setting: {setting}')
+            logger.warning(f'[处理器-自动搜索] 未知的自动搜索设置: {setting}')
         target_index = dic_setting_name_to_index[setting]
 
         if target_index in active:
-            logger.info('Selected to the correct auto search setting')
+            logger.info('[处理器-自动搜索] 已选择正确的自动搜索设置')
             return True
         else:
             self.device.click(AUTO_SEARCH_SETTINGS[target_index])
             return False
 
     def auto_search_setting_ensure(self, setting, skip_first_screenshot=True):
-        """
-        确保自动搜索设置切换到指定选项。
+        """确保自动搜索设置切换到指定选项。
 
         Args:
-            setting (str):
-                fleet1_mob_fleet2_boss, fleet1_boss_fleet2_mob, fleet1_all_fleet2_standby,
-                fleet1_standby_fleet2_all, sub_auto_call, sub_standby
+            setting (str): 目标设置名称，如 fleet1_mob_fleet2_boss、sub_standby 等。
             skip_first_screenshot (bool): 是否跳过首次截图。
 
         Returns:
-            bool: 是否成功切换到目标设置，最多尝试 5 次，
-                  超过则返回 False，成功则返回 True。
+            bool: 是否成功切换到目标设置。
         """
         counter = 0
         while 1:
@@ -168,7 +192,7 @@ class AutoSearchHandler(EnemySearchingHandler):
                 return True
             else:
                 if counter >= 5:
-                    logger.warning('Auto search setting could not be ensured')
+                    logger.warning('[处理器-自动搜索] 无法确保自动搜索设置切换')
                     return False
                 counter += 1
                 self.device.sleep((0.3, 0.5))
@@ -177,10 +201,11 @@ class AutoSearchHandler(EnemySearchingHandler):
     _auto_search_offset = (5, 5)
     # 当 MULTIPLE_SORTIE 出现时向左偏移 213px
     _auto_search_menu_offset = (250, 30)
+    # 上一次确认到 OFF 时的截图，用于要求两次确认来自不同的截图
+    _auto_search_off_frame = None
 
     def is_auto_search_running(self):
-        """
-        判断自动搜索是否正在运行。
+        """判断自动搜索是否正在运行。
 
         Returns:
             bool: 自动搜索是否已开启。
@@ -189,21 +214,30 @@ class AutoSearchHandler(EnemySearchingHandler):
                and self.appear(AUTO_SEARCH_MAP_OPTION_ON)
 
     def handle_auto_search_map_option(self):
-        """
-        确保地图中的自动搜索选项已开启。
+        """确保地图中的自动搜索选项已开启。
+
+        推测战斗结算退场后存在一段过早点击窗口：此时点击会翻转开关的显示状态，
+        但游戏不下发移动指令，表现为「图标显示运行中而舰队静止」。为降低该风险，
+        要求同一流程内两次观察到不同截图均确认为 OFF 后才操作，以画面状态取代
+        固定休眠。流程入口会清空确认状态，避免跨流程沿用旧的确认。
 
         Returns:
-            bool: 是否进行了点击操作。
+            bool: 是否执行了点击开启操作。
         """
-        if self.appear(AUTO_SEARCH_MAP_OPTION_OFF, offset=self._auto_search_offset) \
-                and self.appear_then_click(AUTO_SEARCH_MAP_OPTION_OFF, interval=2):
-            return True
-
-        return False
+        if not self.match_template_color(AUTO_SEARCH_MAP_OPTION_OFF,
+                                         offset=self._auto_search_offset, threshold=30):
+            self._auto_search_off_frame = None
+            return False
+        if self._auto_search_off_frame is None:
+            self._auto_search_off_frame = self.device.image
+            return False
+        if self._auto_search_off_frame is self.device.image:
+            return False
+        self._auto_search_off_frame = None
+        return self.appear_then_click(AUTO_SEARCH_MAP_OPTION_OFF, interval=2)
 
     def is_in_auto_search_menu(self):
-        """
-        判断是否处于自动搜索菜单界面。
+        """判断是否处于自动搜索菜单界面。
 
         Returns:
             bool: 是否在自动搜索菜单中。
@@ -211,14 +245,18 @@ class AutoSearchHandler(EnemySearchingHandler):
         return AUTO_SEARCH_MENU_CONTINUE.match_luma(self.device.image, offset=self._auto_search_menu_offset)
 
     def handle_auto_search_continue(self):
+        """点击自动搜索菜单的继续按钮。
+
+        Returns:
+            bool: 是否成功点击继续按钮。
+        """
         return self.appear_then_click(AUTO_SEARCH_MENU_CONTINUE, offset=self._auto_search_menu_offset, interval=2)
 
     def handle_auto_search_exit(self, drop=None):
-        """
-        处理自动搜索菜单的退出操作。
+        """处理自动搜索菜单的退出操作。
 
         Args:
-            drop (DropImage): 掉落记录对象。
+            drop (DropImage | None): 掉落记录对象。
 
         Returns:
             bool: 是否执行了退出操作。
@@ -234,10 +272,17 @@ class AutoSearchHandler(EnemySearchingHandler):
             return False
 
     def ensure_auto_search_exit(self, skip_first_screenshot=True):
-        """
+        """确保退出自动搜索菜单。
+
         Pages:
             in: is_in_auto_search_menu
             out: page_campaign 或 page_event 或 page_sp
+
+        Args:
+            skip_first_screenshot (bool): 是否跳过首次截图。
+
+        Returns:
+            bool: 是否成功退出自动搜索菜单。
         """
         if not self.is_in_auto_search_menu():
             return False

@@ -1,3 +1,7 @@
+"""奖励收取处理器，统一管理资源奖励和任务奖励的收取。
+支持石油、金币、经验奖励领取和任务奖励收取。
+"""
+
 from module.base.button import ButtonGrid
 from module.base.decorator import cached_property
 from module.base.timer import Timer
@@ -11,9 +15,10 @@ from module.ui_white.assets import MISSION_NOTICE_WHITE
 
 
 class Reward(UI):
+    """资源与任务奖励收取处理器。"""
+
     def reward_receive(self, oil, coin, exp):
-        """
-        领取资源奖励（石油、金币、经验）。
+        """领取资源奖励（石油、金币、经验）。
 
         Args:
             oil (bool): 是否领取石油。
@@ -30,8 +35,8 @@ class Reward(UI):
         if not oil and not coin and not exp:
             return False
 
-        logger.hr('Reward receive')
-        logger.info(f'oil={oil}, coin={coin}, exp={exp}')
+        logger.hr('领取奖励')
+        logger.info(f'[奖励-领取] 石油={oil}, 金币={coin}, 经验={exp}')
         confirm_timer = Timer(1, count=3).start()
         # 设置点击间隔为 0.3 秒，因为游戏无法响应过快的点击。
         click_timer = Timer(0.3)
@@ -49,14 +54,19 @@ class Reward(UI):
                 click_timer.reset()
                 continue
 
-            # End
+            # 结束
             if confirm_timer.reached():
                 break
 
-        logger.info('Reward receive end')
+        logger.info('[奖励-领取] 奖励领取结束')
         return True
 
     def _reward_get_state(self):
+        """获取当前任务页面的奖励领取状态。
+
+        Returns:
+            Button | None: 匹配到的任务状态按钮，未识别到则返回 None。
+        """
         if self.appear(MISSION_MULTI, offset=(20, 20)):
             return MISSION_MULTI
         if self.match_template_color(MISSION_SINGLE, offset=(50, 200)):
@@ -68,8 +78,7 @@ class Reward(UI):
         return None
 
     def _reward_mission_claim_click(self):
-        """
-        点击领取任务奖励。
+        """点击领取任务奖励。
 
         Returns:
             bool: 是否已点击领取。
@@ -93,7 +102,7 @@ class Reward(UI):
                     click_interval.reset()
                     clicked = True
                     continue
-                if self.appear(MISSION_UNFINISH, offset=(20, 20)):
+                if self.appear(MISSION_UNFINISH, offset=(50, 200)):
                     return clicked
 
     def _reward_mission_claim_receive(self):
@@ -107,7 +116,7 @@ class Reward(UI):
             in: 未知弹窗
             out: page_mission
         """
-        logger.info('Mission claim receive')
+        logger.info('[奖励-任务] 领取任务奖励')
         timeout = Timer(2, count=6).start()
         for _ in self.loop():
             if self.ui_page_appear(page_mission):
@@ -115,7 +124,7 @@ class Reward(UI):
                 if state:
                     return state
                 if timeout.reached():
-                    logger.warning('Wait mission receive timeout')
+                    logger.warning('[奖励-任务] 等待任务领取超时')
                     return 'timeout'
             else:
                 timeout.reset()
@@ -125,7 +134,7 @@ class Reward(UI):
                 continue
             if self.appear_then_click(GET_ITEMS_2, offset=(30, 30), interval=1):
                 continue
-            if self.appear_then_click(GET_SHIP, interval=1):
+            if self.appear_then_click(GET_SHIP, offset=(20, 20), interval=1):
                 continue
             if self.handle_mission_popup_ack():
                 continue
@@ -161,14 +170,14 @@ class Reward(UI):
         """
         state = self._reward_wait_mission_list()
         while 1:
-            logger.attr('MissionState', state)
+            logger.attr('任务状态', state)
             self.device.stuck_record_clear()
             self.device.click_record_clear()
             if state == 'timeout':
-                logger.warning('Reward wait mission list timeout')
+                logger.warning('[奖励-任务] 等待任务列表超时')
                 return state
             if state in [MISSION_EMPTY, MISSION_UNFINISH]:
-                logger.info('Mission collect finished')
+                logger.info('[奖励-任务] 任务收集完成')
                 break
             elif state in [MISSION_MULTI, MISSION_SINGLE]:
                 # 清除以下资源的已有间隔计时器
@@ -177,7 +186,7 @@ class Reward(UI):
                 state = self._reward_mission_claim_receive()
                 continue
             else:
-                logger.warning('Empty mission state, mission collect finished')
+                logger.warning('[奖励-任务] 空任务状态，任务收集完成')
 
         return state
 
@@ -198,8 +207,8 @@ class Reward(UI):
         Returns:
             bool: 是否已处理。
         """
-        if not self.image_color_count(MISSION_WEEKLY_RED_DOT, color=(206, 81, 66), threshold=221, count=20):
-            logger.info('No MISSION_WEEKLY_RED_DOT')
+        if not self.image_color_count(MISSION_WEEKLY_RED_DOT, color=(206, 81, 66), threshold=30, count=20):
+            logger.info('[奖励-任务] 没有每周任务红点')
             return False
 
         self.reward_side_navbar_ensure(upper=5)
@@ -216,10 +225,10 @@ class Reward(UI):
             in: page_main
         """
         if self.appear(MISSION_NOTICE):
-            logger.info('Found mission notice MISSION_NOTICE')
+            logger.info('[奖励-任务] 发现任务提示 MISSION_NOTICE')
             return True
-        if self.image_color_count(MISSION_NOTICE_WHITE, color=(214, 117, 99), threshold=221, count=20):
-            logger.info('Found mission notice MISSION_NOTICE_WHITE')
+        if self.image_color_count(MISSION_NOTICE_WHITE, color=(214, 117, 99), threshold=30, count=20):
+            logger.info('[奖励-任务] 发现任务提示 MISSION_NOTICE_WHITE')
             return True
 
         return False
@@ -241,7 +250,7 @@ class Reward(UI):
         """
         if not daily and not weekly:
             return False
-        logger.hr('Mission reward')
+        logger.hr('任务奖励')
         if not self.reward_mission_notice():
             return False
 
@@ -301,7 +310,8 @@ class Reward(UI):
         return False
 
     def run(self):
-        """
+        """执行奖励与任务收取任务的主入口。
+
         Pages:
             in: 任意页面
             out: page_main 或 page_mission，可能带有 info_bar
@@ -314,4 +324,4 @@ class Reward(UI):
         self.ui_goto(page_main)
         self.reward_mission(daily=self.config.Reward_CollectMission,
                             weekly=self.config.Reward_CollectWeeklyMission)
-        self.config.task_delay(success=True)
+        self.config.task_delay(server_update=True)

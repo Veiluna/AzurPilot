@@ -1,3 +1,15 @@
+"""大世界隐秘海域任务模块。
+
+执行大世界隐秘海域（Obscure Zone）的清理任务，包括：
+- 从仓库获取隐秘海域坐标信息
+- 前往目标区域执行自动搜索战斗
+- 行动力不足时的保护和延迟处理
+- 支持强制运行模式
+
+继承自 CoinTaskMixin 和 OSMap，提供代币保护和地图导航能力，
+隐秘海域是大世界主要的代币获取途径之一。
+"""
+
 from module.logger import logger
 from module.os.map import OSMap
 from module.os.tasks.scheduling import CoinTaskMixin
@@ -6,29 +18,27 @@ from module.os.tasks.scheduling import CoinTaskMixin
 class OpsiObscure(CoinTaskMixin, OSMap):
     
     def clear_obscure(self):
-        """
-        清理一个隐秘海域。
+        """清理一个隐秘海域。
 
         从仓库取出隐秘海域坐标，前往目标区域执行自动搜索。
-        如果没有可执行内容，会尝试切换到其他黄币补充任务。
+        若没有可执行内容，在代币任务模式下标记无内容并推迟。
 
         Raises:
-            ActionPointLimit: 行动力不足。
+            ActionPointLimit: 行动力不足时抛出。
 
         Pages:
             in: page_os, 大世界地图
             out: page_os, 大世界地图
         """
-        logger.hr('OS clear obscure', level=1)
+        logger.hr('大世界-隐秘海域', level=1)
         self.cl1_ap_preserve()
         if self.config.OpsiObscure_ForceRun:
-            logger.info('OS obscure finish is under force run')
+            logger.info('隐秘海域处于强制运行模式')
 
         result = self.storage_get_next_item('OBSCURE', use_logger=self.config.OpsiGeneral_UseLogger,
                                             skip_obscure_hazard_2=self.config.OpsiObscure_SkipHazard2Obscure)
         if not result:
-            # 没有隐秘海域坐标，尝试切换到其他任务
-            if self._handle_no_content_and_try_other_tasks('隐秘海域', '隐秘海域没有可执行内容'):
+            if self._handle_coin_task_no_content('隐秘海域', '隐秘海域没有可执行内容'):
                 return
 
         self.config.override(
@@ -42,29 +52,17 @@ class OpsiObscure(CoinTaskMixin, OSMap):
             self.os_order_execute(
                 recon_scan=True,
                 submarine_call=self.config.OpsiFleet_Submarine)
-            self.run_auto_search(rescan='current')
-
-            self.map_exit()
+            self.run_auto_search(rescan='current', exit_map=True)
             self.handle_after_auto_search()
 
     def os_obscure(self):
-        # ===== 任务开始前黄币检查 =====
-        # 如果启用了CL1且黄币充足，直接返回CL1，不执行隐秘海域
-        if self.is_cl1_enabled:
-            return_threshold, cl1_preserve = self._get_operation_coins_return_threshold()
-            if return_threshold is None:
-                logger.info('OperationCoinsReturnThreshold 为 0，禁用黄币检查，仅使用行动力阈值控制')
-            elif self._check_yellow_coins_and_return_to_cl1("任务开始前", "隐秘海域"):
-                return
-        
+        """执行大世界隐秘海域任务主流程。
+
+        非强制模式下每次仅清理一个海域以利用指令冷却；强制模式下持续清理。
+        """
         while True:
             self.clear_obscure()
-            # ===== 循环中黄币充足检查 =====
-            # 在每次循环后检查黄币是否充足，如果充足则返回侵蚀1
-            if self.is_cl1_enabled:
-                if self._check_yellow_coins_and_return_to_cl1("循环中", "隐秘海域"):
-                    return
-            
+
             # 非强制模式每次只清一个隐秘海域，保留 os_order_execute 写入的侦查/潜艇冷却。
             if not self.config.OpsiObscure_ForceRun:
                 break

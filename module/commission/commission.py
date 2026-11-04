@@ -1,23 +1,67 @@
+"""委托任务执行模块。
+
+负责碧蓝航线委托系统的自动化处理，包括委托奖励领取、委托检测、
+委托选择过滤、委托启动以及奖励收入统计。支持每日委托和紧急委托
+两大类别，通过 OCR 和图像匹配识别委托信息，并根据用户配置的
+过滤规则自动选择最优委托组合。
+
+主要流程：
+    1. 从奖励页面进入委托页面
+    2. 领取已完成的委托奖励（commission_receive）
+    3. 扫描当前所有委托列表（_commission_scan_all）
+    4. 根据过滤规则选择待启动的委托（_commission_choose）
+    5. 逐一查找并启动选中的委托（commission_start）
+    6. 根据运行中委托的完成时间计算下次调度
+
+依赖：
+    - module.commission.project: 委托信息解析（Commission 类）
+    - module.commission.preset: 预设过滤规则
+    - module.ui.ui: 页面导航
+    - module.handler.info_handler: 弹窗/信息栏处理
+"""
+
 import copy
+import re
 from datetime import datetime, timedelta
 
-from scipy import signal
+import numpy as np
 
+from scipy import signal
+from scipy.ndimage import uniform_filter1d
+
+from module.base.button import Button, ButtonGrid
+from module.base.runtime_params import (
+    COMMISSION_REWARD_SCREENSHOT_KEEP,
+    COMMISSION_SKIP_TIMEOUT,
+)
 from module.base.timer import Timer
-import time
 from module.base.utils import *
+from module.config.utils import read_run_param
 from module.combat.assets import *
 from module.commission.assets import *
+from module.commission.planner import (
+    DEFAULT_VALUE_MODEL,
+    CommissionPlanJob,
+    CommissionValueModel,
+    optimize_commission_plan,
+)
 from module.commission.preset import DICT_FILTER_PRESET, SHORTEST_FILTER
 from module.commission.project import COMMISSION_FILTER, Commission
 from module.config.config_generated import GeneratedConfig
+from module.config.time_source import now as current_time
 from module.config.utils import get_server_last_update, get_server_next_update, nearest_future
 from module.dorm.dorm import RewardDorm
-from module.exception import GameStuckError, OilMaxed, RequestHumanTakeover
+from module.exception import OilMaxed, RequestHumanTakeover
+from module.handler.assets import POPUP_CANCEL, POPUP_CONFIRM
 from module.handler.info_handler import InfoHandler
 from module.logger import logger
+from module.notify.notify import handle_notify, notify_webui
 from module.map.map_grids import SelectedGrids
-from module.retire.assets import DOCK_CHECK
+from module.retire.assets import DOCK_CHECK, SORTING_CLICK
+from module.statistics.item import AmountOcr
+from module.combat.level import LevelOcr
+from module.retire.dock import CARD_GRIDS, CARD_LEVEL_GRIDS, DOCK_SCROLL, Dock, OCR_DOCK_SELECTED
+from module.retire.scanner import FleetScanner, LevelScanner
 from module.ui.assets import BACK_ARROW, REWARD_GOTO_COMMISSION
 from module.tactical.assets import TACTICAL_CLASS_START, TACTICAL_CLASS_CANCEL
 from module.ui.page import page_commission, page_reward
@@ -25,21 +69,226 @@ from module.ui.scroll import Scroll
 from module.ui.switch import Switch
 from module.ui.ui import UI
 from module.ui_white.assets import REWARD_1_WHITE, REWARD_GOTO_COMMISSION_WHITE
-from datetime import timedelta
 
 COMMISSION_SWITCH = Switch('Commission_switch', is_selector=True)
 COMMISSION_SWITCH.add_state('daily', COMMISSION_DAILY)
 COMMISSION_SWITCH.add_state('urgent', COMMISSION_URGENT)
 COMMISSION_SCROLL = Scroll(COMMISSION_SCROLL_AREA, color=(247, 211, 66), name='COMMISSION_SCROLL')
 
+# 委托收益截图保留张数走 WebUI「运行参数」页（RunParams.UiWait），
+# 默认值集中在 module/base/runtime_params.py（界面等待域）。
+# 委托详情面板的 6 个舰船槽位（1280x720 国服实机截图标定，2026-10-07），
+# 第一格中心 (270,347) 与「推荐」按钮左下按固定距离对齐。
+# 点击已有舰船的槽位不会打开船坞，只有点空槽位（'+'）才会，
+# 且空槽位首次点击有时只展开面板，需要再点一次。
+COMMISSION_SHIP_SLOTS = ButtonGrid(
+    origin=(229, 306), delta=(101.5, 0), button_shape=(82, 82),
+    grid_shape=(6, 1), name='COMMISSION_SHIP_SLOTS')
 
-def lines_detect(image):
-    """
+# 空槽判别：槽中心区域的平均亮度。实测空槽 ≈85（深色底 + 灰 '+'），
+# 有舰船立绘 ≥180，阈值取 130（实机截图 recommended_5 / empty_slots 标定）。
+_SLOT_CENTER_INSET = 20
+_SLOT_EMPTY_LUMINANCE = 130
+
+# 无法开始的委托（如等级不足）在短暂等待后放弃，而不是循环到
+# GameStuckError 重启游戏。单个委托的绝对超时走 WebUI「运行参数」页
+# （RunParams.UiWait），默认值集中在 module/base/runtime_params.py。
+COMMISSION_SKIP_AFTER_RECOMMEND = 3   # 推荐后开始按钮仍灰多久算失败（秒）。
+COMMISSION_SKIP_MAX_RECOMMEND = 3     # 触发闪烁 bug 前的推荐点击上限。
+
+# 舰队询问弹窗（"舰船在已有舰队编成中，是否移出编队？"）的红色关闭按钮区域，
+# 基于 1280x720 国服截图校准（2026-10-07）：弹窗出现时该区域红色占比
+# 实测 0.93，无弹窗时 < 0.05。该弹窗的"取消/确定"是无背板白字与蓝底按钮，
+# 与仓库 POPUP_CONFIRM 的橙色模板不匹配，只能单独检测。
+COMMISSION_FLEET_QUESTION_AREA = (859, 172, 929, 220)
+
+# 委托船坞的筛选面板，基于 1280x720 国服截图校准（2026-09-30）。
+# 状态通过区域均值颜色回读。
+DOCK_FILTER_OPEN = Button(area=(1088, 5, 1177, 45), color=(96, 124, 168),
+                          button=(1088, 5, 1177, 45), name='DOCK_FILTER_OPEN')
+DOCK_FILTER_LEVEL = Button(area=(360, 28, 505, 78), color=(199, 144, 62),
+                           button=(360, 28, 505, 78), name='DOCK_FILTER_LEVEL')
+DOCK_FILTER_CONFIRM = Button(area=(712, 642, 888, 702), color=(64, 99, 160),
+                             button=(712, 642, 888, 702), name='DOCK_FILTER_CONFIRM')
+DOCK_FILTER_CANCEL_AREA = (400, 650, 560, 695)
+DOCK_FILTER_CANCEL = Button(area=(390, 642, 567, 702), color=(160, 84, 84),
+                            button=(390, 642, 567, 702), name='DOCK_FILTER_CANCEL')
+DOCK_FILTER_ALL_RARITY = Button(area=(218, 427, 357, 469), color=(131, 142, 154),
+                                button=(218, 427, 357, 469), name='DOCK_FILTER_ALL_RARITY')
+DOCK_FILTER_RARITY = {
+    'common': Button(area=(365, 427, 505, 469), color=(103, 132, 175),
+                     button=(365, 427, 505, 469), name='FILTER_COMMON'),
+    'rare': Button(area=(512, 427, 652, 469), color=(103, 132, 175),
+                   button=(512, 427, 652, 469), name='FILTER_RARE'),
+    'elite': Button(area=(659, 427, 799, 469), color=(103, 132, 175),
+                    button=(659, 427, 799, 469), name='FILTER_ELITE'),
+    'super_rare': Button(area=(806, 427, 946, 469), color=(103, 132, 175),
+                         button=(806, 427, 946, 469), name='FILTER_SUPER_RARE'),
+    'ultra': Button(area=(953, 427, 1093, 469), color=(103, 132, 175),
+                    button=(953, 427, 1093, 469), name='FILTER_ULTRA'),
+}
+# 稀有度档位，从用户设定的最低档向上遍历。
+_COMMISSION_RARITY_STAGES = ['common', 'rare', 'elite', 'super_rare', 'ultra']
+# 每次翻页拖动滚动条约两行，并测量行间缝对齐到 OCR 网格线。
+CARD_GRIDS_ROW3 = ButtonGrid(
+    origin=(93, 530), delta=(164 + 2 / 3, 227), button_shape=(138, 204),
+    grid_shape=(7, 1), name='CARD_ROW3')
+# 第三行等级区的相对偏移：由 CARD_LEVEL_GRIDS 反推，
+# 与第一行一致且自动跟随 jp 服务器的不同等级位置。
+_row3_level = CARD_LEVEL_GRIDS.origin - CARD_GRIDS.origin
+_ROW3_LEVEL_AREA = tuple(
+    int(v) for v in np.append(_row3_level, _row3_level + CARD_LEVEL_GRIDS.button_shape))
+
+# 船坞列表到底时 DOCK_SCROLL.cal_position 实测封顶约 0.93：既达不到
+# Scroll.at_bottom 的 0.95 阈值，也进不了 Scroll.set(1) 的收敛范围
+# （滚动条可见时 set 没有拖动上限，会一直拖到防连点崩溃），
+# 因此翻页与到底判定在委托内自行实现。
+_DOCK_SCROLL_BOTTOM = 0.9
+# 列表翻页直接拖动右侧滚动条（DOCK_SCROLL）。不得在卡片区做手势：
+# 内容区落点不可控、拖不到列表两端，且会误触舰船卡片。
+# 手势必须用 device.drag（到达目标后按住再松手）：swipe 的小位移
+# 手势（<~25px）会被游戏回弹，drag 松手速度为 0、滑块精确停在目标处。
+#
+# 下列几何常量基于 1280x720 国服实机截图（2026-10-07）测量：
+# 行距 = CARD_GRIDS.delta[1] = 227；两行卡片之间暗缝的中心
+# = 第一行卡片下缘 76+204 加上缝宽（227-204）的一半 ≈ 292。
+_DOCK_ROW_PITCH = 227
+_DOCK_SEAM_Y = 292
+# 滚动视口约 2.85 行：卡片顶 76 到屏幕下缘 720 的可见区域
+# （底部按钮条半透明覆盖在列表上）。
+_DOCK_VIEWPORT_ROWS = 2.85
+# 每屏向下翻约 1.7 行：给位置换算误差留出余量，确保实际推进
+# 不超过 2 行（图像扫描每次只读顶部两行，超过 2 行会整行漏读）。
+_DOCK_PAGE_ROWS = 1.7
+# 实测游戏会吃掉拖拽起手约 10px 的位移（23px 的拖动实际只走 11px），
+# 拖拽终点按方向外扩作为补偿；每轮对齐会重新测量，残差可继续收敛。
+_DOCK_DRAG_SLOP = 8
+
+# 每个委托要求的最低舰船等级（按游戏自身补位规则，至少一艘达标）。
+# 键为国服 OCR 读到的委托名；未知则为 0。
+# 来源：wiki.biligame.com/blhx/军事委托，「需求舰娘等级」列。
+_COMMISSION_LEVEL_GROUP = {
+    '日常资源开发': {'I': 1, 'II': 1, 'III': 10, 'IV': 10, 'V': 30, 'VI': 30},
+    '高阶战术研发': {'I': 100, 'II': 100},
+    '小型油田开发': {'I': 1, 'II': 10, 'III': 30},
+    '中型油田开发': {'I': 1, 'II': 10, 'III': 30},
+    '大型油田开发': {'I': 1, 'II': 10, 'III': 30},
+    '保卫运输部队': {'I': 5, 'II': 25, 'III': 50},
+    '解救商船': {'I': 5, 'II': 25, 'III': 50},
+    '敌袭': {'I': 12, 'II': 35, 'III': 60},
+}
+_COMMISSION_LEVEL_SINGLE = {
+    '初级矿脉护卫委托': 1, '中级矿脉护卫委托': 10, '高级矿脉护卫委托': 30,
+    '初级林木护卫委托': 1, '中级林木护卫委托': 10, '高级林木护卫委托': 30,
+    '小型商船护卫': 1, '中型商船护卫': 10, '大型商船护卫': 30,
+    '短距离航行训练': 1, '中距离航行训练': 10, '远距离航行训练': 30,
+    '舰队护卫演习': 1, '舰队运输演习': 10, '舰队实战演习': 30,
+    '近海防卫巡逻': 1, '海域浮标检查作业': 10, '前沿基地防卫巡逻': 30,
+    '舰队初阶演习': 1, '舰队中阶演习': 10, '舰队高阶演习': 30,
+    '初阶自主训练': 10, '中阶自主训练': 30, '高阶自主训练': 70,
+    '初阶对抗演习': 10, '中阶对抗演习': 30, '高阶对抗演习': 70,
+    '初阶科研任务': 10, '中阶科研任务': 30, '高阶科研任务': 70,
+    '初阶工具整备': 10, '中阶工具整备': 30, '高阶工具整备': 70,
+    '初阶战术课程': 10, '中阶战术课程': 30, '高阶战术课程': 70,
+    '初阶货物运输': 10, '中阶货物运输': 30, '高阶货物运输': 70,
+    '支援土豪尔岛': 5, '支援姆波罗岛': 12, '支援马拉基岛': 25,
+    '支援卡波罗岛': 35, '支援玛丽岛': 50, '支援特林岛': 60,
+    '支援维拉维拉岛': 5, '支援伊岛': 12, '支援多伦瓦岛': 25,
+    '支援恐班纳': 35, '支援马内岛': 50, '支援萌岛': 60,
+    'BIW装备运输': 5, 'BIW要员护卫': 12, 'BIW物资交接': 25,
+    'BIW度假护卫': 35, 'BIW装备研发': 50, 'BIW巡视护卫': 60,
+    'NYB装备运输': 5, 'NYB要员护卫': 12, 'NYB物资交接': 25,
+    'NYB度假护卫': 35, 'NYB装备研发': 50, 'NYB巡视护卫': 60,
+    '小型观舰仪式': 20, '联合观舰仪式': 45, '同盟观舰仪式': 80,
+    '歼灭敌侦查部队': 12, '歼灭敌主力部队': 35, '歼灭敌精锐部队': 60,
+}
+_ROMAN_MAP = {'Ⅰ': 'I', 'Ⅱ': 'II', 'Ⅲ': 'III',
+              'Ⅳ': 'IV', 'Ⅴ': 'V', 'Ⅵ': 'VI'}
+_ROMAN_TRANS = str.maketrans(_ROMAN_MAP)
+
+
+def commission_level_requirement(name):
+    """委托要求的最低舰船等级（至少一艘达标），未知返回 0。"""
+    raw = (name or '').upper().replace(' ', '')
+    raw = re.sub(r'[「」『』“”\'\“（）()]', '', raw)
+    # OCR 会把一个罗马数字字形拆成 ascii 字母加数字字符
+    # （敌袭IⅡ 实为 敌袭Ⅱ），所以最后一个 unicode 数字字符决定档位，
+    # 它前面的 ascii 字母属于同一字形。
+    numerals = list(re.finditer(r'[ⅠⅡⅢⅣⅤⅥ]', raw))
+    if numerals:
+        last = numerals[-1]
+        # 敌袭IⅡ：字形前的 ascii 字母属于该字形，
+        # 组名是去掉整个数字后剩下的部分。
+        group = _COMMISSION_LEVEL_GROUP.get(raw[:last.start()].rstrip('IV'))
+        if group:
+            return group.get(_ROMAN_MAP[last.group()], 0)
+        return 0
+    name = raw.translate(_ROMAN_TRANS)
+    for key, value in _COMMISSION_LEVEL_SINGLE.items():
+        if name.startswith(key):
+            return value
+    match = re.search(r'(III|IV|VI|II|V|I)$', name)
+    if match:
+        group = _COMMISSION_LEVEL_GROUP.get(name[:match.start()])
+        if group:
+            return group.get(match.group(1), 0)
+    return 0
+
+
+def commission_slot_is_empty(image, button):
+    """槽位中心是深色底（空槽 '+'）还是舰船立绘。
+
     Args:
-        image:
+        image (np.ndarray): RGB 截图。
+        button (Button): 槽位按钮。
 
     Returns:
-        np.ndarray: 每个委托下方白色分割线的 Y 坐标。
+        bool: True 表示空槽位。
+    """
+    x0, y0, x1, y1 = button.area
+    center = image[y0 + _SLOT_CENTER_INSET:y1 - _SLOT_CENTER_INSET,
+                   x0 + _SLOT_CENTER_INSET:x1 - _SLOT_CENTER_INSET]
+    return center.mean() < _SLOT_EMPTY_LUMINANCE
+
+
+class CommissionAmount(AmountOcr):
+    """委托收益先匹配原始数量字形，不确定时放大并过滤碎片交给 OCR。
+
+    委托页数字很小（高约 14px），直接识别时两处系统性误读：
+    - 不裁剪时右缘被截断的数字会被丢掉（71 → 7）；
+    - 裁剪后原尺寸下两个 7 会丢掉一个（77 → 7）。
+    完整数位通过加宽数量框保留；OCR 兜底仍超限时不截断猜值。
+    """
+    remove_fragments = True
+    use_digit_templates = True
+    strict_amount_max = True
+
+    def pre_process(self, image):
+        """图像预处理：放大2倍后进行基类预处理。
+
+        Args:
+            image (np.ndarray): 输入图像。
+
+        Returns:
+            np.ndarray: 放大并预处理后的图像。
+        """
+        import cv2
+
+        image = cv2.resize(image, (0, 0), fx=2, fy=2, interpolation=2)
+        return super().pre_process(image)
+
+
+def lines_detect(image):
+    """检测委托列表中各委托条目底部的白色分割线位置。
+
+    通过分析截图中分割线区域（x: 597-619）的灰度均值，
+    使用 scipy.signal.find_peaks 定位白色线条的 Y 坐标。
+
+    Args:
+        image (np.ndarray): 游戏截图。
+
+    Returns:
+        np.ndarray: 每个委托下方白色分割线的 Y 坐标数组。
     """
     # 通过查找每个委托下方的白色分割线来定位委托位置。
     # (597, 0, 619, 720) 是只有白色分割线的区域。
@@ -52,7 +301,23 @@ def lines_detect(image):
     return np.array(peaks)
 
 
-class RewardCommission(UI, InfoHandler):
+class RewardCommission(Dock, UI, InfoHandler):
+    """委托任务处理器。
+
+    继承 Dock、UI 和 InfoHandler，负责委托系统的完整自动化流程，
+    包括委托检测、过滤选择、启动执行和奖励领取。
+
+    Attributes:
+        daily (SelectedGrids): 当前扫描到的每日委托列表。
+        urgent (SelectedGrids): 当前扫描到的紧急委托列表。
+        daily_choose (SelectedGrids): 经过滤器选中的待启动每日委托。
+        urgent_choose (SelectedGrids): 经过滤器选中的待启动紧急委托。
+        comm_choose (SelectedGrids): 所有选中的委托（含每日和紧急），
+            用于调度判断和延迟任务计算。
+        max_commission (int): 最大可同时运行的委托数量，默认 4。
+            当存在活动委托（daily_event）时提升为 5。
+    """
+
     daily: SelectedGrids
     urgent: SelectedGrids
     daily_choose: SelectedGrids
@@ -70,11 +335,11 @@ class RewardCommission(UI, InfoHandler):
         Returns:
             SelectedGrids:
         """
-        logger.hr('Commission detect')
+        logger.hr('委托检测')
         commission = []
         for y in lines_detect(image):
             comm = Commission(image, y=y, config=self.config)
-            logger.attr('Commission', comm)
+            logger.attr('委托', comm)
             repeat = len([c for c in commission if c == comm])
             comm.repeat_count += repeat
             commission.append(comm)
@@ -104,17 +369,137 @@ class RewardCommission(UI, InfoHandler):
                 image = crop(image, area, copy=False)
             commissions = self._commission_detect(image)
 
-            if commissions.count >= 2 and commissions.select(valid=False).count == 1:
-                logger.warning('Found 1 invalid commission, retry commission detect')
+            invalid_count = commissions.select(valid=False).count
+            if invalid_count:
+                logger.warning(f'[委托-检测] 发现{invalid_count}个无效委托，重试委托检测')
                 continue
             else:
                 return commissions
 
-        logger.info('trials of commission detect exhausted, stop')
+        logger.info('[委托-检测] 委托检测重试次数已耗用，停止')
         return commissions
 
     def _commission_choose(self, daily, urgent):
-        """
+        """根据实验开关分派委托选择算法。"""
+        blacklist = self._commission_blacklist()
+        if blacklist:
+            logger.attr('委托黑名单', ', '.join(blacklist))
+        dynamic = bool(getattr(self.config, 'Commission_DynamicProgramming', False))
+        logger.attr('委托选择算法', '动态规划（实验性）' if dynamic else '传统贪心策略')
+        if dynamic:
+            return self._commission_choose_dynamic(daily, urgent)
+        return self._commission_choose_legacy(daily, urgent)
+
+    def _commission_blacklist(self):
+        """解析以英文半角逗号分隔的委托过滤规则。"""
+        blacklist = []
+        raw = getattr(self.config, 'Commission_Blacklist', '') or ''
+        for rule in str(raw).split(','):
+            rule = rule.strip()
+            if not rule:
+                continue
+            if rule not in blacklist:
+                blacklist.append(rule)
+        return blacklist
+
+    def _commission_is_blacklisted(self, commission):
+        """检查委托是否匹配任一黑名单过滤规则。"""
+        for rule in self._commission_blacklist():
+            parsed = COMMISSION_FILTER.parse_filter(rule)
+            if COMMISSION_FILTER.apply_filter_to_obj(commission, parsed):
+                return True
+        return False
+
+    def _commission_filter_get(self):
+        """获取当前时段实际生效的委托过滤器。"""
+        preset = self.config.Commission_PresetFilter
+        if preset == 'custom':
+            return preset, self.config.Commission_CustomFilter
+
+        if f'{preset}_night' in DICT_FILTER_PRESET:
+            start_time = get_server_last_update('02:00')
+            end_time = get_server_last_update('21:00')
+            if start_time < end_time:
+                preset = f'{preset}_night'
+        if preset not in DICT_FILTER_PRESET:
+            logger.warning(f'[委托-过滤] 预设未找到: {preset}，使用默认预设')
+            preset = GeneratedConfig.Commission_PresetFilter
+        return preset, DICT_FILTER_PRESET[preset]
+
+    def _commission_high_value_count(self, filter_count):
+        """统计前若干条委托过滤规则匹配的待执行委托数量。"""
+        preset, string = self._commission_filter_get()
+        COMMISSION_FILTER.load(string)
+        total = self.daily.add_by_eq(self.urgent)
+        high_value = COMMISSION_FILTER.apply_first(
+            total.grids,
+            count=filter_count,
+            func=self._commission_check,
+        )
+        logger.info(
+            f'[委托-调度] 高价值过滤器: {preset} 前{filter_count}条，'
+            f'待执行委托: {len(high_value)}'
+        )
+        for comm in high_value:
+            logger.info(comm)
+        return len(high_value)
+
+    def _commission_choose_legacy(self, daily, urgent):
+        """按过滤器顺序贪心选择委托，保持默认传统行为。"""
+        self.comm_choose = SelectedGrids([])
+        total = daily.add_by_eq(urgent)[::-1]
+        self.max_commission = 5 if any(comm.genre == 'daily_event' for comm in total) else 4
+        running_count = len([comm for comm in total if comm.status == 'running'])
+        logger.attr('运行中', f'{running_count}/{self.max_commission}')
+
+        preset, string = self._commission_filter_get()
+        logger.attr('委托过滤器', preset)
+
+        # tier 和 shortest 是实验模型控制标记，传统策略不把它们当作委托。
+        COMMISSION_FILTER.load(string)
+        run = SelectedGrids(COMMISSION_FILTER.apply(total.grids, func=self._commission_check))
+        run = run.delete(SelectedGrids(['tier', 'shortest']))
+        logger.attr('过滤排序', ' > '.join(str(comm) for comm in run))
+
+        # 过滤结果不足时，保持传统行为并按耗时从短到长补足当前空槽。
+        selected_count = sum(isinstance(comm, Commission) for comm in run)
+        if selected_count + running_count < self.max_commission:
+            candidate = daily.add_by_eq(urgent)
+            if candidate.count:
+                logger.info('[委托-选择] 委托数量不足，添加耗时最短的委托（每日和紧急）')
+                COMMISSION_FILTER.load(SHORTEST_FILTER)
+                shortest = COMMISSION_FILTER.apply(candidate[::-1], func=self._commission_check)
+                run = run.add_by_eq(SelectedGrids(shortest))
+                logger.attr('过滤排序', ' > '.join(str(comm) for comm in run))
+            else:
+                logger.info('[委托-选择] 委托数量不足，无每日和紧急委托可选')
+
+        self.comm_choose = run
+        if running_count >= self.max_commission:
+            return SelectedGrids([]), SelectedGrids([])
+
+        run = run[:self.max_commission - running_count]
+        daily_choose = run.intersect_by_eq(daily)
+        urgent_choose = run.intersect_by_eq(urgent)
+        if daily_choose:
+            logger.info('[委托-选择] 选择每日委托')
+            for comm in daily_choose:
+                logger.info(comm)
+        if urgent_choose:
+            logger.info('[委托-选择] 选择紧急委托')
+            for comm in urgent_choose:
+                logger.info(comm)
+
+        return daily_choose, urgent_choose
+
+    def _commission_choose_dynamic(self, daily, urgent):
+        """使用启动时间折现价值选择当前应启动的委托。
+
+        tier 使用有限倍率表示基础价值，层内候选编号提供有下限的价值修正。
+        每条委托统一按预计启动等待、最晚启动窗口和基础等待半衰期折现；
+        没有游戏内截止时间的委托以服务器刷新时刻作为截止时间。规划器最大化
+        折现价值总和，因此低价值委托只有在收益足以覆盖等待损失时才会被保留。
+
         Args:
             daily (SelectedGrids):
             urgent (SelectedGrids):
@@ -134,104 +519,218 @@ class RewardCommission(UI, InfoHandler):
                 self.max_commission = 5
         running_list = [c for c in total if c.status == 'running']
         running_count = len(running_list)
-        logger.attr('Running', f'{running_count}/{self.max_commission}')
+        logger.attr('运行中', f'{running_count}/{self.max_commission}')
 
         # 加载过滤器字符串
-        preset = self.config.Commission_PresetFilter
-        if preset == 'custom':
-            string = self.config.Commission_CustomFilter
-        else:
-            if f'{preset}_night' in DICT_FILTER_PRESET:
-                start_time = get_server_last_update('02:00')
-                end_time = get_server_last_update('21:00')
-                if start_time < end_time:
-                    preset = f'{preset}_night'
-            if preset not in DICT_FILTER_PRESET:
-                logger.warning(f'Preset not found: {preset}, use default preset')
-                preset = GeneratedConfig.Commission_PresetFilter
-            string = DICT_FILTER_PRESET[preset]
-        logger.attr('Commission Filter', preset)
+        preset, string = self._commission_filter_get()
+        logger.attr('委托过滤器', preset)
 
-        # 过滤
+        # 旧配置没有 tier 时，每条规则仍视作独立层级。
         COMMISSION_FILTER.load(string)
-        run = COMMISSION_FILTER.apply(total.grids, func=self._commission_check)
-        logger.attr('Filter_sort', ' > '.join([str(c) for c in run]))
-        run = SelectedGrids(run)
+        tiers = COMMISSION_FILTER.apply_tiers(total.grids, func=self._commission_check)
+        candidates = SelectedGrids([comm for tier in tiers for _, comm in tier])
+        self.comm_choose = candidates
+        logger.hr('委托最优策略', level=2)
+        start_now = SelectedGrids([])
+        if candidates:
+            logger.info('[委托-规划] 有限价值层级: ' + ' > '.join(
+                f'T{index + 1}' for index in range(len(tiers))
+            ))
+            for index, tier in enumerate(tiers):
+                if not tier:
+                    continue
+                logger.info(f'[委托-规划] T{index + 1}（层内编号越小价值越高）: ' + ' | '.join(
+                    f'#{filter_index} {comm}'
+                    for filter_index, comm in tier
+                ))
 
-        # 添加最短时间委托
-        if self.config.Commission_AddShortest == False and preset == 'custom':
-            logger.info('Not enough commissions to run')
+            plan_time = current_time()
+            server_update = getattr(self.config, 'Scheduler_ServerUpdate', '00:00')
+            horizon_time = get_server_next_update(server_update)
+            horizon = int((horizon_time - plan_time).total_seconds())
+            if horizon <= 0:
+                horizon = 24 * 60 * 60
+                horizon_time = plan_time + timedelta(seconds=horizon)
+
+            jobs = []
+            source_index = 0
+            for tier_index, tier in enumerate(tiers):
+                for filter_index, comm in tier:
+                    # 规划层只接受统一的有限截止时间。源数据的 None 仅表示游戏
+                    # 没有显式倒计时，此时使用本轮实际服务器刷新时刻。
+                    deadline_time = getattr(comm, 'deadline_time', None) or horizon_time
+                    deadline = int((deadline_time - plan_time).total_seconds())
+                    if deadline <= 0:
+                        logger.info(f'[委托-规划] 忽略已过期委托: {comm}')
+                        continue
+                    jobs.append(CommissionPlanJob(
+                        source_index=source_index,
+                        tier=tier_index,
+                        duration=max(int(comm.duration.total_seconds()), 1),
+                        deadline=deadline,
+                        commission=comm,
+                        filter_index=filter_index,
+                    ))
+                    source_index += 1
+
+            slot_available = [max(int(comm.duration.total_seconds()), 0) for comm in running_list]
+            slot_available.extend([0] * max(self.max_commission - running_count, 0))
+            try:
+                value_model = CommissionValueModel.from_config(self.config)
+            except (TypeError, ValueError) as error:
+                logger.warning(f'[委托-规划] 价值模型参数无效，使用默认值: {error}')
+                value_model = DEFAULT_VALUE_MODEL
+            logger.info(f'[委托-规划] Tier 价值倍率: {value_model.tier_value_ratio}')
+            logger.info(f'[委托-规划] 基础等待半衰期: {timedelta(seconds=value_model.delay_half_life)}')
+            logger.info(
+                f'[委托-规划] Deadline 折现基准时间: '
+                f'{timedelta(seconds=value_model.deadline_future_horizon)}'
+            )
+            logger.info(f'[委托-规划] 层内价值下限: {value_model.filter_value_floor / 100:.2f}%')
+            logger.info(f'[委托-规划] 层内编号半衰期: {value_model.filter_value_half_life:g}')
+            plan, planned_jobs = optimize_commission_plan(
+                jobs,
+                slot_available,
+                horizon,
+                model=value_model,
+            )
+            self._commission_plan_log(
+                plan=plan,
+                jobs=planned_jobs,
+                running=running_list,
+                plan_time=plan_time,
+                horizon_time=horizon_time,
+            )
+
+            start_now = SelectedGrids([
+                planned_jobs[action.job_index].commission
+                for action in plan.actions
+                if action.start == 0
+            ])
         else:
-            no_shortest = run.delete(SelectedGrids(['shortest']))
-            if no_shortest.count + running_count < self.max_commission:
-                if daily.count:
-                    logger.info('Not enough commissions to run, add shortest daily commissions')
-                    COMMISSION_FILTER.load(SHORTEST_FILTER)
-                    shortest = COMMISSION_FILTER.apply(daily[::-1], func=self._commission_check)
-                    # 反转每日委托列表以选择更好的委托
-                    run = no_shortest.add_by_eq(SelectedGrids(shortest))
-                    logger.attr('Filter_sort', ' > '.join([str(c) for c in run]))
-                else:
-                    logger.info('Not enough commissions to run')
+            logger.info('[委托-规划] 过滤器没有匹配到可启动委托')
 
-        # 优先处理快过期重要委托
-        if 'expire' in run:
-            logger.info('尝试提前快过期委托')
-
-            valid_runs = [c for c in run if isinstance(c, Commission)]
-            queue = running_list + valid_runs[:self.max_commission - running_count]
-
-            if queue:
-                min_duration_time = queue[0].duration
-                for c in queue:
-                    if c.duration < min_duration_time:
-                        min_duration_time = c.duration
-            else:
-                min_duration_time = timedelta(seconds=0)
-            logger.attr('Min Duration Time', min_duration_time)
-
-            expire_index = run.grids.index('expire')
-            important = run[:expire_index].filter(lambda c: isinstance(c, Commission) and c.expire)
-            priority = [c for c in important if c.expire < min_duration_time]
-            run = run.delete(SelectedGrids(['expire']))
-            run = SelectedGrids(priority).add_by_eq(run)
-            logger.attr('Filter_sort', ' > '.join([str(c) for c in run]))
-
-        self.comm_choose = run
-        if running_count >= self.max_commission:
-            return SelectedGrids([]), SelectedGrids([])
-
-        # 分离每日和紧急委托
-        run = run[:self.max_commission - running_count]
-        daily_choose = run.intersect_by_eq(daily)
-        urgent_choose = run.intersect_by_eq(urgent)
+        daily_choose = start_now.intersect_by_eq(daily)
+        urgent_choose = start_now.intersect_by_eq(urgent)
         if daily_choose:
-            logger.info('Choose daily commission')
+            logger.info('[委托-选择] 选择每日委托')
             for comm in daily_choose:
                 logger.info(comm)
         if urgent_choose:
-            logger.info('Choose urgent commission')
+            logger.info('[委托-选择] 选择紧急委托')
             for comm in urgent_choose:
                 logger.info(comm)
 
         return daily_choose, urgent_choose
 
+    @staticmethod
+    def _commission_plan_log(plan, jobs, running, plan_time, horizon_time):
+        """详细输出最优策略的价值、取舍和全部事件时间节点。"""
+        score = ', '.join(f'T{index + 1}={value}' for index, value in enumerate(plan.score))
+        utility = plan.utility / plan.value_scale
+        full_value = plan.full_value / plan.value_scale
+        delay_loss = plan.delay_loss / plan.value_scale
+        logger.info(f'[委托-规划] 选择数量: {score}')
+        logger.info(f'[委托-规划] 折现价值: {utility:.6f} T1')
+        logger.info(f'[委托-规划] 立即启动价值: {full_value:.6f} T1')
+        logger.info(f'[委托-规划] 等待损失: {delay_loss:.6f} T1')
+        logger.info(
+            f'[委托-规划] 搜索状态数: {plan.state_count}, '
+            f'束宽: {plan.beam_width}, 裁剪: {plan.pruned_state_count}'
+        )
+        if plan.optimality_proven:
+            logger.info('[委托-规划] 最优性证书: 已证明当前计划为全局最优')
+        else:
+            upper_value = plan.utility_upper_bound / plan.value_scale
+            gap = plan.utility_gap / plan.value_scale
+            logger.info(
+                f'[委托-规划] 最优性证书: 尚未证明，严格上界 {upper_value:.6f} T1，'
+                f'最大可能差距 {gap:.6f} T1'
+            )
+        logger.info(f'[委托-规划] 规划边界: {horizon_time:%Y-%m-%d %H:%M:%S}')
+        logger.info('[委托-规划] 比较规则: 折现总价值 > 未折现总价值 > 最晚结束时间 > 完成时间总和 > 稳定编号')
+
+        events = {0: []}
+        horizon = max(int((horizon_time - plan_time).total_seconds()), 0)
+        for comm in running:
+            finish = max(int(comm.duration.total_seconds()), 0)
+            events[0].append(f'继续运行委托: {comm.name} (预计 T+{timedelta(seconds=finish)} 完成)')
+            events.setdefault(finish, []).append(f'运行中委托完成: {comm.name}')
+
+        selected = set()
+        for action in plan.actions:
+            job = jobs[action.job_index]
+            selected.add(job.source_index)
+            tier = f'T{job.tier + 1}'
+            verb = '启动' if action.start == 0 else '预计启动'
+            events.setdefault(action.start, []).append(
+                f'{verb} {tier} 委托: {job.commission.name} (耗时 {timedelta(seconds=job.duration)})'
+            )
+            events.setdefault(action.finish, []).append(
+                f'预计委托完成: {job.commission.name}'
+            )
+
+        for job in jobs:
+            if job.source_index in selected:
+                continue
+            if job.deadline < horizon:
+                events.setdefault(job.deadline, []).append(
+                    f'截止且放弃 T{job.tier + 1} 委托: {job.commission.name}'
+                )
+            else:
+                events.setdefault(horizon, []).append(
+                    f'刷新边界前未安排 T{job.tier + 1} 委托: {job.commission.name}'
+                )
+
+        events.setdefault(horizon, []).append('到达服务器刷新边界')
+        events.setdefault(horizon, []).append('到达边界后将重新扫描并规划')
+
+        for offset in sorted(events):
+            timestamp = plan_time + timedelta(seconds=offset)
+            logger.hr(f'时刻 {timestamp:%Y-%m-%d %H:%M:%S} (T+{timedelta(seconds=offset)})', level=3)
+            for event in events[offset]:
+                logger.info(f'[委托-规划] {event}')
+
     def _commission_check(self, commission):
-        """
+        """检查委托是否符合执行条件。
+
+        过滤掉无效委托、非待启动状态的委托、黑名单中的委托，以及用户配置中
+        明确禁用的主线委托（major commission）。黑名单复用委托过滤器语法，
+        可按委托类别、奖励类型和时长进行匹配。
+
         Args:
-            commission (Commission):
+            commission (Commission): 待检查的委托对象。
 
         Returns:
-            bool:
+            bool: 委托是否可以被选择执行。
         """
         if not commission.valid or commission.status != 'pending':
             return False
+        if self._commission_is_blacklisted(commission):
+            return False
         if not self.config.Commission_DoMajorCommission and commission.category_str == 'major':
             return False
-
         return True
 
     def _commission_ensure_mode(self, mode):
+        """切换委托列表的显示模式（每日/紧急）。
+
+        切换到指定模式后，等待列表滚动动画结束再返回，
+        以避免委托条目在动画过程中被误检或漏检。
+
+        Args:
+            mode (str): 目标模式，'daily' 或 'urgent'。
+
+        Returns:
+            bool: 切换是否成功。
+        """
+        # Switch.set 没有重试上限：不在委托列表时它会一直点同一个按钮，
+        # 直到 GameTooManyClickError 重启游戏。先截一张新图，
+        # 缓存的旧帧会在页面已离开后仍显示委托列表。
+        self.device.screenshot()
+        if not COMMISSION_SWITCH.appear(main=self):
+            logger.warning('[委托-模式] 不在委托列表，跳过模式切换')
+            return False
         if COMMISSION_SWITCH.set(mode, main=self):
             # 当每日委托列表超过 4 个（通常为 5 个），且紧急委托在 1 到 4 个之间时，
             # 委托列表会出现滚动动画，
@@ -251,13 +750,24 @@ class RewardCommission(UI, InfoHandler):
             return False
 
     def _commission_mode_reset(self):
-        logger.hr('Commission mode reset')
+        """重置委托列表显示模式。
+
+        先切换到另一个模式再切回当前模式，强制刷新列表内容，
+        用于委托启动失败后恢复列表状态。
+
+        Returns:
+            bool: 重置是否成功。无法识别当前模式时返回 False。
+        """
+        logger.hr('委托模式重置')
+        # 缓存截图可能早于最后一次点击，旧帧会让切换点击落在
+        # 不是委托列表的页面上。
+        self.device.screenshot()
         if self.appear(COMMISSION_DAILY):
             current, another = 'daily', 'urgent'
         elif self.appear(COMMISSION_URGENT):
             current, another = 'urgent', 'daily'
         else:
-            logger.warning('Unknown Commission mode')
+            logger.warning('[委托-模式] 未知的委托模式')
             return False
 
         self._commission_ensure_mode(another)
@@ -266,6 +776,13 @@ class RewardCommission(UI, InfoHandler):
         return True
 
     def _commission_swipe(self):
+        """向下翻页委托列表。
+
+        如果滚动条可见且未到底部，则向下翻一页；否则返回 False。
+
+        Returns:
+            bool: 是否成功翻页。滚动条不可见或已到底部时返回 False。
+        """
         if COMMISSION_SCROLL.appear(main=self):
             if COMMISSION_SCROLL.at_bottom(main=self):
                 return False
@@ -276,6 +793,11 @@ class RewardCommission(UI, InfoHandler):
             return False
 
     def _commission_swipe_to_top(self):
+        """将委托列表滚动到顶部。
+
+        Returns:
+            bool: 是否执行了滚动操作。滚动条不可见时返回 False。
+        """
         if not COMMISSION_SCROLL.appear(main=self):
             return False
         COMMISSION_SCROLL.set_top(main=self, skip_first_screenshot=True)
@@ -305,57 +827,625 @@ class RewardCommission(UI, InfoHandler):
             in: page_commission
             out: page_commission
         """
-        logger.hr('Commission scan', level=1)
+        logger.hr('委托扫描', level=1)
         # 紧急委托列表是懒加载的，先切换以强制刷新。
         self._commission_ensure_mode('urgent')
 
-        logger.hr('Scan daily', level=2)
+        logger.hr('扫描每日委托', level=2)
         self._commission_ensure_mode('daily')
         self._commission_swipe_to_top()
         daily = self._commission_scan_list()
 
-        urgent = SelectedGrids([])
-        for _ in range(2):
-            logger.hr('Scan urgent', level=2)
-            self._commission_ensure_mode('urgent')
-            self._commission_swipe_to_top()
-            urgent = self._commission_scan_list()
-            # 将额外委托转换为夜间委托
-            urgent.call('convert_to_night')
+        logger.hr('扫描紧急委托', level=2)
+        self._commission_ensure_mode('urgent')
+        self._commission_swipe_to_top()
+        urgent = self._commission_scan_list()
+        # 将额外委托转换为夜间委托
+        urgent.call('convert_to_night')
 
-            # 不在 21:00~03:00 时间段，但扫描到了夜间委托
-            # 可能是过期委托，刷新即可解决
-            if datetime.now() - get_server_next_update('21:00') > timedelta(hours=6):
-                night = urgent.select(category_str='night')
-                if night:
-                    logger.warning('Not in 21:00~03:00, but scanned night commissions')
-                    for comm in night:
-                        logger.attr('Commission', comm)
-                    logger.info('Re-scan urgent commission list')
-                    # 虽然不是最佳方式，但在罕见情况下可以接受
-                    self.device.sleep(2)
-                    self._commission_ensure_mode('daily')
-                    continue
-
-            break
-
-        logger.hr('Showing commission', level=2)
-        logger.info('Daily commission')
+        logger.hr('显示委托', level=2)
+        logger.info('[委托-显示] 每日委托')
         for comm in daily.sort('status', 'genre'):
-            logger.attr('Commission', comm)
+            logger.attr('委托', comm)
         if urgent.count:
-            logger.info('Urgent commission')
+            logger.info('[委托-显示] 紧急委托')
             for comm in urgent.sort('status', 'genre'):
-                logger.attr('Commission', comm)
+                logger.attr('委托', comm)
 
         self.daily = daily
         self.urgent = urgent
         self.daily_choose, self.urgent_choose = self._commission_choose(self.daily, self.urgent)
         return daily, urgent
 
+    def _commission_dock_ship_count(self):
+        """读取船坞已选计数，无法识别时返回 (-1, -1)。"""
+        current, _, total = OCR_DOCK_SELECTED.ocr(self.device.image)
+        if total <= 0 or current < 0 or current > total:
+            return -1, -1
+        return current, total
+
+    def _commission_dock_fleet_question(self):
+        """游戏询问是否把点击的舰船移出舰队时为 True。"""
+        image = np.asarray(self.device.image).astype(int)
+        x0, y0, x1, y1 = COMMISSION_FLEET_QUESTION_AREA
+        region = image[y0:y1, x0:x1]
+        red = (region[:, :, 0] > 140) \
+            & (region[:, :, 0] > region[:, :, 1] + 40) \
+            & (region[:, :, 0] > region[:, :, 2] + 40)
+        return red.mean() > 0.5
+
+    def _commission_dock_answer_fleet_question(self, confirm):
+        """应答舰队询问；confirm 表示把舰船移出所在舰队。"""
+        button = POPUP_CONFIRM if confirm else POPUP_CANCEL
+        # 清除仓库按钮上次匹配残留的 offset。
+        button.clear_offset()
+        self.device.click(button)
+        # 弹窗关闭与选中刷新期间计数会短暂读不到，等充分再截图。
+        self.device.sleep(0.8)
+        self.device.screenshot()
+
+    def _commission_dock_click_ship(self, button, allow_fleet=False):
+        """点击一张卡片一次、应答弹窗，返回点击后的已选计数；
+        无法识别或游戏拒绝该舰船时返回 -1。
+        调用方用它和点击前的计数比较。"""
+        before, _ = self._commission_dock_ship_count()
+        if before < 0:
+            return -1
+        self.device.click(button)
+        self.device.sleep(0.4)
+        self.device.screenshot()
+        if self._commission_dock_fleet_question():
+            if not allow_fleet:
+                # 该卡片属于某个舰队，而此选项不允许从舰队拆船，
+                # 跳过这张卡。
+                self._commission_dock_answer_fleet_question(confirm=False)
+                return -1
+            logger.warning('[委托-选船] 舰船属于某个舰队，'
+                           '将其拆出该舰队以用于此委托')
+            self._commission_dock_answer_fleet_question(confirm=True)
+            after, _ = self._commission_dock_ship_count()
+            return after
+        if self.handle_popup_confirm('COMMISSION_DOCK_SHIP'):
+            # 游戏拒绝的舰船会以弹窗应答而不是选中，
+            # 关闭弹窗后计数保持不变。
+            return -1
+        after, _ = self._commission_dock_ship_count()
+        return after
+
+    def _commission_protected_fleets(self):
+        """任何已启用调度任务使用的舰队都不能被拆船，
+        否则任务下次出击时会缺少这些舰船。"""
+        fleets = set()
+        try:
+            data = self.config.data
+        except Exception:
+            return fleets
+        for node in data.values():
+            if not isinstance(node, dict):
+                continue
+            if not node.get('Scheduler', {}).get('Enable'):
+                continue
+            stack = [node]
+            while stack:
+                d = stack.pop(0)
+                for key, value in d.items():
+                    if isinstance(value, dict):
+                        stack.append(value)
+                        continue
+                    if not isinstance(value, int) or not 1 <= value <= 6:
+                        continue
+                    if key in ('Fleet1', 'Fleet2', 'Fleet') or key.endswith('Fleet'):
+                        fleets.add(value)
+        return fleets
+
+    def _commission_dock_ship_occupied(self, button):
+        """卡片带红色占用横幅（如 大型作战中）时为 True。
+        横幅是实心长条，卡面立绘不会形成这种条带。"""
+        image = np.asarray(self.device.image).astype(int)
+        x0, y0, x1, y1 = button.area
+        strip = image[y0 + 118:y0 + 170, x0:x1]
+        red = (strip[:, :, 0] > 90) & (strip[:, :, 0] > strip[:, :, 1] + 20) \
+            & (strip[:, :, 0] > strip[:, :, 2] + 20)
+        rows = 0
+        for line in red:
+            run = best = 0
+            for v in line:
+                run = run + 1 if v else 0
+                best = max(best, run)
+            if best >= 85:
+                rows += 1
+                if rows >= 2:
+                    return True
+        return False
+
+    def _commission_dock_scan_page(self, level_scanner, fleet_scanner):
+        """读取顶部两行卡片：等级 OCR、舰队徽标、占用状态。"""
+        image = self.device.image
+        levels = level_scanner.scan(image)
+        fleets = fleet_scanner.scan(image)
+        ships = []
+        for idx, button in enumerate(CARD_GRIDS.buttons):
+            ships.append({
+                'idx': idx,
+                'level': int(levels[idx]) if idx < len(levels) else 0,
+                'fleet': fleets[idx] if idx < len(fleets) else 0,
+                'occupied': self._commission_dock_ship_occupied(button),
+                'button': button,
+            })
+        return ships
+
+    def _commission_dock_scan_row3(self, row3_scanner):
+        """读取第三行卡片，仅在列表底部有效。
+        其舰队徽标被底栏遮挡，因此不报告舰队。"""
+        image = self.device.image
+        levels = row3_scanner.scan(image)
+        ships = []
+        for idx, button in enumerate(CARD_GRIDS_ROW3.buttons):
+            ships.append({
+                'idx': 14 + idx,
+                'level': int(levels[idx]) if idx < len(levels) else 0,
+                'occupied': self._commission_dock_ship_occupied(button),
+                'button': button,
+            })
+        return ships
+
+    def _commission_dock_pick_row3(self, row3_scanner, required, picked, count, total):
+        """扫描并点击第三行（列表末行）的候选舰船，返回新的已选计数。
+
+        末行的舰队徽标被底栏遮挡，无法识别舰队归属，
+        只应在不允许拆舰队的档位（allow_fleet=False）使用。
+        """
+        for ship in self._commission_dock_scan_row3(row3_scanner):
+            if count >= total:
+                break
+            if ship['idx'] in picked:
+                continue
+            if ship['occupied']:
+                continue
+            if not 1 <= ship['level'] <= 125 or ship['level'] < required:
+                continue
+            after = self._commission_dock_click_ship(ship['button'], allow_fleet=False)
+            if after < 0:
+                continue
+            if after == count - 1:
+                # 这张卡已被推荐选中，刚才的点击把它取消了，
+                # 点回来且不计数。
+                self.device.click(ship['button'])
+                self.device.sleep(0.4)
+                self.device.screenshot()
+                restored, _ = self._commission_dock_ship_count()
+                if restored >= 0:
+                    count = restored
+                continue
+            count = after
+            picked.add(ship['idx'])
+            logger.attr('已选舰船', f'Lv{ship["level"]} (末行)')
+        return count
+
+    def _commission_dock_wait_stable(self, timeout=4):
+        """等待滚动条停止移动，列表已稳定。"""
+        timer = Timer(timeout)
+        timer.reset()
+        last = None
+        while not timer.reached():
+            self.device.screenshot()
+            position = DOCK_SCROLL.cal_position(main=self)
+            if last is not None and abs(position - last) < 0.01:
+                return True
+            last = position
+        return False
+
+    def _commission_dock_pixels_per_position(self):
+        """滚动条位置每 1.0 对应的内容像素数。
+
+        滑块长度占轨道的比例 = 视口 / 内容，由此反推：
+        内容 = 行高 x 视口行数 / 比例，可滚动像素 = 内容 - 视口。
+        列表被稀有度筛选缩短后滑块会变长，只能按滑块估算，
+        不能用船坞总容量推行数。
+        """
+        total = DOCK_SCROLL.total
+        length = DOCK_SCROLL.length
+        if total <= 0 or length <= 0:
+            return _DOCK_ROW_PITCH * _DOCK_VIEWPORT_ROWS
+        fraction = min(max(length / total, 0.05), 0.95)
+        return _DOCK_ROW_PITCH * _DOCK_VIEWPORT_ROWS * (1 - fraction) / fraction
+
+    def _commission_dock_scroll_drag(self, target):
+        """把右侧滚动条滑块拖到 target 位置（0-1），返回拖动后的位置。
+
+        直接拖滚动条，起点终点都在滚动条上（x≈1239-1248），不会
+        误触舰船卡片；device.drag 到达目标后按住再松手，滑块精确
+        停在目标处、不带惯性。终点按拖动方向外扩一点，
+        补偿游戏吃掉的手势起手位移。
+        """
+        current = DOCK_SCROLL.cal_position(main=self)
+        p1 = random_rectangle_point(DOCK_SCROLL.position_to_screen(current), n=1)
+        p2 = random_rectangle_point(DOCK_SCROLL.position_to_screen(target), n=1)
+        dy = p2[1] - p1[1]
+        if dy:
+            p2 = (p2[0], p2[1] + (_DOCK_DRAG_SLOP if dy > 0 else -_DOCK_DRAG_SLOP))
+            p2 = (p2[0], min(max(p2[1], 78), 639))
+        self.device.drag(p1, p2, name='COMMISSION_DOCK_SCROLL',
+                         point_random=(-2, -3, 2, 3), hold_duration=0.15)
+        self.device.click_record.pop()
+        self._commission_dock_wait_stable()
+        return DOCK_SCROLL.cal_position(main=self)
+
+    def _commission_dock_scroll_page(self, before):
+        """滚动条向下拖约两行，返回拖动后的位置。"""
+        pixels = self._commission_dock_pixels_per_position()
+        target = min(before + _DOCK_PAGE_ROWS * _DOCK_ROW_PITCH / max(pixels, 1), 1.0)
+        return self._commission_dock_scroll_drag(target)
+
+    def _commission_dock_scroll_top(self):
+        """把滚动条拖回顶部。"""
+        for _ in range(4):
+            position = DOCK_SCROLL.cal_position(main=self)
+            if position <= 0.05:
+                return True
+            self._commission_dock_scroll_drag(0.0)
+        return DOCK_SCROLL.cal_position(main=self) <= 0.05
+
+    def _commission_dock_gap_offset(self):
+        """行间缝相对网格线（_DOCK_SEAM_Y）的偏移，折算到一个行距内。
+
+        窗口取网格线上下各约半行，缝滚到哪里都落在窗口内。
+        亮度剖面先做 17px 平滑再取最暗点：单像素暗线（卡片顶边
+        阴影等，实测比行间缝更暗）会被平滑抹掉，只有约 20px 宽的
+        行间缝保留下来。
+        """
+        image = np.asarray(self.device.image).astype(float)
+        y0 = _DOCK_SEAM_Y - 113 - 8
+        y1 = _DOCK_SEAM_Y + 114 + 8
+        band = image[y0:y1, 93:1219].mean(axis=2).mean(axis=1)
+        smooth = uniform_filter1d(band, size=17, mode='nearest')
+        inner = smooth[8:len(smooth) - 8]
+        y = int(np.argmin(inner)) + 8 + y0
+        return (y - _DOCK_SEAM_Y + 113) % _DOCK_ROW_PITCH - 113
+
+    def _commission_dock_align(self, pixels_per_position):
+        """把行间缝拖回网格线，全程只动滚动条，不碰卡片区。
+
+        修正量按位置换算后重拖，逐轮逼近（起手死区会吃掉一部分
+        位移）。顶部/底部钳制导致拉不动时按当前位置接受。
+        返回是否对齐；调用方无论结果都继续扫描。
+        """
+        for _ in range(3):
+            self.device.screenshot()
+            offset = self._commission_dock_gap_offset()
+            if abs(offset) <= 9:
+                # 9px 内的错位接受：等级文字带高 22px，
+                # 偏移 9px 仍完整落在 OCR 区域内。
+                return True
+            position = DOCK_SCROLL.cal_position(main=self)
+            if offset < 0 and position <= 0.02:
+                # 已在顶部：缝偏上需要向下拉，游戏钳制拉不动，
+                # 游戏自然停靠的顶部位置就是对齐位置。
+                return True
+            if offset > 0 and position >= 0.98:
+                # 已在底部同理。
+                return True
+            target = position + offset / max(pixels_per_position, 1)
+            self._commission_dock_scroll_drag(min(max(target, 0.0), 1.0))
+        self.device.screenshot()
+        return abs(self._commission_dock_gap_offset()) <= 9
+
+    def _commission_filter_panel_open(self):
+        """面板自身的红色取消按钮覆盖该区域时说明面板已打开。"""
+        image = np.asarray(self.device.image).astype(int)
+        x0, y0, x1, y1 = DOCK_FILTER_CANCEL_AREA
+        button = image[y0:y1, x0:x1]
+        mean = button.mean(axis=(0, 1))
+        return mean[0] > 110 and mean[0] > mean[2] + 35
+
+    def _commission_filter_rarity_selected(self, button):
+        """选中的筛选按钮会变成亮蓝色，未选中保持灰色。"""
+        image = np.asarray(self.device.image).astype(int)
+        x0, y0, x1, y1 = button.area
+        area = image[y0:y1, x0:x1]
+        return float(area[:, :, 2].mean() - area[:, :, 0].mean()) > 50
+
+    def _commission_dock_set_filter(self, stage, descending):
+        """通过游戏自带筛选面板设置稀有度档位，按等级排序。
+        面板无法控制时返回 False。"""
+        for _ in range(3):
+            if self._commission_filter_panel_open():
+                break
+            self.device.click(DOCK_FILTER_OPEN)
+            self.device.sleep(0.8)
+            self.device.screenshot()
+        if not self._commission_filter_panel_open():
+            logger.warning('[委托-选船] 船坞筛选面板未打开')
+            return False
+        # 必须先让「等级」成为生效的排序类型，档位才有意义。
+        if not self._commission_filter_sort_is_level():
+            self.device.click(DOCK_FILTER_LEVEL)
+            self.device.sleep(0.4)
+            self.device.screenshot()
+        if self._commission_filter_rarity_selected(DOCK_FILTER_ALL_RARITY):
+            self.device.click(DOCK_FILTER_ALL_RARITY)
+            self.device.sleep(0.3)
+            self.device.screenshot()
+        for name, button in DOCK_FILTER_RARITY.items():
+            if name == stage:
+                continue
+            if self._commission_filter_rarity_selected(button):
+                logger.info(f'[委托-选船] 取消选择稀有度: {name}')
+                self.device.click(button)
+                self.device.sleep(0.3)
+                self.device.screenshot()
+        if not self._commission_filter_rarity_selected(DOCK_FILTER_RARITY[stage]):
+            self.device.click(DOCK_FILTER_RARITY[stage])
+            self.device.sleep(0.4)
+            self.device.screenshot()
+        if not self._commission_filter_rarity_selected(DOCK_FILTER_RARITY[stage]):
+            logger.warning(f'[委托-选船] 筛选档位 {stage} 未选中')
+            self.device.click(DOCK_FILTER_CANCEL)
+            return False
+        logger.attr('筛选档位', stage)
+        self.device.click(DOCK_FILTER_CONFIRM)
+        timer = Timer(3)
+        timer.reset()
+        while not timer.reached():
+            self.device.screenshot()
+            if not self._commission_filter_panel_open():
+                break
+        self.handle_dock_cards_loading()
+        self._commission_dock_set_sort(descending)
+        return True
+
+    def _commission_dock_sort_direction(self):
+        """读取排序按钮旁的小箭头，两个箭头像素都不匹配时返回 unknown。"""
+        image = np.asarray(self.device.image).astype(int)
+        for name, (x0, y0, x1, y1) in (('asc', (1014, 22, 1020, 27)),
+                                       ('desc', (1014, 29, 1020, 34))):
+            pixel = image[y0:y1, x0:x1]
+            if np.abs(pixel.mean(axis=(0, 1)) - np.array([189, 207, 231])).mean() < 35:
+                return name
+        return 'unknown'
+
+    def _commission_dock_set_sort(self, descending):
+        """有界重试地把箭头摆到需要的方向，
+        箭头读不出时绝不盲点。"""
+        target = 'desc' if descending else 'asc'
+        for _ in range(3):
+            self.device.screenshot()
+            current = self._commission_dock_sort_direction()
+            if current == target:
+                return True
+            if current == 'unknown':
+                logger.warning('[委托-选船] 排序箭头无法识别，未设置方向')
+                return False
+            self.device.click(SORTING_CLICK)
+            self.device.sleep(0.6)
+        logger.warning('[委托-选船] 排序方向未稳定')
+        return False
+
+    def _commission_filter_sort_is_level(self):
+        image = np.asarray(self.device.image).astype(int)
+        area = image[35:72, 370:495]
+        mean = area.mean(axis=(0, 1))
+        return mean[0] > 150 and mean[0] > mean[2] + 40
+
+    def _commission_wait_dock(self, timeout=10):
+        """点击舰船槽位后等待船坞打开。
+        船坞一直不出现时返回 False。"""
+        timer = Timer(timeout)
+        timer.reset()
+        while not timer.reached():
+            self.device.screenshot()
+            if self.appear(DOCK_CHECK, offset=(20, 20)):
+                return True
+            if self.info_bar_count():
+                # 游戏拒绝了开始，该委托确实无法开始。
+                return False
+        return self.appear(DOCK_CHECK, offset=(20, 20))
+
+    def _commission_empty_slot(self):
+        """最右侧空槽位的 Button；6 格全满时返回 None。"""
+        image = np.asarray(self.device.image)
+        for button in reversed(COMMISSION_SHIP_SLOTS.buttons):
+            if commission_slot_is_empty(image, button):
+                return button
+        return None
+
+    def _commission_enter_dock_by_slot(self):
+        """从委托详情面板的空槽位进入船坞。
+
+        点击已有舰船的槽位不会打开船坞，必须点空槽位（'+'）；
+        空槽位首次点击有时只展开面板，未进船坞时再点一次。
+
+        Returns:
+            bool: 是否已进入船坞（DOCK_CHECK 出现）。
+        """
+        slot = self._commission_empty_slot()
+        if slot is None:
+            # 6 格全满：先取消最后一艘，腾出空槽位。
+            logger.info('[委托-启动] 槽位已满，取消最后一艘以腾出空槽')
+            self.device.click(COMMISSION_SHIP_SLOTS[(5, 0)])
+            self.device.sleep(0.6)
+            self.device.screenshot()
+            slot = self._commission_empty_slot()
+            if slot is None:
+                logger.warning('[委托-启动] 没有空槽位可用，无法进入船坞')
+                return False
+        for attempt in range(2):
+            self.device.click(slot)
+            if self._commission_wait_dock(timeout=3 if attempt == 0 else 10):
+                return True
+            if attempt == 0:
+                logger.info('[委托-启动] 空槽位首次点击未进入船坞，再点一次')
+                self.device.screenshot()
+                recheck = self._commission_empty_slot()
+                if recheck is not None:
+                    slot = recheck
+        return False
+
+    def _commission_dock_fill_stage(self, allow_fleet, protected, required,
+                                    scanners, picked):
+        """在一个稀有度档位内填充槽位，每次翻一屏，只读顶部两行。
+        已挑中的卡片跨档位保持选中，绝不能再次点击，
+        再次点击会取消选择。"""
+        level_scanner, fleet_scanner, row3_scanner = scanners
+        count, total = self._commission_dock_ship_count()
+        if count < 0 or total <= 0:
+            logger.warning('[委托-选船] 船坞已选计数无法识别')
+            return False
+        if count >= total:
+            return True
+        # 列表可能停在上一档扫完的位置，先回到顶部再扫描。
+        self._commission_dock_scroll_top()
+        steps = 0
+        while 1:
+            steps += 1
+            if steps > 30:
+                logger.warning('[委托-选船] 翻页次数过多，停止扫描')
+                return False
+            if not self.appear(DOCK_CHECK, offset=(20, 20)):
+                # 选满后船坞可能自行关闭，停止扫描，
+                # 不要扫描留在身后的任意画面。
+                logger.warning('[委托-选船] 扫描中船坞关闭，停止选船')
+                return False
+            for ship in self._commission_dock_scan_page(level_scanner, fleet_scanner):
+                if count >= total:
+                    break
+                if ship['idx'] in picked:
+                    continue
+                if ship['occupied']:
+                    continue
+                if not allow_fleet and ship['fleet']:
+                    continue
+                if allow_fleet and ship['fleet'] and ship['fleet'] in protected:
+                    continue
+                if not 1 <= ship['level'] <= 125 or ship['level'] < required:
+                    continue
+                after = self._commission_dock_click_ship(
+                    ship['button'], allow_fleet=allow_fleet)
+                if after < 0:
+                    continue
+                if after == count - 1:
+                    # 这张卡已被推荐选中，刚才的点击把它取消了，
+                    # 点回来且不计数。
+                    self.device.click(ship['button'])
+                    self.device.sleep(0.4)
+                    self.device.screenshot()
+                    restored, _ = self._commission_dock_ship_count()
+                    if restored >= 0:
+                        count = restored
+                    continue
+                count = after
+                picked.add(ship['idx'])
+                logger.attr('已选舰船', f'Lv{ship["level"]} fleet{ship["fleet"]}')
+            if count >= total:
+                return True
+            before = DOCK_SCROLL.cal_position(main=self)
+            at_bottom = before >= _DOCK_SCROLL_BOTTOM
+            if not at_bottom:
+                after = self._commission_dock_scroll_page(before)
+                if abs(after - before) < 0.005:
+                    # 偶尔一次手势丢帧，重试一次再放弃。
+                    after = self._commission_dock_scroll_page(before)
+                if abs(after - before) < 0.005 and after < _DOCK_SCROLL_BOTTOM:
+                    # 两次拖动都没动：列表已到末端被游戏钳制，或设备丢帧。
+                    # 按已到底处理，读完末行收尾，不再中止整个档位。
+                    logger.warning('[委托-选船] 滚动条无法继续移动，按已到底处理')
+                    at_bottom = True
+            if at_bottom:
+                # 已经到底，读最后一行；最后一行露出在底栏上方，
+                # 其舰队徽标被遮挡，因此拆舰队时跳过它。
+                if not allow_fleet:
+                    count = self._commission_dock_pick_row3(
+                        row3_scanner, required, picked, count, total)
+                return count >= total
+            # 对齐失败不中止：按当前画面继续扫描，错位行读不到等级
+            # 会被跳过，比整个档位白扫好。
+            if not self._commission_dock_align(self._commission_dock_pixels_per_position()):
+                logger.warning('[委托-选船] 船坞页面未能对齐，按当前画面继续')
+            if DOCK_SCROLL.cal_position(main=self) <= before + 0.02:
+                # 对齐把刚才的翻页抵消了（列表末端附近），按已到底处理。
+                logger.info('[委托-选船] 无法继续向下翻页')
+                if not allow_fleet:
+                    count = self._commission_dock_pick_row3(
+                        row3_scanner, required, picked, count, total)
+                return count >= total
+
+    def _commission_dock_pick_ships(self, comm=None):
+        """通过船坞自带筛选面板手动填充槽位：按等级排序，
+        从用户设定的最低稀有度向上遍历，先只用空闲舰船直到所有档位用尽。
+        拆舰队放在最后，且绝不拆其他已启用任务使用的舰队。"""
+        logger.hr('委托船坞选船')
+        required = commission_level_requirement(comm.name) if comm is not None else 0
+        if required:
+            logger.info(f'[委托-选船] 委托等级要求: Lv{required}+')
+        # 高等级要求从低等级里找不到，从列表顶部读起，
+        # 避免翻过数百艘低级船；用户指定的等级顺序优先。
+        descending = self.config.Commission_PickLevelOrder == 'high_first' \
+            or required >= 100
+        min_rarity = self.config.Commission_PickMinRarity
+        if min_rarity not in _COMMISSION_RARITY_STAGES:
+            min_rarity = 'rare'
+        stages = _COMMISSION_RARITY_STAGES[_COMMISSION_RARITY_STAGES.index(min_rarity):]
+        protected = self._commission_protected_fleets()
+        if protected:
+            logger.attr('受保护舰队', sorted(protected))
+        level_scanner = LevelScanner()
+        fleet_scanner = FleetScanner()
+        row3_grids = CARD_GRIDS_ROW3.crop(area=_ROW3_LEVEL_AREA, name='LEVEL_ROW3')
+        row3_scanner = LevelScanner()
+        row3_scanner.grids = row3_grids
+        row3_scanner.ocr_model = LevelOcr(row3_grids.buttons, name='DOCK_LEVEL_OCR', threshold=64)
+        scanners = (level_scanner, fleet_scanner, row3_scanner)
+
+        count, total = self._commission_dock_ship_count()
+        if count < 0 or total <= 0:
+            logger.warning('[委托-选船] 船坞已选计数无法识别')
+            return False
+        if count >= total and required <= 1:
+            self.dock_select_confirm(check_button=COMMISSION_ADVICE)
+            return True
+        if count >= total:
+            # 槽位已满但开始仍灰：已选舰船不满足等级要求。
+            # 释放第一张卡，以便选一艘达标的。
+            after = self._commission_dock_click_ship(CARD_GRIDS[(0, 0)])
+            if after != count - 1:
+                logger.warning('[委托-选船] 无法释放槽位，第一张卡未被选中')
+                return False
+            count = after
+
+        picked = set()
+
+        def fill(allow_fleet):
+            for stage in stages:
+                current, _ = self._commission_dock_ship_count()
+                if current >= total:
+                    return True
+                if not self._commission_dock_set_filter(stage, descending):
+                    logger.warning(f'[委托-选船] 筛选档位 {stage} 失败，进入下一档')
+                    continue
+                if self._commission_dock_fill_stage(
+                        allow_fleet, protected, required, scanners, picked):
+                    return True
+            return False
+
+        # picked 是已选卡片集合（fill 的闭包用它判重），
+        # fill 的返回值必须用另一个名字，覆盖会破坏集合语义。
+        filled = fill(allow_fleet=False)
+        if not filled and self.config.Commission_NoFreeShipPolicy == 'use_fleet':
+            logger.info('[委托-选船] 重试并允许使用舰队中的舰船')
+            self.device.click_record_clear()
+            filled = fill(allow_fleet=True)
+        if not filled:
+            count, _ = self._commission_dock_ship_count()
+            if count <= 0:
+                logger.warning('[委托-选船] 没有为委托选到船，跳过')
+                return False
+            logger.warning(f'[委托-选船] 舰船仍不足 ({count}/{total})，照常开始')
+        self.dock_select_confirm(check_button=COMMISSION_ADVICE)
+        return True
+
     def _commission_start_click(self, comm, is_urgent=False, skip_first_screenshot=True):
         """
-        启动一个委托。
+        启动一个委托，无法开始的委托由调用方跳过（见 COMMISSION_SKIP_*）。
 
         Args:
             comm (Commission):
@@ -369,10 +1459,17 @@ class RewardCommission(UI, InfoHandler):
             in: page_commission
             out: page_commission, info_bar, commission details unfold
         """
-        logger.hr('Commission start')
+        logger.hr('启动委托')
         self.interval_clear(COMMISSION_ADVICE)
         self.interval_clear(COMMISSION_START)
         comm_timer = Timer(7)
+        skip_timer = Timer(read_run_param(
+            self.config, 'UiWait_CommissionSkipTimeout', COMMISSION_SKIP_TIMEOUT, 10, 600))
+        skip_timer.reset()
+        # 点击推荐后设置，倒计时至开始按钮应点亮的时间点。未用过推荐时为 None。
+        recommend_timer = None
+        # 确认灰色开始按钮强行打开船坞也只尝试一次。
+        enter_dock_tried = False
         count = 0
         while 1:
             if skip_first_screenshot:
@@ -383,29 +1480,71 @@ class RewardCommission(UI, InfoHandler):
             # 结束
             if self.info_bar_count():
                 break
-            if count >= 3:
-                # 重启游戏以处理委托推荐 bug。
-                # 点击"推荐"后，舰船出现后突然消失。
+            # 无法开始：跳过而不是抛 GameStuckError，
+            # 后者会重启游戏并丢掉所有运行中的委托。
+            if skip_timer.reached():
+                logger.warning(f'[委托-启动] 启动超时，跳过: {comm.name}')
+                return False
+            if count >= COMMISSION_SKIP_MAX_RECOMMEND:
+                # 点击「推荐」后，舰船出现后突然消失，
                 # 同时委托图标闪烁。
-                logger.warning('Triggered commission list flashing bug')
-                raise GameStuckError('Triggered commission list flashing bug')
+                logger.warning('[委托-启动] 触发了委托列表闪烁bug，跳过该委托')
+                return False
+            if recommend_timer is not None and recommend_timer.reached():
+                # 推荐已填充舰队但开始按钮仍灰：舰船不满足等级要求，
+                # 放弃这个委托。
+                if self.match_template_color(COMMISSION_START, offset=(5, 20)):
+                    recommend_timer = None
+                elif self.config.Commission_AutoPickShip and not enter_dock_tried \
+                        and self.match_template_color(COMMISSION_ADVICE, offset=(10, 10)):
+                    # 推荐后开始仍灰：从空槽位打开船坞，船坞一次最多可
+                    # 选六艘船。以橙色「推荐」按钮为门卫——槽位行位于其
+                    # 左侧固定距离处；点已有舰船的槽位不会进船坞，
+                    # 由亮度判别找空槽位。
+                    logger.info('[委托-启动] 推荐后开始仍灰，点击空槽位进入船坞')
+                    enter_dock_tried = True
+                    if not self._commission_enter_dock_by_slot():
+                        logger.warning(f'[委托-启动] 船坞未从舰船槽位打开，跳过: {comm.name}')
+                        return False
+                    recommend_timer = None
+                    comm_timer.reset()
+                    continue
+                else:
+                    # 仅作最后手段：未启用任何补位选项，或所有已启用选项在船坞
+                    # 内都试过且开始仍灰时才会走到这里。跳过绝不是第一选择。
+                    logger.warning(f'[委托-启动] 舰船不满足要求，跳过: {comm.name}')
+                    # 只有当船坞在屏幕上时才离开它，详情面板的返回箭头会退出整个页面。
+                    if self.appear(DOCK_CHECK, offset=(20, 20)):
+                        self.device.click(BACK_ARROW)
+                        self.device.sleep(1)
+                    return False
 
             # 点击
             if self.match_template_color(COMMISSION_START, offset=(5, 20), interval=7):
                 self.device.click(COMMISSION_START)
                 self.interval_reset(COMMISSION_ADVICE)
                 comm_timer.reset()
+                recommend_timer = None
                 continue
             if self.handle_popup_confirm('COMMISSION_START'):
                 self.interval_reset(COMMISSION_ADVICE)
                 comm_timer.reset()
                 continue
-            # 误入船坞
+            # 进入船坞：确认灰色开始按钮或误入时都会到这里。
             if self.appear(DOCK_CHECK, offset=(20, 20), interval=3):
-                logger.info(f'equip_enter {DOCK_CHECK} -> {BACK_ARROW}')
+                picked = self.config.Commission_AutoPickShip and self._commission_dock_pick_ships(comm=comm)
+                if picked:
+                    # 回到详情面板后，给开始按钮一段点亮窗口，
+                    # 再进入灰色检查跳过委托。
+                    recommend_timer = Timer(COMMISSION_SKIP_AFTER_RECOMMEND)
+                    recommend_timer.reset()
+                    comm_timer.reset()
+                    continue
+                logger.warning(f'[委托-启动] 推荐后被送入船坞，跳过: {comm.name}')
+                # 离开船坞，让调用方看到预期的委托页面。
                 self.device.click(BACK_ARROW)
-                comm_timer.reset()
-                continue
+                self.device.sleep(1)
+                return False
             # 检查是否是正确的委托
             if self.appear(COMMISSION_ADVICE, offset=(5, 20), interval=7):
                 area = (0, 0, image_size(self.device.image)[0], COMMISSION_ADVICE.button[1])
@@ -414,15 +1553,20 @@ class RewardCommission(UI, InfoHandler):
                     current.call('convert_to_night')  # 将额外委托转换为夜间委托
                 if current.count >= 1:
                     current = current[0]
+                    if not self._commission_check(current):
+                        logger.warning(f'[委托-启动] 当前委托已被过滤: {current.name}')
+                        return False
                     if current == comm:
-                        logger.info('Selected to the correct commission')
+                        logger.info('[委托-启动] 已选择正确的委托')
                     else:
-                        logger.warning('Selected to the wrong commission')
+                        logger.warning('[委托-启动] 选择了错误的委托')
                         return False
                 else:
-                    logger.warning('No selected commission detected, assuming correct')
+                    logger.warning('[委托-启动] 未检测到选择的委托，假设正确')
                 self.device.click(COMMISSION_ADVICE)
                 count += 1
+                recommend_timer = Timer(COMMISSION_SKIP_AFTER_RECOMMEND)
+                recommend_timer.reset()
                 self.interval_reset(COMMISSION_ADVICE)
                 self.interval_clear(COMMISSION_START)
                 comm_timer.reset()
@@ -442,11 +1586,12 @@ class RewardCommission(UI, InfoHandler):
             is_urgent (bool):
         """
         self.device.click_record_clear()
-        comm = copy.deepcopy(comm)
+        # 浅拷贝：只复位本条委托的 repeat_count，不递归 config 引用的运行时对象
+        comm = copy.copy(comm)
         comm.repeat_count = 1
         for _ in range(3):
-            logger.hr('Commission find and start', level=2)
-            logger.info(f'Finding commission {comm}')
+            logger.hr('查找并启动委托', level=2)
+            logger.info(f'[委托-查找] 正在查找委托 {comm}')
 
             failed = True
 
@@ -459,7 +1604,7 @@ class RewardCommission(UI, InfoHandler):
                 # 不同扫描中委托信息相同，但位置可能不同。
                 current = None
                 for new_comm in new:
-                    if new_comm == comm:
+                    if self._commission_check(new_comm) and new_comm == comm:
                         current = new_comm
                 if current is not None:
                     if self._commission_start_click(current, is_urgent=is_urgent):
@@ -476,17 +1621,19 @@ class RewardCommission(UI, InfoHandler):
                     break
 
             if failed:
-                logger.warning(f'Failed to select commission: {comm}')
+                logger.warning(f'[委托-查找] 选择委托失败: {comm}')
                 self._commission_mode_reset()
                 self._commission_swipe_to_top()
                 self.device.click_record_clear()
                 continue
             else:
-                logger.warning(f'Commission not found: {comm}')
+                # _commission_start_click 已放弃（委托错误或无法开始），
+                # 离开这条，继续下一条。
+                logger.warning(f'[委托-查找] 放弃委托: {comm}')
                 self.device.click_record_clear()
                 return False
 
-        logger.warning(f'Failed to select commission after 3 trial')
+        logger.warning('[委托-查找] 尝试3次后仍无法选择委托')
         self.device.click_record_clear()
         return False
 
@@ -500,7 +1647,7 @@ class RewardCommission(UI, InfoHandler):
         """
         self._commission_scan_all()
 
-        logger.hr('Commission run', level=1)
+        logger.hr('执行委托', level=1)
         if self.daily_choose:
             for comm in self.daily_choose:
                 self._commission_ensure_mode('daily')
@@ -516,192 +1663,475 @@ class RewardCommission(UI, InfoHandler):
                 self.handle_info_bar()
                 if self._commission_find_and_start(comm, is_urgent=True):
                     comm.convert_to_running()
+                    if comm.is_gem_commission:
+                        try:
+                            from module.statistics.cl1_database import db as cl1_db
+                            cl1_db.add_running_gem_commission(
+                                instance=self.config.config_name,
+                                commission={
+                                    "name": comm.name,
+                                    "create_time": comm.create_time.isoformat(),
+                                    "finish_time": comm.finish_time.isoformat(),
+                                    "duration": int(comm.duration.total_seconds() // 3600),
+                                },
+                            )
+                            if self.config.Commission_GemNotify:
+                                self._send_gem_commission_notify()
+                        except Exception as e:
+                            logger.warning(f'记录钻石委托持久化失败: {e}')
                 self._commission_mode_reset()
+
+        # 同步紧急委托列表中已 running 状态的钻石委托到数据库
+        self._sync_running_gem_commissions()
+
         if not self.daily_choose and not self.urgent_choose:
-            logger.info('No commission chose')
+            logger.info('[委托-执行] 没有选择任何委托')
 
-    def _record_commission_income(self):
-        """
-        记录委托奖励的收入（物品）。
-
-        分析委托奖励收集过程中在 `_commission_reward_images` 中截取的截图，
-        识别特定物品（钻石、心智魔方、心智单元、石油、金币），
-        汇总数量并保存到数据库。
-        """
+    def _record_commission_income(self) -> bool:
+        """识别并保存一组奖励；只有持久化成功后才发送通知。"""
         try:
-            from module.statistics.get_items import (
-                GetItemsStatistics, ITEM_GRIDS_1_ODD, ITEM_GRIDS_1_EVEN,
-                ITEM_GRIDS_2, ITEM_GRIDS_3
-            )
-            from module.statistics.item import ItemGrid, Item
-            from module.statistics.cl1_database import db as cl1_db
-            from module.combat.assets import GET_ITEMS_1, GET_ITEMS_2, GET_ITEMS_3
-            from module.handler.assets import INFO_BAR_1
-            import os
-
-            template_folder = os.path.join('.', 'assets', 'stats_commission_items')
-            if not os.path.exists(template_folder):
-                logger.info('Commission income: template folder not found, skip')
-                return
-
-            grid = ItemGrid(None, {}, template_area=(40, 21, 89, 70), amount_area=(50, 71, 91, 92))
-            grid.item_class = Item
-            grid.similarity = 0.92
-            grid.load_template_folder(template_folder)
-
-            if not grid.templates:
-                logger.info('Commission income: no templates loaded, skip')
-                return
-
-            get_items = GetItemsStatistics()
-
-            merged_items = {}
-            item_count = 0
-
-            images = getattr(self, '_commission_reward_images', None)
-            if not images:
-                logger.info('Commission income: no reward images collected')
-                return
-
-            COMMISSION_TRACKED_ITEMS = ['Gem', 'Cube', 'Chip', 'Oil', 'Coin']
-
-            COMMISSION_ITEM_NAME_MAP = {
-                'Gems': 'Gem',
-                'Cubes': 'Cube',
-                'CognitiveChips': 'Chip',
-                'Coins': 'Coin',
-            }
-
-            logger.info(f'Commission income: processing {len(images)} reward screenshot(s)')
-            for idx, image in enumerate(images):
-                try:
-                    if INFO_BAR_1.appear_on(image):
-                        logger.info(f'Commission income: screenshot[{idx}] has info_bar, skip')
-                        continue
-                    grid.grids = None
-                    if GET_ITEMS_1.match_template_color(image, offset=(5, 0)):
-                        is_odd = get_items._stats_get_items_is_odd(image)
-                        grid.grids = ITEM_GRIDS_1_ODD if is_odd else ITEM_GRIDS_1_EVEN
-                    elif GET_ITEMS_2.match_template_color(image, offset=(5, 0)):
-                        grid.grids = ITEM_GRIDS_2
-                    elif GET_ITEMS_3.match_template_color(image, offset=(5, 0)):
-                        grid.grids = ITEM_GRIDS_3
-                    else:
-                        logger.info(f'Commission income: screenshot[{idx}] not a get_items page, skip')
-                        continue
-                    grid.predict(image)
-                    recognized = []
-                    for item in grid.items:
-                        if item.is_known_item() and item.name not in ('DefaultItem',):
-                            mapped_name = COMMISSION_ITEM_NAME_MAP.get(item.name, item.name)
-                            if mapped_name not in COMMISSION_TRACKED_ITEMS:
-                                logger.info(f'Commission income: screenshot[{idx}] ignored {item.name} (not tracked)')
-                                continue
-                            merged_items[mapped_name] = merged_items.get(mapped_name, 0) + item.amount
-                            item_count += 1
-                            recognized.append(f'{mapped_name}x{item.amount}')
-                    if recognized:
-                        logger.info(f'Commission income: screenshot[{idx}] recognized {len(recognized)} item(s): {", ".join(recognized)}')
-                    else:
-                        logger.info(f'Commission income: screenshot[{idx}] no known items recognized')
-                except Exception as e:
-                    logger.info(f'Commission income: screenshot[{idx}] recognition failed: {e}')
-                    continue
-
-            if merged_items:
-                instance = self.config.config_name
-                cl1_db.add_commission_income(instance, merged_items, commission_count=1)
-                item_str = ', '.join([f'{k}x{v}' for k, v in merged_items.items()])
-                logger.info(f'Commission income recorded: {item_str} (instance={instance})')
-            else:
-                logger.info('Commission income: no known items recognized from all screenshots')
-
+            merged_items, reward_images = self._recognize_commission_income()
+            if not merged_items:
+                logger.info('[委托-收入] 所有截图都没有识别到已知物品')
+                return True
+            self._persist_commission_income(merged_items, reward_images)
         except Exception as e:
-            logger.warning(f'Commission income recording failed: {e}')
+            logger.warning(f'[委托-收入] 委托收入记录失败，保留运行委托: {e}')
+            return False
+
+        item_str = ', '.join(f'{key}x{value}' for key, value in merged_items.items())
+        logger.info(f'[委托-收入] 委托收入记录: {item_str} (实例={self.config.config_name})')
+        try:
+            self._notify_commission_income(merged_items)
+        except Exception as e:
+            # 通知失败不回滚或重写已经提交的收益。
+            logger.warning(f'[委托-收入] 奖励已保存，但通知失败: {e}')
+        return True
+
+    def _recognize_commission_income(self):
+        """只识别本组截图，返回合并物品和通过页面校验的原图。"""
+        images = getattr(self, '_commission_reward_images', None)
+        if not images:
+            logger.info('[委托-收入] 没有收集到奖励截图')
+            return {}, []
+
+        from module.statistics.get_items import (
+            GetItemsStatistics, ITEM_GRIDS_1_ODD, ITEM_GRIDS_1_EVEN,
+            ITEM_GRIDS_2, ITEM_GRIDS_3
+        )
+        from module.statistics.item import ItemGrid, Item
+        from module.combat.assets import GET_ITEMS_1, GET_ITEMS_2, GET_ITEMS_3
+        from module.handler.assets import INFO_BAR_1
+        import os
+
+        template_folder = os.path.join('.', 'assets', 'stats_commission_items')
+        if not os.path.exists(template_folder):
+            logger.info('[委托-收入] 模板文件夹不存在，跳过')
+            return {}, []
+
+        grid = ItemGrid(None, {}, template_area=(40, 21, 89, 70), amount_area=(50, 72, 94, 94))
+        grid.item_class = Item
+        grid.similarity = 0.92
+        # 原始字形匹配保留完整数位，OCR 兜底再放大并过滤图标白色碎块。
+        grid.amount_ocr = CommissionAmount([], threshold=96, name='Amount_ocr')
+        grid.load_template_folder(template_folder)
+
+        if not grid.templates:
+            logger.info('[委托-收入] 没有加载模板，跳过')
+            return {}, []
+
+        get_items = GetItemsStatistics()
+
+        merged_items = {}
+        # 通过「获取物品」页面校验的截图，结算后落盘存档供 WebUI 查看
+        reward_images = []
+
+        COMMISSION_TRACKED_ITEMS = ['Gem', 'Cube', 'Chip', 'Oil', 'Coin']
+
+        COMMISSION_ITEM_NAME_MAP = {
+            'Gems': 'Gem',
+            'Cubes': 'Cube',
+            'CognitiveChips': 'Chip',
+            'Coins': 'Coin',
+        }
+
+        logger.info(f'[委托-收入] 处理 {len(images)} 张奖励截图')
+        for idx, image in enumerate(images):
+            try:
+                if INFO_BAR_1.appear_on(image):
+                    logger.info(f'[委托-收入] 截图[{idx}] 有信息栏，跳过')
+                    continue
+                grid.grids = None
+                if GET_ITEMS_1.match_template_color(image, offset=(5, 0)):
+                    is_odd = get_items._stats_get_items_is_odd(image)
+                    grid.grids = ITEM_GRIDS_1_ODD if is_odd else ITEM_GRIDS_1_EVEN
+                elif GET_ITEMS_2.match_template_color(image, offset=(5, 0)):
+                    grid.grids = ITEM_GRIDS_2
+                elif GET_ITEMS_3.match_template_color(image, offset=(5, 0)):
+                    grid.grids = ITEM_GRIDS_3
+                else:
+                    logger.info(f'[委托-收入] 截图[{idx}] 不是获取物品页面，跳过')
+                    continue
+                reward_images.append(image)
+                # 先匹配原始字形，配置中的 OCR 后端只处理不确定的数量。
+                grid.predict(image, amount_trim=True)
+                recognized = []
+                for item in grid.items:
+                    if item.is_known_item() and item.name not in ('DefaultItem',):
+                        mapped_name = COMMISSION_ITEM_NAME_MAP.get(item.name, item.name)
+                        if mapped_name not in COMMISSION_TRACKED_ITEMS:
+                            logger.info(f'[委托-收入] 截图[{idx}] 忽略 {item.name} (未跟踪)')
+                            continue
+                        if item.amount <= 0:
+                            logger.warning(f'[委托-收入] 截图[{idx}] {item.name} 数量无法确认，保留截图供核对')
+                            continue
+                        merged_items[mapped_name] = merged_items.get(mapped_name, 0) + item.amount
+                        recognized.append(f'{mapped_name}x{item.amount}')
+                if recognized:
+                    logger.info(f'[委托-收入] 截图[{idx}] 识别到 {len(recognized)} 个物品: {", ".join(recognized)}')
+                else:
+                    logger.info(f'[委托-收入] 截图[{idx}] 没有识别到已知物品')
+            except Exception as e:
+                logger.info(f'[委托-收入] 截图[{idx}] 识别失败: {e}')
+                continue
+
+        return merged_items, reward_images
+
+    def _persist_commission_income(self, merged_items, reward_images):
+        """截图先独立存档，收益与钻石委托的迁移交给单个数据库事务。"""
+        from module.statistics.cl1_database import db as cl1_db
+
+        instance = self.config.config_name
+        screenshots = self._save_commission_reward_screenshots(reward_images, instance)
+        gem_count = merged_items.get("Gem", 0)
+        target_duration = self._guess_gem_duration(gem_count) if gem_count > 0 else None
+        commission = cl1_db.add_commission_income(
+            instance, merged_items, commission_count=1, screenshots=screenshots,
+            gem_duration=target_duration, completed_at=current_time(),
+        )
+        if gem_count > 0:
+            if target_duration is None:
+                logger.warning(f'无法根据钻石数量 {gem_count} 推断委托时长')
+            elif commission is None:
+                logger.warning(f'钻石委托 {target_duration}h 在运行列表中未找到记录')
+
+    def _notify_commission_income(self, merged_items):
+        """读取已提交的统计并生成奖励通知，不修改委托结算数据。"""
+        from module.statistics.cl1_database import db as cl1_db
+
+        instance = self.config.config_name
+        if self.config.Commission_CommissionNotifyReward:
+            reward_stats = None
+            if self.config.Commission_CommissionNotifyRewardStatistics:
+                reward_stats = cl1_db.get_commission_reward_stats(instance)
+            gem_count = merged_items.get("Gem", 0)
+            tracked = []
+            if gem_count > 0:
+                text = f'本次获得钻石 * {gem_count}'
+                if reward_stats:
+                    text += (
+                        f'\n\n今日累计: {reward_stats["today"].get("Gem", 0)}'
+                        f'\n本周累计: {reward_stats["week"].get("Gem", 0)}'
+                        f'\n本月累计: {reward_stats["month"].get("Gem", 0)}'
+                    )
+                tracked.append(text)
+            if tracked:
+
+                msg = '\n'.join(tracked)
+                webui_msg = msg.replace('\n\n', '\n')
+                title = f"AzurPilot <{instance}> 委托获得奖励喵！"
+                webui_title = f"AzurPilot <{instance}> 委托获得奖励喵！"
+                if gem_count >= 50:
+                    title = f"AzurPilot <{instance}> 大成功！！！委托获得顶级奖励喵！"
+                    webui_title = f"AzurPilot <{instance}> 大成功！！！委托获得顶级奖励喵！"
+
+                elif gem_count > 0:
+                    title = f"AzurPilot <{instance}> 委托获得顶级奖励喵！"
+                    webui_title = f"AzurPilot <{instance}> 委托获得顶级奖励喵！"
+
+                # 附加钻石委托分时长统计
+                if gem_count > 0 and self.config.Commission_GemStatistics:
+                    try:
+                        gem_stats = cl1_db.get_gem_commission_stats(
+                            instance,
+                            period=self.config.Commission_GemStatisticsPeriod,
+                        )
+                        gem_entries = cl1_db.get_gem_commissions(instance)
+                        msg += '\n\n' + self._format_gem_statistics(
+                            gem_stats,
+                            gem_entries,
+                            self.config.Commission_GemStatisticsPeriod,
+                        )
+                        webui_msg = msg.replace('\n\n', '\n')
+                    except Exception as e:
+                        logger.warning(f'钻石委托统计生成失败: {e}')
+
+                handle_notify(
+                    self.config.Error_OnePushConfig,
+                    title=title,
+                    content=msg,
+                )
+
+                notify_webui(
+                    instance,
+                    title=webui_title,
+                    content=webui_msg,
+                )
+
+
+    def _save_commission_reward_screenshots(self, images, instance):
+        """保存本次结算的委托收益截图。
+
+        截图落盘到 ``./log/commission_rewards/<instance>/<YYYY-MM>/`` 目录，
+        文件名使用毫秒时间戳避免冲突。返回相对 ``log/commission_rewards``
+        根目录的路径列表（POSIX 风格），写入数据库供 WebUI 查看截图使用。
+
+        关掉「掉落记录 - 委托收益截图」后不再落盘，
+        但收益数据本身仍然记录，只是统计页不再有截图可看。
+
+        Args:
+            images: 通过「获取物品」页面校验的截图列表（RGB numpy 数组）。
+            instance: 配置实例名称。
+
+        Returns:
+            list[str]: 保存成功的截图相对路径列表，未保存或失败时返回空列表。
+        """
+        import os
+
+        from module.statistics.drop_cleanup import drop_screenshot_retention_days
+
+        if self.config.DropRecord_CommissionIncomeScreenshot == 'do_not':
+            return []
+        if not images:
+            return []
+
+        month_str = current_time().strftime('%Y-%m')
+        folder = os.path.join('.', 'log', 'commission_rewards', instance, month_str)
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as e:
+            logger.warning(f'[委托-收入] 创建截图目录失败: {e}')
+            return []
+
+        stamp = current_time().strftime('%Y%m%d_%H%M%S_%f')
+        paths = []
+        for idx, image in enumerate(images):
+            filename = f'{stamp}_{idx}.png'
+            try:
+                save_image(image, os.path.join(folder, filename))
+            except Exception as e:
+                logger.warning(f'[委托-收入] 保存截图失败 {filename}: {e}')
+                continue
+            paths.append(f'{instance}/{month_str}/{filename}')
+            logger.info(f'[委托-收入] 已保存收益截图: log/commission_rewards/{instance}/{month_str}/{filename}')
+
+        # 填了保留天数就交给掉落记录模块按天数统一清理
+        # （见 module/statistics/drop_cleanup.py），没填才沿用张数上限
+        if drop_screenshot_retention_days(self.config) <= 0:
+            self._prune_commission_reward_screenshots(instance)
+        return paths
+
+    def _prune_commission_reward_screenshots(self, instance, max_keep=None, base=None):
+        """清理实例目录下超量的委托收益截图，仅保留最近 max_keep 张。
+
+        截图保留张数与统计页「最近委托记录」的 50 条上限对应：
+        超过保留数量的旧截图按修改时间排序删除，并移除清空后的
+        空月份目录。清理在每次保存截图后顺带执行。
+        ``bak/`` 下的备份不计入张数上限，也不会被删除。
+
+        Args:
+            instance: 配置实例名称。
+            max_keep: 保留的截图张数上限，默认使用模块级常量
+                COMMISSION_REWARD_SCREENSHOT_KEEP。
+            base: 实例截图目录，默认按实例名推导；测试可注入临时目录。
+        """
+        import os
+
+        from module.statistics.drop_cleanup import BAK_FOLDER
+
+        if max_keep is None:
+            max_keep = int(read_run_param(
+                self.config, 'UiWait_CommissionRewardScreenshotKeep',
+                COMMISSION_REWARD_SCREENSHOT_KEEP, 5, 500))
+
+        if base is None:
+            base = os.path.join('.', 'log', 'commission_rewards', instance)
+        if not os.path.isdir(base):
+            return
+        files = []
+        for folder, dirs, names in os.walk(base):
+            dirs[:] = [d for d in dirs if d != BAK_FOLDER]
+            for name in names:
+                if not name.endswith('.png'):
+                    continue
+                file = os.path.join(folder, name)
+                try:
+                    files.append((os.path.getmtime(file), file))
+                except OSError:
+                    continue
+        files.sort(reverse=True)
+        for _, file in files[max_keep:]:
+            try:
+                os.remove(file)
+            except OSError:
+                continue
+        for folder, _, _ in os.walk(base, topdown=False):
+            if os.path.basename(os.path.normpath(folder)) == BAK_FOLDER:
+                continue
+            try:
+                os.rmdir(folder)
+            except OSError:
+                pass
+
+    def _handle_research_genre_t_update(self, completed_commission_count):
+        """更新 T 类科研任务的剩余委托计数。
+
+        当存在 T 类科研（要求完成指定次数委托）时，将已完成的委托次数
+        从剩余计数中扣除。计数归零时触发科研任务调度。
+
+        Args:
+            completed_commission_count (int): 本次领取奖励时完成的委托数量。
+        """
+        if completed_commission_count <= 0:
+            return
+        required_commissions = self.config.cross_get('Research.Research.RemainingCommissions', -1)
+        if required_commissions <= -1:
+            return
+
+        new_value = max(required_commissions - completed_commission_count, 0)
+        logger.info(f'T类科研要求进行委托{required_commissions}次，当前进行了{completed_commission_count}次，剩余{new_value}次')
+        self.config.cross_set('Research.Research.RemainingCommissions', new_value)
+        if new_value <= 0:
+            logger.info('T类科研要求已完成，叫出科研任务')
+            self.config.task_call('Research')
 
     def _commission_receive(self, skip_first_screenshot=True):
-        logger.hr('Reward receive')
+        """领取已完成的委托奖励。
+
+        在委托页面和奖励页面之间循环，点击所有可领取的奖励弹窗
+        （经验、物品、舰船），同时收集奖励截图用于收入统计。
+        处理石油溢出的情况（触发宿舍喂食消耗石油）。
+
+        Args:
+            skip_first_screenshot (bool): 是否跳过首次截图，复用上一状态的截图。
+
+        Returns:
+            bool: 是否领取了任何奖励。
+
+        Raises:
+            OilMaxed: 石油溢出且喂食 3 次仍无法解决时抛出。
+        """
+        logger.hr('领取奖励')
 
         reward = False
         click_timer = Timer(1)
         self._commission_reward_images = []
+        completed_commission_count = 0
+        income_recorded = True
 
-        with self.stat.new(
-                'commission', method=self.config.DropRecord_CommissionRecord
-        ) as drop:
-            while 1:
-                if skip_first_screenshot:
-                    skip_first_screenshot = False
-                else:
-                    self.device.screenshot()
+        try:
+            with self.stat.new(
+                    'commission', method=self.config.DropRecord_CommissionRecord
+            ) as drop:
+                while 1:
+                    if skip_first_screenshot:
+                        skip_first_screenshot = False
+                    else:
+                        self.device.screenshot()
 
-                if self.ui_page_appear(page_commission, offset=(20, 20)):
-                    break
+                    if drop and hasattr(drop, 'capture_commission_status'):
+                        drop.capture_commission_status(self.device.image)
 
-                for button in [EXP_INFO_S_REWARD, GET_ITEMS_1, GET_ITEMS_2, GET_ITEMS_3]:
-                    if self.appear(button, interval=1):
-                        self.ensure_no_info_bar(timeout=1)
+                    if self.ui_page_appear(page_commission, offset=(20, 20)):
+                        break
 
-                        if drop:
-                            drop.add(self.device.image)
+                    for button in [EXP_INFO_S_REWARD, GET_ITEMS_1, GET_ITEMS_2, GET_ITEMS_3]:
+                        if self.appear(button, interval=1):
+                            self.ensure_no_info_bar(timeout=1)
 
-                        if button is EXP_INFO_S_REWARD:
-                            if self._commission_reward_images:
-                                self._record_commission_income()
-                                self._commission_reward_images = []
-                        else:
-                            self._commission_reward_images.append(self.device.image.copy())
-                            logger.info(f'Commission income: collected reward screenshot (trigger={button.name})')
+                            if drop:
+                                drop.add(self.device.image)
 
-                        REWARD_SAVE_CLICK.name = button.name
-                        self.device.click(REWARD_SAVE_CLICK)
-                        if button is EXP_INFO_S_REWARD:
-                            self.device.sleep(0.3)
+                            if button is EXP_INFO_S_REWARD:
+                                completed_commission_count += 1
+                                if self._commission_reward_images:
+                                    income_recorded = self._record_commission_income() and income_recorded
+                                    self._commission_reward_images = []
+                            else:
+                                self._commission_reward_images.append(self.device.image.copy())
+                                logger.info(f'[委托-收入] 收集奖励截图 (触发按钮={button.name})')
+
+                            REWARD_SAVE_CLICK.name = button.name
+                            self.device.click(REWARD_SAVE_CLICK)
+                            if button is EXP_INFO_S_REWARD:
+                                self.device.sleep(0.3)
+                            click_timer.reset()
+                            reward = True
+                            continue
+                    if click_timer.reached() and self.appear_then_click(REWARD_1, offset=(20, 20), interval=1):
+                        self.interval_reset(GET_SHIP)
                         click_timer.reset()
                         reward = True
                         continue
-                if click_timer.reached() and self.appear_then_click(REWARD_1, offset=(20, 20), interval=1):
-                    self.interval_reset(GET_SHIP)
-                    click_timer.reset()
-                    reward = True
-                    continue
-                if click_timer.reached() and self.appear_then_click(REWARD_1_WHITE, offset=(20, 20), interval=1):
-                    self.interval_reset(GET_SHIP)
-                    click_timer.reset()
-                    reward = True
-                    continue
-                if click_timer.reached() and self.appear_then_click(REWARD_GOTO_COMMISSION, offset=(20, 20)):
-                    self.interval_reset(GET_SHIP)
-                    click_timer.reset()
-                    continue
-                if click_timer.reached() and self.appear_then_click(REWARD_GOTO_COMMISSION_WHITE, offset=(20, 20)):
-                    self.interval_reset(GET_SHIP)
-                    click_timer.reset()
-                    continue
-                if self.ui_main_appear_then_click(page_reward, interval=3):
-                    self.interval_reset(GET_SHIP)
-                    continue
-
-                if self.config.SERVER in ['cn']:
-                    if self.appear(OIL_MAXED, offset=(20, 20), interval=3):
-                        raise OilMaxed
-
-                for button in [GET_SHIP]:
-                    if click_timer.reached() and self.appear(button, interval=1):
-                        self.ensure_no_info_bar(timeout=1)
-                        drop.add(self.device.image)
-
-                        REWARD_SAVE_CLICK.name = button.name
-                        self.device.click(REWARD_SAVE_CLICK)
+                    if click_timer.reached() and self.appear_then_click(REWARD_1_WHITE, offset=(20, 20), interval=1):
+                        self.interval_reset(GET_SHIP)
                         click_timer.reset()
                         reward = True
                         continue
-                if click_timer.reached() and self.ui_additional():
-                    click_timer.reset()
-                    continue
+                    if click_timer.reached() and self.appear_then_click(REWARD_GOTO_COMMISSION, offset=(20, 20)):
+                        self.interval_reset(GET_SHIP)
+                        click_timer.reset()
+                        continue
+                    if click_timer.reached() and self.appear_then_click(REWARD_GOTO_COMMISSION_WHITE, offset=(20, 20)):
+                        self.interval_reset(GET_SHIP)
+                        click_timer.reset()
+                        continue
+                    if self.ui_main_appear_then_click(page_reward, interval=3):
+                        self.interval_reset(GET_SHIP)
+                        continue
+
+                    if self.config.SERVER in ['cn']:
+                        if self.appear(OIL_MAXED, offset=(20, 20), interval=3):
+                            raise OilMaxed
+
+                    # 委托舰船掉落检测开关：不做会掉落舰船的委托时
+                    # 可在配置中关闭，避免识别错误；其他场景的舰船检测不受影响
+                    if self.config.Commission_DetectShipDrop:
+                        for button in [GET_SHIP]:
+                            if click_timer.reached() and self.appear(button, offset=(20, 20), interval=1):
+                                self.ensure_no_info_bar(timeout=1)
+                                drop.add(self.device.image)
+
+                                REWARD_SAVE_CLICK.name = button.name
+                                self.device.click(REWARD_SAVE_CLICK)
+                                click_timer.reset()
+                                reward = True
+                                continue
+                    if click_timer.reached() and self.ui_additional():
+                        click_timer.reset()
+                        continue
+        finally:
+            self._handle_research_genre_t_update(completed_commission_count)
 
         if reward:
-            self._record_commission_income()
+            income_recorded = self._record_commission_income() and income_recorded
+
+        if not income_recorded:
+            logger.warning("委托收益未全部保存，本轮跳过未获钻石委托的失败结算")
+            return reward
+
+        # 已处理所有奖励截图且回到委托列表后，剩余的到期钻石委托没有匹配到
+        # 钻石收益，按失败写入统计并从运行列表清理。
+        try:
+            from module.statistics.cl1_database import db as cl1_db
+            settled = cl1_db.settle_expired_gem_commissions(
+                self.config.config_name,
+                now=current_time(),
+            )
+            if settled:
+                logger.info(f'钻石委托统计：结算 {settled} 条未获得钻石的委托')
+        except Exception as e:
+            logger.warning(f'钻石委托失败统计结算失败: {e}')
 
         return reward
 
@@ -718,12 +2148,358 @@ class RewardCommission(UI, InfoHandler):
             try:
                 return self._commission_receive()
             except OilMaxed:
-                logger.info("Oil maxed, buy food to consume oil")
+                runtime = self.config.__dict__.get('_scheduler_runtime')
+                if runtime is not None and runtime.oil_control.enabled:
+                    for _ in self.loop(skip_first=False):
+                        if self.handle_popup_confirm('COMMISSION_OIL_MAXED'):
+                            continue
+                        if self.ui_page_appear(page_reward) or self.ui_page_appear(page_commission):
+                            break
+                        if self.ui_additional():
+                            continue
+                    runtime.oil_control.request_blocked(self.config.task.command)
+                    self.config.task_stop('石油溢出，交回调度器优先清理')
+                logger.info("[委托-石油] 石油溢出，购买食物消耗石油")
                 RewardDorm(self.config, self.device).dorm_food_run(amount=10)
                 self.ui_ensure(page_reward)
 
-        logger.critical(f'Failed to handle oil maxed after 3 trial')
+        logger.critical('[委托-石油] 尝试3次后仍无法处理石油溢出')
         raise RequestHumanTakeover
+
+    def _sync_running_gem_commissions(self):
+        """同步 urgent 列表中钻石委托到数据库。
+
+        commission_start() 只写本次新启动的 urgent 钻石委托。
+        上会话已启动的钻石委托在当前会话中可能已 finished，不会被
+        commission_start() 写入。此方法遍历 self.urgent 全量列表，
+        补充写入 running/finished 状态的钻石委托（同名委托已存在则跳过）。
+
+        新启动的委托会在 commission_start() 中使用实际启动时间持久化；
+        本方法仅用于恢复缺失记录。扫描对象的 create_time 每次都会刷新，
+        因而恢复记录只能以本次扫描时间估算开始时间；记录写入后由同名检查
+        保留，后续扫描不会继续刷新数据库中的时间戳。
+        """
+        try:
+            from module.statistics.cl1_database import db as cl1_db
+        except Exception:
+            return
+
+        try:
+            existing = cl1_db.get_running_gem_commissions(
+                self.config.config_name
+            )
+        except Exception:
+            return
+        existing_names = {c.get("name") for c in existing}
+
+        for comm in self.urgent:
+            if not comm.is_gem_commission:
+                continue
+            if comm.name in existing_names:
+                continue
+            if comm.status not in ('running', 'finished'):
+                continue
+
+            duration_seconds = comm.duration.total_seconds()
+            duration_hour = int(duration_seconds // 3600)
+            now = current_time()
+
+            if comm.status == 'finished':
+                create_time = now - timedelta(seconds=duration_seconds)
+                finish_time = now
+            else:
+                finish_time = now + timedelta(seconds=duration_seconds)
+                create_time = now
+
+            try:
+                cl1_db.add_running_gem_commission(
+                    instance=self.config.config_name,
+                    commission={
+                        "name": comm.name,
+                        "create_time": create_time.isoformat(),
+                        "finish_time": finish_time.isoformat(),
+                        "duration": duration_hour,
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    f'同步钻石委托运行列表失败: {e}'
+                )
+
+    @staticmethod
+    def _guess_gem_duration(gem_count):
+        """按获得的钻石数量推断钻石委托时长。
+
+        对应关系：2h -> 10~20，4h -> 25~40，8h -> 50~80。
+
+        Args:
+            gem_count (int): 本次结算获得的钻石数量。
+
+        Returns:
+            int | None: 推断出的委托时长（小时）；无法推断时返回 None。
+        """
+        if 10 <= gem_count <= 20:
+            return 2
+        if 25 <= gem_count <= 40:
+            return 4
+        if 50 <= gem_count <= 80:
+            return 8
+        return None
+
+    def _get_gem_reward(self, comm):
+        """根据委托时长返回预计钻石收益。
+
+        优先使用 comm.duration，当 OCR 识别失败（duration 为 0）时，
+        用 finish_time - create_time 推算时长。
+        """
+        hour = int(comm.duration.total_seconds() // 3600)
+
+        if hour == 0:
+            try:
+                hour = int(
+                    (comm.finish_time - comm.create_time).total_seconds() // 3600
+                )
+            except Exception:
+                pass
+
+        return {
+            2: '钻石 10~20',
+            4: '钻石 25~40',
+            8: '钻石 50~80',
+        }.get(hour, '未知')
+
+    def _get_remaining_time(self, comm):
+        """计算委托对象的剩余完成时间文本。
+
+        Args:
+            comm (Commission): 目标委托对象。
+
+        Returns:
+            str: 格式化的剩余时间字符串（如 '1小时30分钟' 或 '已完成'）。
+        """
+        remaining = comm.finish_time - current_time()
+
+        if remaining.total_seconds() <= 0:
+            return '已完成'
+
+        hours, remainder = divmod(int(remaining.total_seconds()), 3600)
+        minutes, _ = divmod(remainder, 60)
+
+        if hours:
+            return f'{hours}小时{minutes}分钟'
+        return f'{minutes}分钟'
+
+    def _get_remaining_time_str(self, finish_time_str):
+        """根据 ISO 格式的完成时间字符串计算剩余时间文本。
+
+        Args:
+            finish_time_str (str): ISO 格式时间字符串。
+
+        Returns:
+            str: 格式化的剩余时间字符串。
+        """
+        finish_time = datetime.fromisoformat(finish_time_str)
+        remaining = finish_time - current_time()
+
+        if remaining.total_seconds() <= 0:
+            return '已完成'
+
+        hours, remainder = divmod(int(remaining.total_seconds()), 3600)
+        minutes, _ = divmod(remainder, 60)
+
+        if hours:
+            return f'{hours}小时{minutes}分钟'
+        return f'{minutes}分钟'
+
+    def _get_gem_reward_str(self, duration_hour):
+        """根据时长小时数获取预计钻石收益描述。
+
+        Args:
+            duration_hour (int): 委托耗时（小时）。
+
+        Returns:
+            str: 收益描述文本，如 '钻石 10~20'。
+        """
+        return {
+            2: '钻石 10~20',
+            4: '钻石 25~40',
+            8: '钻石 50~80',
+        }.get(duration_hour, '未知')
+
+    def _format_gem_statistics(self, stats, entries, period='month'):
+        """格式化钻石委托统计信息，返回可直接拼接的文本。
+
+        Args:
+            stats: get_gem_commission_stats() 返回的字典，
+                   结构为 {duration: {count, success, reward, rate}}。
+            entries: 原始钻石委托记录列表，用于找到实际第一条记录日期。
+            period: 统计周期（today / week / month），用于标题格式。
+        """
+
+        now = datetime.now()
+        today = now.date()
+        week_start = today - timedelta(days=today.weekday())
+        month_start = today.replace(day=1)
+
+        if period == 'today':
+            ts_filter = lambda d: d == today
+        elif period == 'week':
+            ts_filter = lambda d: week_start <= d <= today
+        else:
+            ts_filter = lambda d: d >= month_start
+
+        # 从周期范围内的 entries 中找到第一条记录日期作为统计开始日
+        first_ts = None
+        for entry in entries:
+            try:
+                ts = datetime.fromisoformat(entry.get("ts", ""))
+                if not ts_filter(ts.date()):
+                    continue
+                if first_ts is None or ts < first_ts:
+                    first_ts = ts
+            except Exception:
+                continue
+
+        has_data = first_ts is not None
+
+        if period == 'today':
+            title = f'{today.month}.{today.day}'
+        elif period == 'week':
+            if has_data:
+                start = first_ts.date()
+                if start < week_start:
+                    start = week_start
+                title = (
+                    f'{start.month}.{start.day}~{today.month}.{today.day}'
+                )
+            else:
+                title = (
+                    f'{week_start.month}.{week_start.day}~{today.month}.{today.day}'
+                )
+        else:
+            if has_data:
+                start = first_ts.date()
+                if start < month_start:
+                    start = month_start
+                title = (
+                    f'{start.month}.{start.day}~{today.month}.{today.day}'
+                )
+            else:
+                title = (
+                    f'{month_start.month}.{month_start.day}~{today.month}.{today.day}'
+                )
+
+        lines = [
+            '',
+            '━━━━━━━━━━━━',
+            f'钻石委托统计{title}',
+            '',
+        ]
+
+        commission_names = {
+            2: 'BIW/NYB要员护卫',
+            4: 'BIW/NYB度假护卫',
+            8: 'BIW/NYB巡视护卫',
+        }
+
+        total_count = 0
+        total_success = 0
+        total_reward = 0
+
+        for hour in (2, 4, 8):
+            item = stats[hour]
+
+            total_count += item['count']
+            total_success += item['success']
+            total_reward += item['reward']
+
+            avg_reward = (
+                item['reward'] / item['success']
+                if item['success']
+                else 0
+            )
+
+            lines.extend([
+                f'{commission_names[hour]}（{hour}小时）',
+                f'成功：{item["success"]} / {item["count"]}（{item["rate"]:.1f}%）',
+                f'累计：{item["reward"]}',
+                f'平均：{avg_reward:.1f}/次成功',
+                '',
+            ])
+
+        total_rate = (
+            total_success * 100 / total_count
+            if total_count
+            else 0
+        )
+
+        avg_total = (
+            total_reward / total_success
+            if total_success
+            else 0
+        )
+
+        lines.extend([
+            '━━━━━━━━━━━━',
+            '总计',
+            f'成功：{total_success} / {total_count}（{total_rate:.1f}%）',
+            f'累计：{total_reward}',
+            f'平均：{avg_total:.1f}/次成功',
+        ])
+
+        return '\n'.join(lines)
+
+    def _send_gem_commission_notify(self):
+        """推送当前执行中的钻石委托列表。
+
+        从数据库中读取运行中的钻石委托（保证时间戳稳定），
+        按完成时间排序后通过 OnePush 和 WebUI 推送通知。
+        没有运行中的钻石委托时静默返回。
+        """
+        instance = self.config.config_name
+        now = current_time()
+
+        try:
+            from module.statistics.cl1_database import db as cl1_db
+            db_commissions = cl1_db.get_running_gem_commissions(instance)
+        except Exception as e:
+            logger.warning(f'读取钻石委托数据库失败: {e}')
+            return
+
+        if not db_commissions:
+            return
+
+        db_commissions = [
+            c for c in db_commissions
+            if datetime.fromisoformat(c['finish_time']) > now
+        ]
+
+        if not db_commissions:
+            return
+
+        db_commissions.sort(key=lambda c: c['finish_time'])
+
+        content = '当前钻石委托执行列表\n'
+        content += '\n\n'.join(
+            f'{idx}. {c["name"]}\n'
+            f'接取时间：{datetime.fromisoformat(c["create_time"]):%Y-%m-%d %H:%M:%S}\n'
+            f'预计完成：{datetime.fromisoformat(c["finish_time"]):%Y-%m-%d %H:%M:%S}\n'
+            f'剩余时间：{self._get_remaining_time_str(c["finish_time"])}\n'
+            f'预计收益：{self._get_gem_reward_str(c["duration"])}'
+            for idx, c in enumerate(db_commissions, 1)
+        )
+
+        handle_notify(
+            self.config.Error_OnePushConfig,
+            title=f'AzurPilot <{instance}> 新的钻石委托开始执行',
+            content=content,
+        )
+
+        notify_webui(
+            instance,
+            title=f'{instance} 新的钻石委托开始执行',
+            content=content,
+        )
 
     def run(self):
         """
@@ -736,7 +2512,7 @@ class RewardCommission(UI, InfoHandler):
         # 选择 BACK_ARROW，但从该页面无法导航到 page_reward
         self.device.screenshot()
         if self.appear(TACTICAL_CLASS_START, offset=(30, 30)):
-            logger.info('Detected TACTICAL_CLASS_START, clicking cancel to exit')
+            logger.info('[委托-战术] 检测到战术课堂开始按钮，点击取消退出')
             self.device.click(TACTICAL_CLASS_CANCEL)
             self.device.sleep((0.5, 1.0))
         self.ui_ensure(page_reward)
@@ -750,24 +2526,41 @@ class RewardCommission(UI, InfoHandler):
         # 调度
         total = self.daily.add_by_eq(self.urgent)
         future_finish = sorted([f for f in total.get('finish_time') if f is not None])
-        logger.info(f'Commission finish: {[str(f) for f in future_finish]}')
+        logger.info(f'[委托-完成] 委托完成时间: {[str(f) for f in future_finish]}')
         if len(future_finish):
             self.config.task_delay(target=future_finish)
         else:
-            logger.info('No commission running')
+            logger.info('[委托-完成] 没有正在运行的委托')
             self.config.task_delay(success=False)
 
-        # 延迟钻石 farming 任务
-        if self.config.is_task_enabled('GemsFarming') and \
-                self.config.cross_get(keys='GemsFarming.GemsFarming.CommissionLimit', default=False):
-            daily = self.daily.select(category_str='daily', status='pending').count
-            filtered_urgent = self.comm_choose.intersect_by_eq(self.urgent.select(status='pending')).count
-            filtered_extra = self.comm_choose.intersect_by_eq(self.daily.select(category_str='extra', status='pending')).count
-            logger.info(f'Daily commission: {daily}, filtered_urgent: {filtered_urgent}, filtered_extra: {filtered_extra}')
+        # 延迟钻石 farming / 三油低耗任务
+        # 遍历使用 GemsFarming 配置组的任务，检查是否启用且开启了 CommissionLimit
+        limit_tasks = [
+            task for task in ['GemsFarming', 'ThreeOilLowCost']
+            if self.config.is_task_enabled(task)
+            and self.config.cross_get(keys=f'{task}.GemsFarming.CommissionLimit', default=False)
+        ]
+
+        if limit_tasks:
             future = nearest_future(future_finish) if len(future_finish) else None
-            if daily > 0 and filtered_urgent >= 1:
-                logger.info('Having daily commissions to do, delay task `GemsFarming`')
-                self.config.task_delay(minute=None if future else 120, target=future, task='GemsFarming')
-            elif filtered_urgent >= 4:
-                logger.info('Having too many urgent commissions, delay task `GemsFarming`')
-                self.config.task_delay(minute=None if future else 120, target=future, task='GemsFarming')
+            for task in limit_tasks:
+                filter_count = self.config.cross_get(f'{task}.GemsFarming.HighValueCommissionFilterCount')
+                reserve = self.config.cross_get(f'{task}.GemsFarming.HighValueCommissionReserve')
+                filter_count = max(int(filter_count), 1)
+                reserve = max(int(reserve), 1)
+                high_value_count = self._commission_high_value_count(filter_count)
+                if high_value_count >= reserve:
+                    logger.info(
+                        f"[委托-调度] 高价值委托达到保留量 {high_value_count}/{reserve}，"
+                        f"延迟任务 '{task}'"
+                    )
+                    self.config.task_delay(
+                        minute=None if future else 120,
+                        target=future,
+                        task=task,
+                    )
+                else:
+                    logger.info(
+                        f"[委托-调度] 高价值委托未达到保留量 {high_value_count}/{reserve}，"
+                        f"继续任务 '{task}'"
+                    )

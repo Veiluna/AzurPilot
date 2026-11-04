@@ -1,3 +1,16 @@
+"""活动战役基础模块。
+
+提供活动关卡的基类和通用工具，供 CampaignABCD、CampaignSP 等子类继承。
+
+主要功能：
+- EventStage: 从活动目录中的 .py 文件名提取关卡名称
+- EventBase: 活动战役基类，提供关卡名称转换和过滤功能
+- STAGE_FILTER: 基于正则的关卡过滤器，用于用户自定义关卡选择
+
+活动地图文件存放在 campaign/{event_name}/ 目录下，
+每个 .py 文件对应一个关卡（如 a1.py, b1.py, sp.py）。
+"""
+
 import re
 
 from module.base.filter import Filter
@@ -7,9 +20,19 @@ STAGE_FILTER = Filter(regex=re.compile('^(.*?)$'), attr=('stage',))
 
 
 class EventStage:
-    """活动关卡文件的封装，从文件名提取关卡名称。"""
+    """活动关卡文件的封装，从文件名提取关卡名称。
+
+    Attributes:
+        filename (str): 关卡文件名。
+        stage (str): 提取出的关卡名称。
+    """
 
     def __init__(self, filename):
+        """初始化活动关卡对象。
+
+        Args:
+            filename (str): 关卡 Python 文件名。
+        """
         self.filename = filename
         # 从文件名中去掉 .py 后缀作为关卡名
         self.stage = 'unknown'

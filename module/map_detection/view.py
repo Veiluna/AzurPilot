@@ -1,3 +1,6 @@
+"""地图视图模块。定义 View 类继承 MapDetector，管理地图中所有网格的集合，
+提供网格查询、遍历、舰队位置计算和滑动偏移等功能。"""
+
 import collections
 import time
 
@@ -12,6 +15,20 @@ from module.map_detection.utils_assets import *
 
 
 class View(MapDetector):
+    """地图局部视野类。
+
+    管理当前屏幕视野中的所有网格对象，维护局部坐标系，
+    计算视野中心、滑动基准步长及滑动位移预测。
+
+    Attributes:
+        grids (dict[tuple[int, int], Grid]): 以局部坐标为键的网格字典。
+        shape (np.ndarray): 局部网格尺寸 (width, height)。
+        center_loca (tuple[int, int]): 视野中心对应的网格局部坐标。
+        center_offset (np.ndarray): 视野中心相对于网格中心的像素偏移。
+        swipe_base (np.ndarray): 单个网格对应的横向与纵向像素步长。
+        mode (str): 地图模式，'main' 或 'os'。
+        grid_class (type): 网格实例化类，默认为 Grid。
+    """
     grids: dict
     shape: np.ndarray
     center_loca: tuple
@@ -19,11 +36,12 @@ class View(MapDetector):
     swipe_base: np.ndarray
 
     def __init__(self, config, mode='main', grid_class=Grid):
-        """
+        """初始化地图局部视野对象。
+
         Args:
             config (AzurLaneConfig): 配置对象。
-            mode (str): 'main' 为普通碧蓝航线地图，'os' 为大世界。
-            grid_class: 网格类。
+            mode (str, optional): 'main' 为普通碧蓝航线地图，'os' 为大世界。默认为 'main'。
+            grid_class (type, optional): 网格类。默认为 Grid。
         """
         super().__init__(config)
         self.mode = mode
@@ -39,21 +57,33 @@ class View(MapDetector):
         return tuple(item) in self.grids
 
     def show(self):
+        """在日志中打印当前局部视野网格的状态矩阵。"""
         for y in range(self.shape[1] + 1):
             text = ' '.join([self[(x, y)].str if (x, y) in self else '..' for x in range(self.shape[0] + 1)])
             logger.info(text)
 
     def _image_clear_ui(self, image):
+        """应用 UI 蒙版清除遮挡区域。
+
+        Args:
+            image (np.ndarray): 原始输入图像。
+
+        Returns:
+            np.ndarray: 清除 UI 后的图像。
+        """
         if self.mode == 'os':
             return cv2.copyTo(image, ASSETS.ui_mask_os_in_map)
         else:
             return cv2.copyTo(image, ASSETS.ui_mask_in_map)
 
     def load(self, image):
-        """加载图像并构建局部视野地图。
+        """加载图像并构建局部视野网格系统。
 
         Args:
-            image: 截图图像。
+            image (np.ndarray): 截图图像。
+
+        Raises:
+            MapDetectionError: 未检测到网格或相机位于地图外时抛出。
         """
         image = self._image_clear_ui(np.array(image))
         self.image = image
@@ -107,7 +137,11 @@ class View(MapDetector):
 
     def update(self, image):
         """更新所有网格的图像。
+
         如果摄像机位置未变化，无需重新计算，仅更新图像即可。
+
+        Args:
+            image (np.ndarray): 新的屏幕截图。
         """
         image = self._image_clear_ui(image)
         self.image = image
@@ -116,7 +150,7 @@ class View(MapDetector):
             grid.image = image
 
     def select(self, **kwargs):
-        """根据属性筛选网格。
+        """根据属性条件筛选网格。
 
         Args:
             **kwargs: 网格属性键值对。
@@ -140,15 +174,11 @@ class View(MapDetector):
 
         Args:
             prev (View): 滑动前的 View 实例。
-            with_current_fleet (bool): 是否使用当前舰队的绿色箭头进行预测。
-            with_sea_grids (bool): 是否使用所有海洋网格进行预测。
-                注意此方法存在一定的错误率。
+            with_current_fleet (bool, optional): 是否使用当前舰队的绿色箭头进行预测。默认为 True。
+            with_sea_grids (bool, optional): 是否使用所有海洋网格进行预测。注意此方法存在一定的错误率。默认为 True。
 
         Returns:
-            tuple[int]: 偏移量 (x, y)。无法预测时返回 None。
-
-        Log:
-            Map swipe predict: (2, 0) (0.023s, current fleet match)
+            tuple[int, int] | None: 偏移量 (x, y)。无法预测时返回 None。
         """
         start_time = time.time()
         offset = np.subtract(self.center_loca, prev.center_loca)
@@ -168,8 +198,8 @@ class View(MapDetector):
                 diff = np.subtract(current_fleet[0].location, previous_fleet[0].location) - offset
                 # print(current_fleet[0].location, previous_fleet[0].location, offset, diff)
                 diff = tuple(diff.tolist())
-                logger.info(f'Map swipe predict: {diff} ({float2str(time.time() - start_time) + "s"}'
-                            f', current fleet match)')
+                logger.info(f'[地图检测-视图] 地图滑动预测: {diff} ({float2str(time.time() - start_time) + "s"}'
+                            f', 当前舰队匹配)')
                 return diff
 
         if with_sea_grids:
@@ -187,11 +217,11 @@ class View(MapDetector):
             # print(diff)
             if len(diff) == 1 \
                     or len(diff) >= 2 and diff[0][1] > diff[1][1]:
-                logger.info(f'Map swipe predict: {diff[0][0]} '
-                            f'({float2str(time.time() - start_time) + "s"}, {diff[0][1]} matches)')
+                logger.info(f'[地图检测-视图] 地图滑动预测: {diff[0][0]} '
+                            f'({float2str(time.time() - start_time) + "s"}, {diff[0][1]} 次匹配)')
                 return diff[0][0]
 
         # 无法预测
-        logger.info(f'Map swipe predict: None '
-                    f'({float2str(time.time() - start_time) + "s"}, no match)')
+        logger.info(f'[地图检测-视图] 地图滑动预测: 无 '
+                    f'({float2str(time.time() - start_time) + "s"}, 无匹配)')
         return None

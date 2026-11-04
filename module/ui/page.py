@@ -1,22 +1,58 @@
+"""UI 页面定义和导航图。
+
+定义碧蓝航线游戏中的所有 UI 页面及其导航关系。
+每个页面由一个检查按钮（check_button）标识，页面之间通过按钮点击建立链接。
+
+导航系统使用 A* 寻路算法找到从当前页面到目标页面的最短路径。
+导航图在运行时通过 `init_connection()` 动态构建。
+
+页面层次：
+- 主页面（page_main）：游戏主界面，所有功能的入口
+- 功能页面：战役、活动、商店、宿舍等
+- 子页面：关卡选择、舰队准备等
+
+使用示例:
+    >>> page_main.link(button=MAIN_GOTO_CAMPAIGN, destination=page_campaign)
+    >>> # 从任意页面导航到 page_campaign
+    >>> Page.init_connection(page_main)
+    >>> # 之后可通过 page.parent 沿路径回溯
+"""
+
 import traceback
 
 from module.coalition.assets import *
 from module.event_hospital.assets import HOSIPITAL_CHECK
 from module.freebies.assets import MAIL_ENTER
+from module.limit_challenge.assets import CHALLENGE_PREPARATION
 from module.raid.assets import *
 from module.retire.assets import DOCK_CHECK
+from module.secretary.assets import *
 from module.ui.assets import *
 from module.ui_white.assets import *
 import module.config.server as server
 
 
 class Page:
+    """UI 页面定义类。
+
+    每个 Page 实例代表游戏中的一个可导航页面。
+    通过 `link()` 方法建立页面间的导航关系，形成有向图。
+    `init_connection()` 使用 BFS 算法预计算从目标页面到所有源页面的最短路径。
+
+    Attributes:
+        all_pages (dict[str, Page]): 全局页面注册表，键为页面变量名。
+        check_button (Button): 页面标识按钮，用于检测当前是否在此页面。
+        links (dict[Page, Button]): 到达其他页面的链接，键为目标页面，值为点击按钮。
+        name (str): 页面变量名，如 'page_main'、'page_campaign'。
+        parent (Page | None): 在 A* 寻路中指向目标方向的父页面。
+    """
     # 键: str, 页面名称如 "page_main"
     # 值: Page, 页面实例
     all_pages = {}
 
     @classmethod
     def clear_connection(cls):
+        """清除所有页面的父级导航连接。"""
         for page in cls.all_pages.values():
             page.parent = None
 
@@ -46,14 +82,29 @@ class Page:
 
     @classmethod
     def iter_pages(cls):
+        """遍历所有已注册的页面。
+
+        Returns:
+            dict_values: 所有 Page 实例的集合视图。
+        """
         return cls.all_pages.values()
 
     @classmethod
     def iter_check_buttons(cls):
+        """生成所有页面的标识检查按钮。
+
+        Yields:
+            Button: 各页面的 check_button。
+        """
         for page in cls.all_pages.values():
             yield page.check_button
 
     def __init__(self, check_button):
+        """初始化 UI 页面实例。
+
+        Args:
+            check_button (Button | None): 用于检测当前是否在该页面的标识按钮。
+        """
         self.check_button = check_button
         self.links = {}
         (filename, line_number, function_name, text) = traceback.extract_stack()[-2]
@@ -71,6 +122,12 @@ class Page:
         return self.name
 
     def link(self, button, destination):
+        """建立从当前页面到目标页面的单向导航链接。
+
+        Args:
+            button (Button): 点击以跳转到目标页面的按钮。
+            destination (Page): 目标页面实例。
+        """
         self.links[destination] = button
 
 
@@ -91,6 +148,14 @@ page_campaign_menu.link(button=GOTO_MAIN, destination=page_main)
 page_campaign.link(button=GOTO_MAIN, destination=page_main)
 page_campaign.link(button=BACK_ARROW, destination=page_campaign_menu)
 page_fleet.link(button=GOTO_MAIN, destination=page_main)
+
+# 限界挑战与专用编队页，返回时不能误用每日出击入口。
+page_limit_challenge = Page(LIMIT_CHALLENGE_CHECK)
+page_campaign_menu.link(button=CAMPAIGN_MENU_GOTO_LIMIT_CHALLENGE, destination=page_limit_challenge)
+page_limit_challenge.link(button=BACK_ARROW, destination=page_campaign_menu)
+page_limit_challenge.link(button=GOTO_MAIN, destination=page_main)
+page_limit_challenge_preparation = Page(CHALLENGE_PREPARATION)
+page_limit_challenge_preparation.link(button=BACK_ARROW, destination=page_limit_challenge)
 
 # 主界面（白色主题）
 # 2024.05.22, 新 UI 中 MAIN_GOTO_CAMPAIGN_WHITE 是主界面最后显示的按钮
@@ -133,11 +198,11 @@ page_campaign_menu.link(button=CAMPAIGN_MENU_GOTO_EVENT, destination=page_sp)
 page_campaign.link(button=CAMPAIGN_GOTO_EVENT, destination=page_sp)
 
 # 联动活动
-# 霜冻行动
-# page_coalition = Page(FROSTFALL_COALITION_CHECK)
-# page_coalition.link(button=GOTO_MAIN, destination=page_main)
-# page_coalition.link(button=BACK_ARROW, destination=page_campaign_menu)
-# page_campaign_menu.link(button=CAMPAIGN_MENU_GOTO_EVENT, destination=page_coalition)
+# 恐怖故事
+page_coalition = Page(HORROR_COALITION_CHECK)
+page_coalition.link(button=GOTO_MAIN, destination=page_main)
+page_coalition.link(button=BACK_ARROW, destination=page_campaign_menu)
+page_campaign_menu.link(button=CAMPAIGN_MENU_GOTO_EVENT, destination=page_coalition)
 # 小学院
 # page_coalition_menu = Page(COALITION_ACADEMY_MAIN_CHECK)
 # page_coalition_menu.link(button=COALITION_ACADEMY_HOME, destination=page_main)
@@ -157,10 +222,10 @@ page_campaign.link(button=CAMPAIGN_GOTO_EVENT, destination=page_sp)
 # page_coalition.link(button=BACK_ARROW, destination=page_campaign_menu)
 # page_campaign_menu.link(button=CAMPAIGN_MENU_GOTO_EVENT, destination=page_coalition)
 # 时尚联动
-page_coalition = Page(FASHION_COALITION_CHECK)
-page_coalition.link(button=GOTO_MAIN, destination=page_main)
-page_coalition.link(button=BACK_ARROW, destination=page_campaign_menu)
-page_campaign_menu.link(button=CAMPAIGN_MENU_GOTO_EVENT, destination=page_coalition)
+# page_coalition = Page(FASHION_COALITION_CHECK)
+# page_coalition.link(button=GOTO_MAIN, destination=page_main)
+# page_coalition.link(button=BACK_ARROW, destination=page_campaign_menu)
+# page_campaign_menu.link(button=CAMPAIGN_MENU_GOTO_EVENT, destination=page_coalition)
 
 # 大世界
 page_os = Page(OS_CHECK)
@@ -222,8 +287,9 @@ page_main_white.link(button=MAIN_GOTO_EVENT_LIST_WHITE, destination=page_event_l
 # page_raid.link(button=GOTO_MAIN, destination=page_main)
 # page_main.link(button=MAIN_GOTO_RAID, destination=page_raid)
 # page_main_white.link(button=MAIN_GOTO_RAID_WHITE, destination=page_raid)
-# 新版（2026.02.12 后）
-page_raid = Page(RAID_CHECK)
+# 2026.02.12 之后
+# page_raid = Page(RAID_CHECK)
+page_raid = Page(RAID_CHECK_20260827)
 page_raid.link(button=GOTO_MAIN, destination=page_main)
 page_raid.link(button=BACK_ARROW, destination=page_campaign_menu)
 page_campaign_menu.link(button=CAMPAIGN_MENU_GOTO_EVENT, destination=page_raid)
@@ -274,6 +340,17 @@ page_dorm = Page(DORM_CHECK)
 page_dormmenu.link(button=DORMMENU_GOTO_DORM, destination=page_dorm)
 page_dorm.link(button=DORM_GOTO_MAIN, destination=page_main)
 
+# 秘书舰
+page_profile = Page(PROFILE_CHECK)
+page_secretary_group = Page(SECRETARY_GROUP_CHECK)
+# 经典主界面与新版白色主界面的头像都在左上角同一位置，点击即进入个人资料页；
+# 只给白色主界面建链接时，经典主界面无法导航到 page_profile，秘书舰任务卡死
+page_main.link(button=MAIN_GOTO_PROFILE, destination=page_profile)
+page_main_white.link(button=MAIN_GOTO_PROFILE, destination=page_profile)
+page_profile.link(button=SECRETARY_BUTTON, destination=page_secretary_group)
+page_secretary_group.link(button=BACK_ARROW, destination=page_profile)
+page_profile.link(button=BACK_ARROW, destination=page_main)
+
 # 指挥喵
 page_meowfficer = Page(MEOWFFICER_CHECK)
 page_dormmenu.link(button=DORMMENU_GOTO_MEOWFFICER, destination=page_meowfficer)
@@ -284,7 +361,7 @@ page_academy = Page(ACADEMY_CHECK)
 page_dormmenu.link(button=DORMMENU_GOTO_ACADEMY, destination=page_academy)
 page_academy.link(button=GOTO_MAIN, destination=page_main)
 
-# 私人休息室
+# 宿舍计划
 page_private_quarters = Page(PRIVATE_QUARTERS_CHECK)
 page_dormmenu.link(button=DORMMENU_GOTO_PRIVATE_QUARTERS, destination=page_private_quarters)
 page_private_quarters.link(button=PQ_GOTO_MAIN, destination=page_main)
@@ -357,13 +434,11 @@ page_hospital = Page(HOSIPITAL_CHECK)
 page_hospital.link(button=GOTO_MAIN_WHITE, destination=page_main)
 page_campaign_menu.link(button=CAMPAIGN_MENU_GOTO_EVENT, destination=page_hospital)
 
-# ISLAND
+# 寻宝活动/海岛活动（ISLAND）
 page_island = Page(ISLAND_CHECK)
 page_island_message = Page(DORMMENU_GOTO_ISLAND_MESSAGE)
 page_island_management = Page(ISLAND_MANAGEMENT_CHECK)
 page_island_postmanage = Page(ISLAND_POSTMANAGE_CHECK)
-page_island_shop = Page(ISLAND_SHOP_CHECK)
-page_island_shopping = Page(ISLAND_SHOPPING_CHECK)
 page_island_warehouse = Page(ISLAND_WAREHOUSE_CHECK)
 page_island_warehouse_filter = Page(ISLAND_WAREHOUSE_FILTER_CHECK)
 page_island_map = Page(ISLAND_MAP_CHECK)
@@ -371,12 +446,13 @@ page_island_visit = Page(ISLAND_VISIT_CHECK)
 page_island_mill = Page(ISLAND_MILL_CHECK)
 page_island_season = Page(ISLAND_SEASON_CHECK)
 page_island_phone = Page(ISLAND_PHONE_CHECK)
+# 岛屿科技页（岛屿生产规划器扫描科技树），跳转与返回沿用 ALAS
+page_island_technology = Page(ISLAND_TECHNOLOGY_CHECK)
 
 page_dormmenu.link(button=DORMMENU_GOTO_ISLAND, destination=page_island)
 page_island_message.link(button=DORMMENU_GOTO_ISLAND_MESSAGE, destination=page_island)
 page_island.link(button=ISLAND_GOTO_ISLAND_PHONE, destination=page_island_phone)
 page_island.link(button=ISLAND_GOTO_MANAGEMENT, destination=page_island_management)
-page_island.link(button=ISLAND_GOTO_SHOP, destination=page_island_shop)
 page_island_management.link(button=ISLAND_MANAGEMENT_GOTO_ISLAND, destination=page_island)
 page_island_management.link(button=ISLAND_MANAGEMENT_GOTO_POSTMANAGE, destination=page_island_postmanage)
 page_island_management.link(button=ISLAND_MANAGEMENT_GOTO_WAREHOUSE, destination=page_island_warehouse)
@@ -385,14 +461,15 @@ page_island_postmanage.link(button=ISLAND_POSTMANAGE_GOTO_MANAGEMENT, destinatio
 page_island_warehouse.link(button=ISLAND_WAREHOUSE_GOTO_WAREHOUSE_FILTER, destination=page_island_warehouse_filter)
 page_island_warehouse.link(button=ISLAND_WAREHOUSE_GOTO_MANAGEMENT, destination=page_island_management)
 page_island_warehouse_filter.link(button=ISLAND_WAREHOUSE_FILTER_GOTO_WAREHOUSE, destination=page_island_warehouse)
-page_island_shop.link(button=ISLAND_SHOP_GOTO_ISLAND, destination=page_island)
-page_island_shopping.link(button=ISLAND_SHOPPING_GOTO_SHOP, destination=page_island_shop)
 page_island.link(button=ISLAND_GOTO_MAP, destination=page_island_map)
 page_island_map.link(button=ISLAND_MAP_GOTO_ISLAND, destination=page_island)
 page_island_management.link(button=ISLAND_MANAGEMENT_GOTO_VISIT, destination=page_island_visit)
 page_island_visit.link(button=ISLAND_VISIT_GOTO_MANAGEMENT, destination=page_island_management)
 page_island_mill.link(button=ISLAND_MILL_GOTO_ISLAND, destination=page_island)
 page_island_season.link(button=ISLAND_SEASON_GOTO_ISLAND, destination=page_island)
+page_island.link(button=ISLAND_GOTO_ISLAND_TECHNOLOGY, destination=page_island_technology)
+page_island.link(button=ISLAND_GOTO_ISLAND_SEASON, destination=page_island_season)
+page_island_technology.link(button=BACK_ARROW_WHITE, destination=page_island)
 page_island_phone.link(button=ISLAND_PHONE_GOTO_MAIN, destination=page_main)
 page_island_phone.link(button=ISLAND_PHONE_GOTO_ISLAND, destination=page_island)
 page_island_phone.link(button=ISLAND_PHONE_GOTO_ISLAND_MANAGE, destination=page_island_management)

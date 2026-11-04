@@ -1,3 +1,9 @@
+"""造船厂系统 UI 全局资源定义。
+
+声明造船厂页面中使用的按钮网格和 OCR 识别器，包括角色头像网格、
+蓝图计数网格、系列选择网格，以及开发等级与天运拟合等级 OCR 数字识别器。
+"""
+
 from module.base.button import ButtonGrid
 from module.ocr.ocr import Digit
 from module.shipyard.assets import *

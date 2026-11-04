@@ -1,17 +1,51 @@
+"""配置系统更新器。
+
+配置系统的核心引擎，负责：
+- 读取 YAML 配置定义文件（task.yaml、argument.yaml、override.yaml、default.yaml）
+- 生成 Python 配置类（config_generated.py）
+- 生成参数定义文件（args.json、menu.json）
+- 生成国际化文件（i18n/*.json）
+- 生成配置模板（template.json）
+- 处理配置版本迁移和重定向
+- 管理活动/关卡数据的更新
+
+配置生成管道：
+    task.yaml + argument.yaml + override.yaml + default.yaml + gui.yaml
+    → args.json（合并后的完整参数定义）
+    → menu.json（菜单结构）
+    → config_generated.py（Python 配置类）
+    → template.json（配置模板）
+    → i18n/*.json（五种语言翻译文件）
+
+通过命令行调用：
+    uv run -m module.config.config_updater
+
+主要类：
+- ConfigUpdater: 配置更新和生成的基类
+- Event: 活动数据解析类
+- CampaignEvent: 战役活动配置管理
+"""
+
 import re
 import typing as t
 from copy import deepcopy
+from pathlib import Path
 
 from cached_property import cached_property
 
 from deploy.utils import DEPLOY_TEMPLATE, poor_yaml_read, poor_yaml_write
 from module.base.timer import timer
+from module.campaign.stage_name import normalize_event_stage
 from module.config.deep import deep_default, deep_get, deep_iter, deep_set
 from module.config.env import IS_ON_PHONE_CLOUD
+from module.config.fleet_legacy import LEGACY_PATHS
 from module.config.server import VALID_CHANNEL_PACKAGE, VALID_PACKAGE, VALID_SERVER_LIST, to_package, to_server
+from module.config.redirect_utils.shop import migrate_shop_options
+from module.config.task_priority import get_scheduler_tasks, merge_task_priority
 from module.config.utils import *
 from module.config.redirect_utils.utils import *
 
+# config_generated.py 的头部模板
 CONFIG_IMPORT = '''
 # 此文件是配置系统的更新器。
 # 负责读取配置定义、生成 config_generated.py 以及处理配置的版本迁移、i18n 生成等核心管理任务。
@@ -35,14 +69,79 @@ ARCHIVES_PREFIX = {
 MAINS = ['Main', 'Main2', 'Main3']
 EVENTS = ['Event', 'Event2', 'Event3', 'EventA', 'EventB', 'EventC', 'EventD', 'EventSp']
 GEMS_FARMINGS = ['GemsFarming', 'ThreeOilLowCost']
+# 根据关卡名在主线与所选活动之间切换的任务。
+MIXED_CAMPAIGNS = GEMS_FARMINGS + ['OperationHandover']
 RAIDS = ['Raid', 'RaidDaily', 'RaidScuttle']
 WAR_ARCHIVES = ['WarArchives']
-COALITIONS = ['Coalition', 'CoalitionSp']
+COALITIONS = ['Coalition', 'CoalitionSp', 'CoalitionScuttle']
 MARITIME_ESCORTS = ['MaritimeEscort']
 HOSPITAL = ['Hospital', 'HospitalEvent']
 
 
+def campaign_event_options(data, args):
+    """按实例包名读取各任务的活动候选，不修改共享元数据或全局服务器。"""
+    server = to_server(deep_get(data, 'Alas.Emulator.PackageName', 'cn'))
+    options = {}
+    for task in args:
+        candidates = deep_get(args, f'{task}.Campaign.Event.option_{server}')
+        if isinstance(candidates, list):
+            options[task] = candidates
+    return options
+
+
+def _event_stage_exists(folder, stage):
+    """Apply runtime event aliases before checking whether the selected map exists."""
+    if not isinstance(stage, str) or not stage.strip():
+        return False
+    name = re.sub(r'\s+', '', stage).lower()
+    name = re.sub(r'^([a-z]+)-(\d+)$', r'\1\2', name)
+    if name and name[0].isdigit():
+        name = 'campaign_' + name.replace('-', '_')
+    if name in ('d3-3', 'd3_3') and (folder / 'd3_3.py').is_file():
+        name = 'd3_3'
+    return (folder / (normalize_event_stage(name, folder.name) + '.py')).is_file()
+
+
+def refresh_campaign_events(data, args, is_template=False):
+    """刷新已结束的活动，避免旧关卡名指向新活动中不存在的地图。"""
+    options = campaign_event_options(data, args)
+    if not is_template:
+        for task in EVENTS + RAIDS + COALITIONS + MIXED_CAMPAIGNS:
+            candidates = options.get(task, [])
+            if candidates and deep_get(data, f'{task}.Campaign.Event', 'campaign_main') not in candidates:
+                deep_set(data, f'{task}.Campaign.Event', candidates[0])
+            if task in EVENTS and candidates:
+                event = deep_get(data, f'{task}.Campaign.Event', 'campaign_main')
+                folder = Path(__file__).resolve().parents[2] / 'campaign' / event
+                if folder.is_dir() and not _event_stage_exists(
+                        folder, deep_get(data, f'{task}.Campaign.Name')):
+                    # D3 can normalize to ht6 in a T-chapter event with no ht6.py.
+                    preferred = ('sp', 't1', 'a1', 'd3') if task == 'EventSp' else (
+                        't1', 'a1', 'd3', 'sp')
+                    fallback = next((name for name in preferred if (folder / (name + '.py')).is_file()), None)
+                    if fallback:
+                        deep_set(data, f'{task}.Campaign.Name', fallback.upper())
+    for task in WAR_ARCHIVES:
+        candidates = options.get(task, [])
+        if candidates and deep_get(data, f'{task}.Campaign.Event', 'campaign_main') == 'campaign_main':
+            deep_set(data, f'{task}.Campaign.Event', candidates[0])
+
+
 class Event:
+    """活动数据解析类。
+
+    从 campaign/Readme.md 中解析活动信息，包含：
+    - date: 活动日期
+    - directory: 活动目录名（如 'event_20230101_cn'）
+    - name: 活动英文名
+    - cn/en/jp/tw: 各服务器的活动名称
+
+    属性：
+        is_war_archives (bool): 是否为作战档案活动
+        is_raid (bool): 是否为突袭活动
+        is_coalition (bool): 是否为联动活动
+    """
+
     def __init__(self, text):
         self.date, self.directory, self.name, self.cn, self.en, self.jp, self.tw \
             = [x.strip() for x in text.strip('| \n').split('|')]
@@ -314,13 +413,16 @@ class ConfigGenerator:
                 v = deep_get(old, keys=k, default=d)
                 deep_set(new, keys=k, value=v)
 
-        # 菜单翻译
+        # 菜单翻译。空菜单分组也需要翻译，用于预留尚未实现内容的入口。
+        for task_group in self.task:
+            if task_group != 'Dashboard':
+                deep_load(['Menu', task_group])
+
         for path, data in deep_iter(self.task, depth=3):
             if 'tasks' not in path:
                 continue
             task_group, _, task = path
             if task_group != 'Dashboard':
-                deep_load(['Menu', task_group])
                 deep_load(['Task', task])
         # 参数翻译
         visited_group = set()
@@ -466,15 +568,6 @@ class ConfigGenerator:
                                   v
                    args.json -----+-----> args.json
         """
-        def is_concurrent_event(date1, date2):
-            if isinstance(date1, int):
-                date1 = str(date1)
-            if isinstance(date2, int):
-                date2 = str(date2)
-            d1 = datetime.strptime(date1, '%Y%m%d')
-            d2 = datetime.strptime(date2, '%Y%m%d')
-            return abs((d1 - d2).days) <= 30
-
         for server in ARCHIVES_PREFIX.keys():
             for event in self.event:
                 name = event.__getattribute__(server)
@@ -489,7 +582,7 @@ class ConfigGenerator:
                     if event.is_raid:
                         if not hasattr(self, f'_{server}_latest_raid_date'):
                             setattr(self, f'_{server}_latest_raid_date', int(event.date))
-                        if is_concurrent_event(int(event.date), getattr(self, f'_{server}_latest_raid_date')):
+                        if int(event.date) == getattr(self, f'_{server}_latest_raid_date'):
                             for task in RAIDS:
                                 insert(task)
                     elif event.is_war_archives:
@@ -498,17 +591,17 @@ class ConfigGenerator:
                     elif event.is_coalition:
                         if not hasattr(self, f'_{server}_latest_coalition_date'):
                             setattr(self, f'_{server}_latest_coalition_date', int(event.date))
-                        if is_concurrent_event(int(event.date), getattr(self, f'_{server}_latest_coalition_date')):
+                        if int(event.date) == getattr(self, f'_{server}_latest_coalition_date'):
                             for task in COALITIONS:
                                 insert(task)
                     else:
                         if not hasattr(self, f'_{server}_latest_event_date'):
                             setattr(self, f'_{server}_latest_event_date', int(event.date))
-                        if is_concurrent_event(int(event.date), getattr(self, f'_{server}_latest_event_date')):
-                            for task in EVENTS + GEMS_FARMINGS:
+                        if int(event.date) == getattr(self, f'_{server}_latest_event_date'):
+                            for task in EVENTS + MIXED_CAMPAIGNS:
                                 insert(task)
 
-        for task in EVENTS + GEMS_FARMINGS + WAR_ARCHIVES + RAIDS + COALITIONS:
+        for task in EVENTS + MIXED_CAMPAIGNS + WAR_ARCHIVES + RAIDS + COALITIONS:
             latest = {}
             for server in ARCHIVES_PREFIX.keys():
                 latest[server] = deep_get(self.args, keys=f'{task}.Campaign.Event.option_{server}', default=[])
@@ -521,6 +614,7 @@ class ConfigGenerator:
 
     @staticmethod
     def generate_deploy_template():
+        """根据基础模板生成各环境（国内镜像、AidLux、Docker、Linux）的部署配置模板。"""
         template = poor_yaml_read(DEPLOY_TEMPLATE)
         cn = {
             'Repository': 'git://git.pull/AzurPilot',
@@ -564,6 +658,7 @@ class ConfigGenerator:
         update('template-linux-cn', linux, cn)
 
     def insert_package(self):
+        """将支持的模拟器包名选项插入参数定义。"""
         option = deep_get(self.argument, keys='Emulator.PackageName.option')
         option += list(VALID_PACKAGE.keys())
         option += list(VALID_CHANNEL_PACKAGE.keys())
@@ -571,6 +666,7 @@ class ConfigGenerator:
         deep_set(self.args, keys='Alas.Emulator.PackageName.option', value=option)
 
     def insert_server(self):
+        """将支持的服务器名称选项插入参数定义。"""
         option = deep_get(self.argument, keys='Emulator.ServerName.option')
         server_list = []
         for server, _list in VALID_SERVER_LIST.items():
@@ -599,6 +695,22 @@ class ConfigGenerator:
 class ConfigUpdater:
     # 格式：source, target, (可选) convert_func
     redirection = [
+        ('FleetInfo', 'FleetInfo.FleetTraining.CheckIntervalHours', fleet_training_interval_redirect),
+        ('OpsiGeneral.OpsiGeneral.ActionPointCheckInterval',
+         'OpsiHazard1Leveling.OpsiHazard1Leveling.ActionPointCheckInterval'),
+        ('OpsiGeneral.OpsiGeneral.SkipStrategicSearchCheck',
+         'OpsiHazard1Leveling.OpsiHazard1Leveling.SkipStrategicSearchCheck'),
+        ('OpsiScheduling.OpsiSmartExplore.BuyActionPoint', 'OpsiScheduling.OpsiScheduling.BuyActionPoint'),
+        ('OpsiExplore.OpsiExplore.MeowfficerCleanup', 'OpsiExploreCleanup.Scheduler.Enable'),
+        ('OpsiExplore.OpsiFleet', 'OpsiExploreCleanup.OpsiFleet'),
+        ('OpsiExplore.OpsiExplore.MeowfficerCleanupState', 'OpsiExploreCleanup.OpsiExploreCleanup.State',
+         opsi_explore_cleanup_state_redirect),
+        # 保留旧开关的布尔值，关闭后不再保留任何推荐材料中的普通航母。
+        ('General.Enhance.SkipSingleCommonCV', 'General.Enhance.KeepCommonCV'),
+        ('OpsiAshBeacon.OpsiAshBeacon.OneHitMode', 'OpsiAshBeacon.OpsiAshBeacon.AssistRequestLimit',
+         meta_assist_limit_redirect),
+        ('OpsiHazard1Leveling.OpsiHazard1Leveling.RecordSeaMiles',
+         'OpsiHazard1Leveling.OpsiHazard1Leveling.RecordSeaMiles', sea_miles_interval_redirect),
         # ('OpsiDaily.OpsiDaily.BuySupply', 'OpsiShop.Scheduler.Enable'),
         # ('OpsiDaily.Scheduler.Enable', 'OpsiDaily.OpsiDaily.DoMission'),
         # ('OpsiShop.Scheduler.Enable', 'OpsiShop.OpsiShop.BuySupply'),
@@ -643,6 +755,28 @@ class ConfigUpdater:
         # 2025.06.26
         # ('Coalition.Coalition.Mode', 'Coalition.Coalition.Mode', coalition_to_little_academy),
     ]
+    redirection += [
+        (f'{task}.GemsFarming.ALLowHighFlagshipLevel', f'{task}.GemsFarming.AllowHighFlagshipLevel')
+        for task in [*GEMS_FARMINGS, 'Ambush11']
+    ]
+    redirection += [
+        (f'{task}.GemsFarming.ALLowLowVanguardLevel', f'{task}.GemsFarming.AllowLowVanguardLevel')
+        for task in [*GEMS_FARMINGS, 'Ambush11']
+    ]
+    # 旧版等级枚举（0/1/2）→ 布尔开关：0→false，1/2/3→true（等级已合并成同一个效率模式）。
+    # 放在此处迁移，使存量的数字值被清洗成布尔，避免复选框里留着数字。
+    redirection += [
+        ('OpsiHazard1Leveling.ExecuteFixedPatrolScan',
+         'OpsiHazard1Leveling.ExecuteFixedPatrolScan',
+         execute_fixed_patrol_scan_redirect),
+    ]
+    # 大世界掉落截图由单一开关拆成按任务分类的 8 个开关，旧值铺给每一个，
+    # 升级后各任务的截图行为与升级前保持一致。
+    redirection += [
+        ('Alas.DropRecord.OpsiRecord',
+         tuple(f'Alas.DropRecord.{arg}' for arg in OPSI_RECORD_ARGS),
+         opsi_record_redirect),
+    ]
 
     # redirection += [
     #     (
@@ -670,6 +804,16 @@ class ConfigUpdater:
             更新后的配置字典。
         """
         new = {}
+        # 保留尚未显式迁移的旧内容；不解析、不导入，也不作为分析数据源。
+        if not is_template:
+            missing = object()
+            for path in LEGACY_PATHS:
+                value = deep_get(old, path, missing)
+                if value is not missing:
+                    deep_set(new, path, deepcopy(value))
+        # 交易玩家身份不是可编辑参数，运行器迁移必须原样保留。
+        if not is_template and '_stockInstance' in old:
+            new['_stockInstance'] = old['_stockInstance']
 
         for keys, data in deep_iter(self.args, depth=3):
             # 跳过非字典项（叶子值，如字符串、数字等）
@@ -678,40 +822,15 @@ class ConfigUpdater:
             value = deep_get(old, keys=keys, default=data['value'])
             typ = data['type']
             display = data.get('display')
-            if is_template or value is None or value == '' \
+            value_empty = value == '' and not data.get('preserve_empty')
+            if is_template or value is None or value_empty \
                     or typ in ['lock', 'state'] or (display == 'hide' and typ != 'stored'):
                 value = data['value']
             value = parse_value(value, data=data)
             deep_set(new, keys=keys, value=value)
 
-        # 处理 AzurStatsID
-        if is_template:
-            deep_set(new, 'Alas.DropRecord.AzurStatsID', None)
-        else:
-            deep_default(new, 'Alas.DropRecord.AzurStatsID', random_id())
         # 更新到最新活动
-        server = to_server(deep_get(new, 'Alas.Emulator.PackageName', 'cn'))
-        if not is_template:
-            for task in EVENTS + RAIDS + COALITIONS:
-                opts = deep_get(self.args, keys=f'{task}.Campaign.Event.option_{server}', default=[])
-                if opts and not deep_get(new, keys=f'{task}.Campaign.Event', default='campaign_main') in opts:
-                    deep_set(new,
-                             keys=f'{task}.Campaign.Event',
-                             value=opts[0])
-
-            for task in ['GemsFarming']:
-                opts = deep_get(self.args, keys=f'{task}.Campaign.Event.option_{server}', default=[])
-                if opts and deep_get(new, keys=f'{task}.Campaign.Event', default='campaign_main') not in opts:
-                    deep_set(new,
-                             keys=f'{task}.Campaign.Event',
-                             value=opts[0])
-        # 作战档案不允许选择 campaign_main
-        for task in WAR_ARCHIVES:
-            opts = deep_get(self.args, keys=f'{task}.Campaign.Event.option_{server}', default=[])
-            if opts and deep_get(new, keys=f'{task}.Campaign.Event', default='campaign_main') == 'campaign_main':
-                deep_set(new,
-                         keys=f'{task}.Campaign.Event',
-                         value=opts[0])
+        refresh_campaign_events(new, self.args, is_template=is_template)
 
         # 活动不允许默认关卡 12-4
         def default_stage(t, stage):
@@ -723,8 +842,53 @@ class ConfigUpdater:
         for task in COALITIONS:
             default_stage(task, 'TC-3')
 
+        # 联动任务统一使用简单、普通、困难的关卡命名。
+        # 旧配置中的 TC-1/2/3 在加载时迁移，霜落活动会在运行时转换回内部编号。
+        if not is_template:
+            for task in COALITIONS:
+                stage_key = f'{task}.Coalition.Mode'
+                stage = deep_get(new, keys=stage_key)
+                stage = coalition_to_little_academy(stage)
+                deep_set(new, keys=stage_key, value=stage)
+
         if not is_template:
             new = self.config_redirect(old, new)
+            # 在 OpsiRecord 拆分后统一清洗旧档位；只保存的科研/委托按新三档迁移。
+            drop = deep_get(new, 'Alas.DropRecord')
+            old_drop = deep_get(old, 'Alas.DropRecord', {})
+            for arg in ('ResearchRecord', 'CommissionRecord'):
+                # parse_value 已将不再合法的旧选项替换成默认值，迁移时需读原值。
+                if old_drop.get(arg) == 'save':
+                    drop[arg] = 'save_and_upload'
+            for arg in (*OPSI_RECORD_ARGS, 'CombatRecord', 'MeowfficerTalent'):
+                value = old_drop.get(arg, drop[arg])
+                drop[arg] = 'save' if value in ('save', 'save_and_upload') else 'do_not'
+            old_priority = deep_get(old, 'General.YukikazeTaskManager.TaskPriorityAdjustment')
+            new_priority = deep_get(new, 'General.YukikazeTaskManager.TaskPriorityAdjustment')
+            template_priority = deep_get(
+                self.args, 'General.YukikazeTaskManager.TaskPriorityAdjustment.value'
+            )
+            if (
+                    isinstance(old_priority, str)
+                    and 'OpsiScheduling' not in old_priority
+                    and isinstance(new_priority, str)
+                    and new_priority == old_priority
+                    and old_priority.replace(
+                        '> OpsiCrossMonth\n> Commission > Tactical > Research',
+                        '> OpsiCrossMonth\n> OpsiScheduling\n> Commission > Tactical > Research',
+                    ) == template_priority
+            ):
+                deep_set(new, 'General.YukikazeTaskManager.TaskPriorityAdjustment', template_priority)
+            else:
+                deep_set(
+                    new,
+                    'General.YukikazeTaskManager.TaskPriorityAdjustment',
+                    merge_task_priority(new_priority, template_priority, get_scheduler_tasks(self.args)),
+                )
+        if not is_template:
+            new, shop_warnings = migrate_shop_options(old, new)
+            for task, reason in shop_warnings:
+                logger.warning(f'{task}：{reason}，已暂停任务，请检查购买配置后重新启用')
         new = self._override(new)
 
         return new
@@ -821,27 +985,6 @@ class ConfigUpdater:
         # 当修改侵蚀1的黄币保留时，同步到智能调度
         elif key == 'OpsiHazard1Leveling.OpsiHazard1Leveling.OperationCoinsPreserve':
             yield 'OpsiScheduling.OpsiScheduling.OperationCoinsPreserve', value
-        
-        # 智能调度与侵蚀1虚拟资产保留双向同步
-        if key == 'OpsiScheduling.OpsiScheduling.VirtualAssetPreserve':
-            yield 'OpsiHazard1Leveling.OpsiHazard1Leveling.PreserveVirtualAsset', value
-        elif key == 'OpsiHazard1Leveling.OpsiHazard1Leveling.PreserveVirtualAsset':
-            yield 'OpsiScheduling.OpsiScheduling.VirtualAssetPreserve', value
-        
-        # 智能调度与短猫行动力保留双向同步
-        # 只有当值 > 0 时才同步（值为0表示不覆盖，使用各任务自己的配置）
-        if key == 'OpsiScheduling.OpsiScheduling.ActionPointPreserve':
-            if value and int(value) > 0:
-                yield 'OpsiMeowfficerFarming.OpsiMeowfficerFarming.ActionPointPreserve', value
-        elif key == 'OpsiMeowfficerFarming.OpsiMeowfficerFarming.ActionPointPreserve':
-            if value and int(value) > 0:
-                yield 'OpsiScheduling.OpsiScheduling.ActionPointPreserve', value
-
-        # 注意：动态下拉菜单更新仅在 pywebio > 1.8.0 时可用
-        # elif key == 'Alas.Emulator.ScreenshotMethod' and value == 'nemu_ipc':
-        #     yield 'Alas.Emulator.ControlMethod', 'nemu_ipc'
-        # elif key == 'Alas.Emulator.ControlMethod' and value == 'nemu_ipc':
-        #     yield 'Alas.Emulator.ScreenshotMethod', 'nemu_ipc'
 
     def read_file(self, config_name, is_template=False):
         """

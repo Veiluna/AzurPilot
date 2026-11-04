@@ -1,3 +1,7 @@
+"""核心商店处理器，管理核心数据商品的过滤和购买。
+支持 2025-08-14 新 UI 布局，使用模板匹配识别商品。
+"""
+
 from module.base.decorator import cached_property
 from module.logger import logger
 from module.shop.assets import *
@@ -7,11 +11,6 @@ from module.shop.shop_status import ShopStatus
 
 
 class CoreShop_250814(ShopClerk, ShopStatus):
-    """核心商店处理器 (2025-08-14 新 UI)。
-
-    Pages: in: page_shop (core shop tab)
-    """
-
     shop_template_folder = './assets/shop/core'
 
     @cached_property
@@ -23,7 +22,7 @@ class CoreShop_250814(ShopClerk, ShopStatus):
         """
         return self.config.CoreShop_Filter.strip()
 
-    # 2025-08-14 新 UI
+    # New UI in 2025-08-14
     @cached_property
     def shop_core_items(self):
         """加载核心商店商品模板和配置。
@@ -64,7 +63,7 @@ class CoreShop_250814(ShopClerk, ShopStatus):
             int: 核心数据数量
         """
         self._currency = self.status_get_core()
-        logger.info(f'Core: {self._currency}')
+        logger.info(f'[商店-核心] 核心数据: {self._currency}')
         return self._currency
 
     def shop_interval_clear(self):
@@ -100,10 +99,13 @@ class CoreShop_250814(ShopClerk, ShopStatus):
 
         按照过滤器配置购买核心商店商品。
         """
+        # Base case; exit run if filter empty
         if not self.shop_filter:
             return
 
+        # When called, expected to be in
+        # correct Core Shop interface
         logger.hr('Core Shop', level=1)
 
-        # 执行购买操作
+        # Execute buy operations
         self.shop_buy()

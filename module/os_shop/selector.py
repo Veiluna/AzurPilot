@@ -1,4 +1,4 @@
-"""大世界商店物品筛选与选择逻辑。
+"""大世界商店+物品筛选与选择逻辑。
 
 基于正则表达式解析商品类型，并根据用户配置的过滤器决定购买行为。
 支持明石商店过滤和 OS 商店预设两种过滤模式。
@@ -6,7 +6,8 @@
 import re
 from typing import List
 from module.config.config_generated import GeneratedConfig
-from module.os_shop.preset import *
+from module.logger import logger
+from module.os_shop.preset import OS_SHOP
 from module.os_shop.item import OSShopItem as Item
 from module.base.filter import Filter
 
@@ -19,7 +20,7 @@ FILTER_REGEX = re.compile(
     '|tuning)'
 
     '(20|50|100|prototype|specialized|abyssal|obscure|full2|full|triple2|triple|2'
-    '|combat|offence|survival)?'
+    '|combat|offence|offense|survival)?'
 
     '(t[1-6])?$',
     flags=re.IGNORECASE)
@@ -81,7 +82,7 @@ class Selector():
         Returns:
             bool: 允许购买返回 True，CL1 模式下购买紫币返回 False。
         """
-        return not (self.is_cl1_enabled and item.name == 'PurpleCoins')
+        return not (self.is_cl1_mode_enabled and item.name == 'PurpleCoins')
 
     def check_item_count(self, item) -> bool:
         """检查物品计数是否有效。
@@ -93,6 +94,7 @@ class Selector():
             bool: 计数有效（当前数量 >= 1，总数量 >= 1，当前不超过总数）返回 True。
         """
         return item.count >= 1 and item.total_count >= 1 and item.count <= item.total_count
+
 
     def items_filter_in_akashi_shop(self, items) -> List[Item]:
         """过滤明石商店中可购买的物品。
@@ -106,7 +108,7 @@ class Selector():
             list[Item]: 可购买的物品列表。
         """
         items = self.pretreatment(items)
-        if getattr(self, 'is_in_task_cl1_leveling', False) and getattr(self, 'is_cl1_enabled', False):
+        if getattr(self, 'is_running_cl1_leveling', False):
             parser = self.config.OpsiHazard1Leveling_Cl1Filter
             if not parser:
                 parser = 'ActionPoint'
@@ -129,6 +131,8 @@ class Selector():
             list[Item]: 可购买的物品列表。
         """
         items = self.pretreatment(items)
+        if getattr(self, '_opsi_action_point_purchase', False):
+            return [item for item in items if item.group == 'actionpoint' and self.check_item_count(item)]
         preset = self.config.OpsiShop_PresetFilter
         parser = ''
         if preset == 'custom':

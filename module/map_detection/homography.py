@@ -1,3 +1,6 @@
+"""单应性变换模块。通过特征点匹配计算截图与地图模板之间的单应性矩阵，
+用于确定截图在地图中的位置和视角变换。"""
+
 import time
 
 import numpy as np
@@ -13,27 +16,28 @@ from module.map_detection.utils_assets import *
 
 
 class Homography:
-    """单应性变换。
+    """单应性变换检测器。
 
-    Examples:
-        hm = Homography(AzurLaneConfig('template'))
-        hm.load(image)
+    通过透视变换和特征匹配计算截图与地图网格之间的单应性映射，
+    用于快速精准确定截图在地图中的相对位置与视角变换。
 
-    Examples:
-        hm = Homography(AzurLaneConfig('template'))
-        storage = ((8, 3), [(80.773, 281.635), (1164.829, 281.635), (-20.123, 609.332), (1259.794, 609.332)])
-        hm.load_homography(storage=storage)
-        hm.detect(image)
-
-    Logs:
-                   tile_center: 0.968 (good match)
-        0.062s  _   edge_lines: 3 hori, 3 vert
-        Edges: /_    homo_loca: ( 26,  58)
+    Attributes:
+        image (np.ndarray): 输入的地图图像。
+        config (AzurLaneConfig): 配置对象。
+        left_edge (int | bool): 左边缘坐标或布尔标记。
+        right_edge (int | bool): 右边缘坐标或布尔标记。
+        lower_edge (int | bool): 下边缘坐标或布尔标记。
+        upper_edge (int | bool): 上边缘坐标或布尔标记。
+        homo_storage (tuple): 单应性变换的存储格式数据。
+        homo_data (np.ndarray): 单应性变换矩阵。
+        homo_invt (np.ndarray): 单应性逆变换矩阵。
+        homo_size (tuple): 变换后的输出尺寸。
+        homo_loca (np.ndarray): 单应性对齐位置坐标。
+        homo_loaded (bool): 是否已加载单应性数据。
+        map_inner (np.ndarray): 内部区域坐标。
+        _map_edge_count (tuple): 检测到的垂直和水平边缘线计数。
     """
 
-    """
-    输出
-    """
     image: np.ndarray
     config: AzurLaneConfig
     # 四条边缘线，bool 类型或具有 __bool__ 属性
@@ -42,9 +46,6 @@ class Homography:
     lower_edge: int
     upper_edge: int
 
-    """
-    私有属性
-    """
     homo_storage: tuple
     homo_data: np.ndarray
     homo_invt: np.ndarray
@@ -56,7 +57,8 @@ class Homography:
     _map_edge_count: tuple
 
     def __init__(self, config):
-        """
+        """初始化单应性变换检测器。
+
         Args:
             config (AzurLaneConfig): 配置对象。
         """
@@ -65,6 +67,7 @@ class Homography:
 
     @cached_property
     def ui_mask_homo_stroke(self):
+        """获取经单应性变换并腐蚀后的 UI 蒙版轮廓。"""
         if self.config.Scheduler_Command.startswith('Opsi'):
             mask = ASSETS.ui_mask_os
         else:
@@ -130,7 +133,7 @@ class Homography:
             overflow (bool): True 获取完整变换图像，False 仅获取有效区域。
         """
         self.homo_storage = (size, [(x, y) for x, y in np.round(src_pts, 3)])
-        logger.attr('homo_storage', self.homo_storage)
+        logger.attr('单应存储', self.homo_storage)
 
         # 生成透视变换数据
         src_pts = np.array(src_pts) - self.config.DETECTING_AREA[:2]
@@ -208,11 +211,11 @@ class Homography:
 
         # 日志输出
         time_cost = round(time.time() - start_time, 3)
-        logger.info('%ss  %s   edge_lines: %s hori, %s vert' % (
+        logger.info('[地图-单应性] %ss  %s   边缘线: %s 水平, %s 垂直' % (
             float2str(time_cost), '_' if self.lower_edge else ' ',
             self._map_edge_count[1], self._map_edge_count[0])
                     )
-        logger.info('Edges: %s%s%s   homo_loca: %s' % (
+        logger.info('[地图-单应性] 边缘: %s%s%s   单应位置: %s' % (
             '/' if self.left_edge else ' ', '_' if self.upper_edge else ' ', '\\' if self.right_edge else ' ',
             point2str(*self.homo_loca, length=3))
                     )
@@ -249,7 +252,7 @@ class Homography:
             message = 'bad match'
 
         # print(self.homo_loca % self.config.HOMO_TILE)
-        logger.attr_align('tile_center', f'{float2str(similarity)} ({message})')
+        logger.attr_align('瓦片中心', f'{float2str(similarity)} ({message})')
         return message != 'bad match'
 
     def search_tile_corner(self, image, threshold=0.8, encourage=1.0):
@@ -284,7 +287,7 @@ class Homography:
             message = 'bad match'
 
         # print(self.homo_loca % self.config.HOMO_TILE)
-        logger.attr_align('tile_corner', f'{float2str(similarity)} ({message})')
+        logger.attr_align('瓦片角点', f'{float2str(similarity)} ({message})')
         return message != 'bad match'
 
     def search_tile_rectangle(self, image, threshold=10, encourage=5.1, close_kernel=(5, 10, 15, 20, 25)):
@@ -328,7 +331,7 @@ class Homography:
             message = 'bad match'
 
         # print(self.homo_loca % self.config.HOMO_TILE)
-        logger.attr_align('tile_rectangle', f'{len(location)} rectangles ({message})')
+        logger.attr_align('瓦片矩形', f'{len(location)} 个矩形 ({message})')
         return message != 'bad match'
 
     def detect_edges(self, image, hough_th=120, theta_th=0.005, edge_th=9):
@@ -419,6 +422,13 @@ class Homography:
         return hori, vert
 
     def draw(self, lines=None, bg=None, expend=0):
+        """在图像上绘制透视线段并展示。
+
+        Args:
+            lines (Lines, optional): 待绘制的线段集合。默认为 None。
+            bg (np.ndarray, optional): 背景图像。默认为 None（使用 self.image）。
+            expend (int, optional): 边缘扩展像素数。默认为 0。
+        """
         if lines is None:
             hori, vert = self.to_perspective()
             lines = hori.add(vert)

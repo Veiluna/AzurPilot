@@ -1,3 +1,7 @@
+"""游戏设置提取器，从碧蓝航线 Lua 源代码中解析 PlayerPrefs 配置项。
+通过正则表达式匹配 GetInt/GetFloat/GetString 等调用，
+自动提取键名、类型和默认值。"""
+
 import os
 import re
 from dataclasses import dataclass
@@ -36,7 +40,14 @@ def _strip_code(string):
 
 
 def strip_code(string):
-    """拼接 _strip_code 生成器的输出为完整字符串。"""
+    """拼接 _strip_code 生成器的输出为完整字符串。
+
+    Args:
+        string (str): 包含括号的代码字符串。
+
+    Returns:
+        str: 剥离后的代码字符串。
+    """
     return ''.join(list(_strip_code(string)))
 
 

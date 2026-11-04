@@ -1,15 +1,144 @@
+"""委托信息解析模块。
+
+负责从委托界面截图中解析单条委托的全部属性，包括名称 OCR 识别、
+委托类型匹配、执行时长解析、状态判断和后缀图像提取。
+
+核心类 Commission 封装了一条委托的所有信息，并通过 @Config.when
+装饰器为 CN/EN/JP/TW 四个服务器分别实现不同的解析逻辑。
+
+本模块还定义了 COMMISSION_FILTER 过滤器实例，用于根据用户配置的
+规则（如 'daily_resource-01:30'）筛选和排序委托列表。
+
+依赖：
+    - module.base.filter: 正则过滤器框架
+    - module.ocr.ocr: OCR 文字识别（Duration、Ocr）
+    - module.commission.project_data: 各服务器的委托名称字典
+"""
+
 from datetime import datetime, timedelta
 
-import module.config.server as server
 from module.base.decorator import Config
 from module.base.filter import Filter
 from module.base.utils import *
 from module.commission.project_data import *
+from module.config.time_source import now as current_time
 from module.logger import logger
 from module.ocr.ocr import Duration, Ocr
 from module.reward.assets import *
 
-COMMISSION_FILTER = Filter(
+class CommissionFilter(Filter):
+    """支持价值分层和最短耗时兜底的委托过滤器。"""
+
+    def apply_first(self, objs, count, func=None):
+        """应用前若干条普通委托过滤规则。
+
+        ``tier`` 和 ``shortest`` 仅用于控制委托选择策略，不代表具体的
+        委托类型，因此不占用高价值过滤器数量。被多条规则匹配的同一委托
+        只返回一次。
+
+        Args:
+            objs: 待匹配委托。
+            count: 从过滤器开头选取的普通规则数量。
+            func: 额外可用性检查函数。
+
+        Returns:
+            list: 按过滤器优先级排列且去重后的匹配委托。
+        """
+        count = max(int(count), 0)
+        out = []
+        applied = 0
+        for raw, parsed in zip(self.filter_raw, self.filter):
+            if self.is_preset(raw):
+                continue
+            if applied >= count:
+                break
+            applied += 1
+
+            for obj in objs:
+                if obj in out:
+                    continue
+                if self.apply_filter_to_obj(obj=obj, filter=parsed):
+                    out.append(obj)
+
+        if func is not None:
+            out = [obj for obj in out if func(obj)]
+        return out
+
+    def apply_tiers(self, objs, func=None):
+        """把过滤结果按价值层级分组。
+
+        含 ``tier`` 时，相邻两个 ``tier`` 之间的规则属于同一价值层级，
+        层级内保留规则编号，用于计算稳定的有限层内价值；
+        不含 ``tier`` 的旧配置保持原行为，每条规则视为一个独立层级。
+        ``shortest`` 会把尚未匹配的可用委托放入当前位置对应的最低层级。
+        空层级和未匹配规则不会被压缩，避免候选价值随当前可见列表漂移。
+
+        Args:
+            objs: 待匹配委托。
+            func: 额外可用性检查函数。
+
+        Returns:
+            list[list[tuple[int, Commission]]]: 从高到低排列的委托层级，
+                元组首项是该层内稳定过滤器编号。
+        """
+        objs = [obj for obj in objs if func is None or func(obj)]
+        has_tier = any(raw.lower() == 'tier' for raw in self.filter_raw)
+        groups = []
+        shortest_group = None
+        matched = set()
+
+        if has_tier:
+            groups.append([])
+            filter_index = 0
+            for raw, parsed in zip(self.filter_raw, self.filter):
+                token = raw.lower()
+                if token == 'tier':
+                    groups.append([])
+                    filter_index = 0
+                    continue
+                if token == 'shortest':
+                    shortest_group = len(groups) - 1
+                    shortest_filter_index = filter_index
+                    filter_index += 1
+                    continue
+
+                for obj in objs:
+                    identity = id(obj)
+                    if identity in matched:
+                        continue
+                    if self.apply_filter_to_obj(obj=obj, filter=parsed):
+                        groups[-1].append((filter_index, obj))
+                        matched.add(identity)
+                filter_index += 1
+        else:
+            shortest_filter_index = 0
+            for raw, parsed in zip(self.filter_raw, self.filter):
+                token = raw.lower()
+                if token == 'tier':
+                    continue
+                groups.append([])
+                if token == 'shortest':
+                    shortest_group = len(groups) - 1
+                    continue
+
+                for obj in objs:
+                    identity = id(obj)
+                    if identity in matched:
+                        continue
+                    if self.apply_filter_to_obj(obj=obj, filter=parsed):
+                        groups[-1].append((0, obj))
+                        matched.add(identity)
+
+        if shortest_group is not None:
+            fallback = [obj for obj in objs if id(obj) not in matched]
+            fallback.sort(key=lambda obj: (obj.duration, obj.genre, obj.repeat_count))
+            groups[shortest_group].extend(
+                (shortest_filter_index, obj) for obj in fallback
+            )
+
+        return groups
+
+COMMISSION_FILTER = CommissionFilter(
     regex=re.compile(
         '(major|daily|extra|urgent|night)?'
         '-?'
@@ -19,40 +148,60 @@ COMMISSION_FILTER = Filter(
         '(\d\d?.\d\d?|\d\d?)?'
     ),
     attr=('category_str', 'genre_str', 'duration_hm', 'duration_hour'),
-    preset=('shortest', 'expire')
+    preset=('shortest', 'tier')
 )
 
 
-class SuffixOcr(Ocr):
-    """后缀 OCR 识别器，用于识别委托名称末尾的罗马数字后缀。
+def crop_suffix_image(image, area):
+    """裁剪委托名称右侧的罗马数字后缀图像。
 
-    预处理时裁剪掉图像右侧空白区域，只保留后缀部分以提高识别准确率。
+    Args:
+        image (np.ndarray): 游戏截图。
+        area (tuple[int, int, int, int]): 委托名称区域。
+
+    Returns:
+        np.ndarray | None: 后缀裁剪图，黑字白底；未检测到文字时返回 None。
     """
+    name_image = crop(image, area)
+    name_image = extract_letters(name_image, letter=(255, 255, 255), threshold=128).astype(np.uint8)
 
-    def pre_process(self, image):
-        """预处理图像，裁剪右侧空白区域以聚焦后缀字符。
+    line = cv2.reduce(name_image[5:-5, :], 0, cv2.REDUCE_AVG).flatten()
+    columns = np.where(line < 250)[0]
+    if not len(columns):
+        return None
 
-        通过检测每列像素最小值定位文本右边界，再向左回退若干像素
-        以确保完整保留后缀字符。日服字符较宽，需要更大的回退量。
+    # 从最右侧文字向左回看，尽量完整包含罗马数字后缀。
+    threshold = 250
+    look_back = 10
+    for i in range(columns[-1], 0, -1):
+        if line[i] > threshold:
+            if columns[-1] - i > look_back:
+                look_back = columns[-1] - i
+                break
 
-        Args:
-            image: 输入的灰度图像。
+    left = columns[-1] - look_back
+    right = columns[-1] + 1
+    x1, y1 = area[0:2]
+    suffix_area = area_offset((left - 3, -3, right + 3, name_image.shape[0] + 3), (x1, y1))
+    image = crop(image, suffix_area)
+    image = extract_letters(image, letter=(255, 255, 255), threshold=128).astype(np.uint8)
+    return image
 
-        Returns:
-            裁剪后的图像。
-        """
-        image = super().pre_process(image)
 
-        left = np.where(np.min(image[5:-5, :], axis=0) < 85)[0]
-        # 日服字符较宽，需要回退更多像素
-        if server.server in ['jp']:
-            look_back = 21
-        else:
-            look_back = 18
-        if len(left):
-            image = image[:, left[-1] - look_back:]
+def image_hash(image):
+    """计算图像哈希，用于日志输出。
 
-        return image
+    Args:
+        image (np.ndarray | None): 输入图像。
+
+    Returns:
+        str: 图像 MD5；图像为空时返回空字符串。
+    """
+    if image is None:
+        return ''
+
+    import hashlib
+    return hashlib.md5(image.tobytes()).hexdigest()
 
 
 class Commission:
@@ -68,9 +217,10 @@ class Commission:
     name: str
     # 委托名称是否解析成功
     valid: bool
-    # 罗马数字后缀，委托无后缀时可能识别错误
-    # 值: ⅠⅡⅢⅤⅣⅥ
-    suffix: str
+    # 裁剪出的后缀图像，黑字白底；无后缀时为 None
+    suffix_image: np.ndarray
+    # 后缀图像哈希，仅用于日志；无后缀时为空字符串
+    suffix_hash: str
     # 委托类型名称，定义在 project_data.py 中
     # 值: major_comm, daily_resource, urgent_cube, ...
     genre: str
@@ -79,8 +229,10 @@ class Commission:
     status: str
     # 委托执行时长
     duration: timedelta
-    # 过期时间，仅紧急委托有值，其他委托为 None
-    expire: timedelta
+    # 剩余可启动时间，仅紧急委托有值，其他委托为 0
+    available_time: timedelta
+    # 最晚可启动时刻，用于规划和跨截图稳定比较；非紧急委托为 None
+    deadline_time: datetime | None
     # 过滤器用分类
     # 值: major|daily|extra|urgent|night
     category_str: str
@@ -113,7 +265,11 @@ class Commission:
         if not self.duration.total_seconds():
             self.valid = False
 
-        self.create_time = datetime.now()
+        self.create_time = current_time()
+        self.deadline_time = (
+            (self.create_time + self.available_time).replace(microsecond=0)
+            if self.available_time else None
+        )
         self.repeat_count = 1
         self.category_str = 'unknown'
         self.genre_str = 'unknown'
@@ -121,8 +277,42 @@ class Commission:
         self.duration_hm = 'unknown'
         if self.valid:
             self.category_str, self.genre_str = self.genre.split('_', 1)
-            self.duration_hour = str(int(self.duration.total_seconds() / 36) / 100).strip('.0')
+            # 仅去掉整数小时的 .0 后缀，保留 0.5 的前导零和 10 的个位零。
+            self.duration_hour = str(int(self.duration.total_seconds() / 36) / 100).removesuffix('.0')
             self.duration_hm = str(self.duration).rsplit(':', 1)[0]
+
+    @property
+    def is_gem_commission(self):
+        """是否为钻石委托。
+
+        钻石委托是紧急委托中产出钻石化收益的一类（genre 为 'urgent_gem'），
+        需要单独跟踪运行状态，用于按完成时间匹配收益记录。
+
+        Returns:
+            bool: 是钻石委托返回 True，否则返回 False。
+        """
+        return self.valid and self.genre == 'urgent_gem'
+
+    def _commission_available_time_parse(self):
+        """识别紧急委托的剩余可启动时间。
+
+        Returns:
+            timedelta: 紧急委托的剩余有效时间；非紧急委托返回 0。
+        """
+        # 紧急委托在时长左侧有红色提示标记，先用颜色判断可避免无效 OCR。
+        area = area_offset((-49, 68, -45, 84), self.area[0:2])
+        button = Button(area=area, color=(189, 65, 66),
+                        button=area, name='IS_URGENT')
+        if not button.appear_on(self.image, threshold=30):
+            return timedelta(seconds=0)
+
+        area = area_offset((-49, 67, 45, 94), self.area[0:2])
+        button = Button(area=area, color=(), button=area, name='DEADLINE')
+        available_time = Duration(button).ocr(self.image)
+        if not available_time:
+            logger.warning('[委托-检测] 紧急委托可启动时间识别失败')
+            self.valid = False
+        return available_time
 
     @Config.when(SERVER='en')
     def commission_parse(self):
@@ -136,7 +326,7 @@ class Commission:
         # 名称识别——EN 服名称较长，使用更宽的裁剪区域
         area = area_offset((131, 23, 409, 53), self.area[0:2])
         button = Button(area=area, color=(), button=area, name='COMMISSION')
-        ocr = Ocr(button, lang='cnocr')
+        ocr = Ocr(button, lang='ppocr_v6')
         self.button = button
         result = ocr.ocr(self.image).upper()
         # 修正常见 OCR 识别错误
@@ -146,9 +336,9 @@ class Commission:
         self.name = result
         self.genre = self.commission_name_parse(self.name)
 
-        # 后缀识别
-        ocr = SuffixOcr(button, lang='azur_lane', letter=(255, 255, 255), threshold=128, alphabet='IV')
-        self.suffix = self.beautify_name(ocr.ocr(self.image))
+        # 后缀图像识别
+        self.suffix_image = crop_suffix_image(self.image, self.button.area)
+        self.suffix_hash = image_hash(self.suffix_image)
 
         # 执行时长
         area = area_offset((290, 68, 390, 95), self.area[0:2])
@@ -156,17 +346,8 @@ class Commission:
         ocr = Duration(button)
         self.duration = ocr.ocr(self.image)
 
-        # 过期时间——仅紧急委托有
-        area = area_offset((-49, 68, -45, 84), self.area[0:2])
-        button = Button(area=area, color=(189, 65, 66),
-                        button=area, name='IS_URGENT')
-        if button.appear_on(self.image, threshold=30):
-            area = area_offset((-49, 67, 45, 94), self.area[0:2])
-            button = Button(area=area, color=(), button=area, name='EXPIRE')
-            ocr = Duration(button)
-            self.expire = ocr.ocr(self.image)
-        else:
-            self.expire = timedelta(seconds=0)
+        # 剩余可启动时间——仅紧急委托有
+        self.available_time = self._commission_available_time_parse()
 
         # 状态识别——通过 RGB 颜色通道判断
         area = area_offset((179, 71, 187, 93), self.area[0:2])
@@ -198,9 +379,9 @@ class Commission:
         self.name = result
         self.genre = self.commission_name_parse(self.name)
 
-        # 后缀识别
-        ocr = SuffixOcr(button, lang='azur_lane', letter=(255, 255, 255), threshold=128, alphabet='IV')
-        self.suffix = self.beautify_name(ocr.ocr(self.image))
+        # 后缀图像识别
+        self.suffix_image = crop_suffix_image(self.image, self.button.area)
+        self.suffix_hash = image_hash(self.suffix_image)
 
         # 执行时长
         area = area_offset((290, 68, 390, 95), self.area[0:2])
@@ -208,17 +389,8 @@ class Commission:
         ocr = Duration(button)
         self.duration = ocr.ocr(self.image)
 
-        # 过期时间——仅紧急委托有
-        area = area_offset((-49, 68, -45, 84), self.area[0:2])
-        button = Button(area=area, color=(189, 65, 66),
-                        button=area, name='IS_URGENT')
-        if button.appear_on(self.image, threshold=30):
-            area = area_offset((-49, 67, 45, 94), self.area[0:2])
-            button = Button(area=area, color=(), button=area, name='EXPIRE')
-            ocr = Duration(button)
-            self.expire = ocr.ocr(self.image)
-        else:
-            self.expire = timedelta(seconds=0)
+        # 剩余可启动时间——仅紧急委托有
+        self.available_time = self._commission_available_time_parse()
 
         # 状态识别——通过 RGB 颜色通道判断
         area = area_offset((179, 71, 187, 93), self.area[0:2])
@@ -254,9 +426,9 @@ class Commission:
         self.name = result
         self.genre = self.commission_name_parse(self.name)
 
-        # 后缀识别
-        ocr = SuffixOcr(button, lang='azur_lane', letter=(255, 255, 255), threshold=128, alphabet='IV')
-        self.suffix = self.beautify_name(ocr.ocr(self.image))
+        # 后缀图像识别
+        self.suffix_image = crop_suffix_image(self.image, self.button.area)
+        self.suffix_hash = image_hash(self.suffix_image)
 
         # 执行时长
         area = area_offset((290, 68, 390, 95), self.area[0:2])
@@ -264,17 +436,8 @@ class Commission:
         ocr = Duration(button)
         self.duration = ocr.ocr(self.image)
 
-        # 过期时间——仅紧急委托有
-        area = area_offset((-49, 68, -45, 84), self.area[0:2])
-        button = Button(area=area, color=(189, 65, 66),
-                        button=area, name='IS_URGENT')
-        if button.appear_on(self.image, threshold=30):
-            area = area_offset((-49, 67, 45, 94), self.area[0:2])
-            button = Button(area=area, color=(), button=area, name='EXPIRE')
-            ocr = Duration(button)
-            self.expire = ocr.ocr(self.image)
-        else:
-            self.expire = timedelta(seconds=0)
+        # 剩余可启动时间——仅紧急委托有
+        self.available_time = self._commission_available_time_parse()
 
         # 状态识别——通过 RGB 颜色通道判断
         area = area_offset((179, 71, 187, 93), self.area[0:2])
@@ -292,7 +455,7 @@ class Commission:
     def commission_parse(self):
         """解析委托信息（CN 服务器，默认回退）。
 
-        CN 服后缀直接从名称末尾提取罗马数字，不使用独立 OCR。
+        CN 服同样裁剪名称右侧后缀图像，用于后续相似度匹配。
         解析内容：名称、后缀、时长、过期时间、状态。
         """
         # 名称识别
@@ -306,8 +469,9 @@ class Commission:
         self.name = result
         self.genre = self.commission_name_parse(self.name)
 
-        # 后缀——直接从名称末尾提取罗马数字
-        self.suffix = self.beautify_name(''.join(c for c in result[-4:] if c in 'IV'))
+        # 后缀图像识别
+        self.suffix_image = crop_suffix_image(self.image, self.button.area)
+        self.suffix_hash = image_hash(self.suffix_image)
 
         # 执行时长
         area = area_offset((290, 68, 390, 95), self.area[0:2])
@@ -315,17 +479,8 @@ class Commission:
         ocr = Duration(button)
         self.duration = ocr.ocr(self.image)
 
-        # 过期时间——仅紧急委托有
-        area = area_offset((-49, 68, -45, 84), self.area[0:2])
-        button = Button(area=area, color=(189, 65, 66),
-                        button=area, name='IS_URGENT')
-        if button.appear_on(self.image, threshold=30):
-            area = area_offset((-49, 67, 45, 94), self.area[0:2])
-            button = Button(area=area, color=(), button=area, name='EXPIRE')
-            ocr = Duration(button)
-            self.expire = ocr.ocr(self.image)
-        else:
-            self.expire = timedelta(seconds=0)
+        # 剩余可启动时间——仅紧急委托有
+        self.available_time = self._commission_available_time_parse()
 
         # 状态识别——通过 RGB 颜色通道判断
         area = area_offset((179, 71, 187, 93), self.area[0:2])
@@ -341,12 +496,12 @@ class Commission:
 
     def __str__(self):
         """返回委托的可读字符串表示，包含名称、类型、状态和时长。"""
-        name = f'{self.name} | {self.suffix}'
+        name = f'{self.name} | {self.suffix_hash}' if self.suffix_hash else self.name
         if not self.valid:
             return f'{name} (Invalid)'
         info = {'Genre': self.genre, 'Status': self.status, 'Duration': self.duration}
-        if self.expire:
-            info['Expire'] = self.expire
+        if self.available_time:
+            info['Deadline'] = self.deadline_time
         if self.repeat_count > 1:
             info['Repeat'] = self.repeat_count
         info = ', '.join([f'{k}: {v}' for k, v in info.items()])
@@ -355,14 +510,14 @@ class Commission:
     def __eq__(self, other):
         """判断两个委托是否为同一委托。
 
-        通过类型、状态、后缀、时长（允许 120 秒误差）、过期时间和重复次数
+        通过类型、状态、后缀、时长（允许 120 秒误差）、截止时间和重复次数
         进行综合比较。紧急物资委托还需匹配阵营标签（NYB/BIW）。
 
         Args:
-            other: 要比较的委托对象。
+            other (object): 要比较的委托对象。
 
         Returns:
-            是否为同一委托。
+            bool: 是否为同一委托。
         """
         if not isinstance(other, Commission):
             return False
@@ -372,7 +527,7 @@ class Commission:
         if self.genre != other.genre or self.status != other.status:
             return False
         if self.category_str == 'daily':
-            if self.suffix != other.suffix:
+            if not self.suffix_match(other):
                 return False
         if self.genre == 'urgent_box':
             for tag in ['NYB', 'BIW']:
@@ -382,14 +537,17 @@ class Commission:
                     return False
         if (other.duration < self.duration - threshold) or (other.duration > self.duration + threshold):
             return False
-        if (not self.expire and other.expire) or (self.expire and not other.expire):
+        if (self.deadline_time is None) != (other.deadline_time is None):
             return False
-        if self.expire and other.expire:
-            if (other.expire < self.expire - threshold) or (other.expire > self.expire + threshold):
+        if self.deadline_time is not None and other.deadline_time is not None:
+            if (
+                other.deadline_time < self.deadline_time - threshold
+                or other.deadline_time > self.deadline_time + threshold
+            ):
                 return False
         if self.repeat_count != other.repeat_count:
             return False
-        if self.genre in ['extra_oil', 'night_oil'] and self.suffix != other.suffix:
+        if self.genre in ['extra_oil', 'night_oil'] and not self.suffix_match(other):
             return False
 
         return True
@@ -398,20 +556,60 @@ class Commission:
         """返回委托的哈希值，基于类型和名称。"""
         return hash(f'{self.genre}_{self.name}')
 
+    def suffix_match(self, other, similarity=0.75):
+        """判断两个委托的后缀图像是否匹配。
+
+        Args:
+            other (Commission): 要比较的委托对象。
+            similarity (float): 相似度阈值，范围 0-1。
+
+        Returns:
+            bool: 后缀是否匹配。
+        """
+        if self.suffix_image is None and other.suffix_image is None:
+            return True
+        if self.suffix_image is None or other.suffix_image is None:
+            return False
+
+        def match(image, template):
+            template = crop(template, (3, 3, template.shape[1] - 3, template.shape[0] - 3), copy=False)
+            if image.shape[0] < template.shape[0] or image.shape[1] < template.shape[1]:
+                return 0.0
+
+            res = cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
+            _, sim, _, _ = cv2.minMaxLoc(res)
+            return sim
+
+        sim = max(
+            match(self.suffix_image, other.suffix_image),
+            match(other.suffix_image, self.suffix_image)
+        )
+        return sim >= similarity
+
     def parse_time(self, string):
         """解析时间字符串为 timedelta 对象。
 
         Args:
-            string: 时间字符串，格式如 '01:00:00', '05:47:10', '17:50:51'。
+            string (str): 时间字符串，格式如 '01:00:00', '05:47:10', '17:50:51'。
 
         Returns:
-            解析后的 timedelta 实例，解析失败时返回 None。
+            timedelta | None: 解析后的 timedelta 实例，解析失败时返回 None。
         """
         # OCR 常将 0 识别为 D，此处修正
         string = string.replace('D', '0')
         result = re.search('(\d+):(\d+):(\d+)', string)
         if not result:
-            logger.warning(f'Invalid time string: {string}')
+            logger.warning(f'无效的时间字符串: {string}')
+            self.valid = False
+            return None
+        else:
+            result = [int(s) for s in result.groups()]
+            return timedelta(hours=result[0], minutes=result[1], seconds=result[2])
+        # OCR 常将 0 识别为 D，此处修正
+        string = string.replace('D', '0')
+        result = re.search('(\d+):(\d+):(\d+)', string)
+        if not result:
+            logger.warning(f'无效的时间字符串: {string}')
             self.valid = False
             return None
         else:
@@ -437,7 +635,7 @@ class Commission:
                 if keyword in string:
                     return key
 
-        logger.warning(f'Name with unknown genre: {string}')
+        logger.warning(f'未知类型的名称: {string}')
         self.valid = False
         return ''
 
@@ -470,7 +668,7 @@ class Commission:
         if min_distance < 3:
             return min_key
 
-        logger.warning(f'Name with unknown genre: {string}')
+        logger.warning(f'未知类型的名称: {string}')
         self.valid = False
         return ''
 
@@ -493,7 +691,7 @@ class Commission:
                 if keyword in string:
                     return key
 
-        logger.warning(f'Name with unknown genre: {string}')
+        logger.warning(f'未知类型的名称: {string}')
         self.valid = False
         return ''
 
@@ -516,7 +714,7 @@ class Commission:
                 if keyword in string:
                     return key
 
-        logger.warning(f'Name with unknown genre: {string}')
+        logger.warning(f'未知类型的名称: {string}')
         self.valid = False
         return ''
 
@@ -546,7 +744,9 @@ class Commission:
         """将委托状态设为运行中，并将创建时间重置为当前时间。"""
         if self.valid:
             self.status = 'running'
-            self.create_time = datetime.now()
+            self.create_time = current_time()
+            self.available_time = timedelta(seconds=0)
+            self.deadline_time = None
 
     @property
     def finish_time(self):

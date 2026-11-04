@@ -1,13 +1,17 @@
-# 此文件实现了基于 uiautomator2 的设备交互逻辑。
-# 包含截图、模拟点击、长按、滑动、层级提取（dump）等控制移动端设备的核心操作。
+"""基于 uiautomator2 的设备交互与控制实现模块。
+
+提供 Uiautomator2 类，封装了通过 uiautomator2 进行截图、输入控制、应用管理、
+无障碍节点提取（UI dump）、后台进程管理等核心功能。
+"""
+
 import base64
-import time
 import typing as t
 from dataclasses import dataclass
-from functools import wraps
+from functools import partial
 from json.decoder import JSONDecodeError
 from subprocess import list2cmdline
 
+import requests
 import uiautomator2 as u2
 from adbutils.errors import AdbError
 from lxml import etree
@@ -15,107 +19,52 @@ from lxml import etree
 from module.base.utils import *
 from module.config.server import DICT_PACKAGE_TO_ACTIVITY
 from module.device.connection import Connection
-from module.device.method.utils import (ImageTruncated, PackageNotInstalled, RETRY_TRIES, handle_adb_error,
-                                        handle_unknown_host_service, possible_reasons, retry_sleep)
+from module.device.method.retry import retry_backend, recover_adb, recover_truncated_image, recover_unknown
+from module.device.method.utils import ImageTruncated, PackageNotInstalled, handle_adb_error, possible_reasons
 from module.exception import EmulatorNotRunningError, RequestHumanTakeover
 from module.logger import logger
 
 
-def retry(func):
-    @wraps(func)
-    def retry_wrapper(self, *args, **kwargs):
-        """
-        Args:
-            self (Uiautomator2):
-        """
-        init = None
-        for _ in range(RETRY_TRIES):
-            try:
-                if callable(init):
-                    time.sleep(retry_sleep(_))
-                    init()
-                return func(self, *args, **kwargs)
-            # 不可处理
-            except RequestHumanTakeover:
-                break
-            # adb server 被终止时
-            except ConnectionResetError as e:
-                logger.error(e)
+def _retry_recover(self, error, trial):
+    if isinstance(error, (ConnectionResetError, AdbError)):
+        return recover_adb(self, error)
+    if isinstance(error, requests.exceptions.ConnectionError):
+        logger.error(error)
+        # atx-agent 中断需要重装并等待就绪，其余连接丢失只重连 ADB。
+        if 'Connection aborted' in str(error):
+            return self.install_uiautomator2
+        return self.adb_reconnect
+    if isinstance(error, JSONDecodeError):
+        logger.error(error)
+        return self.install_uiautomator2
+    if isinstance(error, RuntimeError):
+        return self.adb_reconnect if handle_adb_error(error) else None
+    if isinstance(error, AssertionError):
+        logger.exception(error)
+        possible_reasons('如果使用 BlueStacks、雷电模拟器或 WSA，请在模拟器设置中启用 ADB')
+        return None
+    if isinstance(error, PackageNotInstalled):
+        logger.error(error)
+        return self.detect_package
+    if isinstance(error, ImageTruncated):
+        return recover_truncated_image(self, error)
+    return recover_unknown(error)
 
-                def init():
-                    self.adb_reconnect()
-            # 在 `device.set_new_command_timeout(604800)` 时
-            # json.decoder.JSONDecodeError: Expecting value: line 1 column 2 (char 1)
-            except JSONDecodeError as e:
-                logger.error(e)
 
-                def init():
-                    self.install_uiautomator2()
-            # AdbError
-            except AdbError as e:
-                if handle_adb_error(e):
-                    def init():
-                        self.adb_reconnect()
-                elif handle_unknown_host_service(e):
-                    def init():
-                        self.adb_start_server()
-                        self.adb_reconnect()
-                else:
-                    break
-            # RuntimeError: USB device 127.0.0.1:5555 is offline
-            except RuntimeError as e:
-                if handle_adb_error(e):
-                    def init():
-                        self.adb_reconnect()
-                else:
-                    break
-            # 在 `assert c.read string(4) == _OKAY` 时
-            # 模拟器未启用 ADB
-            except AssertionError as e:
-                logger.exception(e)
-                possible_reasons(
-                    '如果你使用的是 BlueStacks、雷电模拟器或 WSA，'
-                    '请在模拟器设置中启用 ADB'
-                )
-                break
-            # 包未安装
-            except PackageNotInstalled as e:
-                logger.error(e)
-
-                def init():
-                    self.detect_package()
-            # 图像截断
-            except ImageTruncated as e:
-                from module.device.method.utils import handle_image_truncated
-                handle_image_truncated(self, e)
-
-                def init():
-                    pass
-            # 不可处理 - 必须向上抛出以触发模拟器重启
-            except EmulatorNotRunningError:
-                raise
-            # 未知异常
-            except Exception as e:
-                logger.exception(e)
-
-                def init():
-                    pass
-
-        if func.__name__ in [
-            '_app_start_u2_am', '_app_start_u2_monkey',
-            'screenshot_uiautomator2',
-        ]:
-            logger.critical(f'Retry {func.__name__}() failed')
-            raise EmulatorNotRunningError
-
-        logger.critical(f'Retry {func.__name__}() failed')
-        raise RequestHumanTakeover
-
-    return retry_wrapper
+retry = partial(retry_backend, recover=_retry_recover, label='设备-U2')
 
 
 @dataclass
 class ProcessInfo:
+    """Android 设备进程信息数据类。
+
+    Attributes:
+        pid (int): 进程 ID。
+        ppid (int): 父进程 ID。
+        thread_count (int): 线程数量。
+        cmdline (str): 命令行字符串。
+        name (str): 进程名称。
+    """
     pid: int
     ppid: int
     thread_count: int
@@ -125,13 +74,20 @@ class ProcessInfo:
 
 @dataclass
 class ShellBackgroundResponse:
+    """后台执行 Shell 命令的响应数据类。
+
+    Attributes:
+        success (bool): 是否成功启动。
+        pid (int): 启动的后台进程 ID。
+        description (str): 响应描述信息。
+    """
     success: bool
     pid: int
     description: str
 
 
 class Uiautomator2(Connection):
-    @retry
+    @retry(on_exhausted=EmulatorNotRunningError)
     def screenshot_uiautomator2(self):
         image = self.u2.screenshot(format='raw')
         # 防止 None/空响应
@@ -195,18 +151,19 @@ class Uiautomator2(Connection):
             x, y, second = data
             if index == 0:
                 self.u2.touch.down(x, y)
-                logger.info(point2str(x, y) + ' down')
+                logger.info(point2str(x, y) + ' 按下')
             elif index - length == -1:
                 self.u2.touch.up(x, y)
-                logger.info(point2str(x, y) + ' up')
+                logger.info(point2str(x, y) + ' 抬起')
             else:
                 self.u2.touch.move(x, y)
-                logger.info(point2str(x, y) + ' move')
+                logger.info(point2str(x, y) + ' 移动')
             self.sleep(second)
 
     def drag_uiautomator2(self, p1, p2, segments=1, shake=(0, 15), point_random=(-10, -10, 10, 10),
-                          shake_random=(-5, -5, 5, 5), swipe_duration=0.25, shake_duration=0.1):
-        """拖拽并抖动，示意如下:
+                          shake_random=(-5, -5, 5, 5), swipe_duration=0.25, shake_duration=0.1,
+                          hold_duration=0.0):
+        r"""拖拽并抖动，示意如下:
                      /\
         +-----------+  +  +
                         \/
@@ -222,6 +179,7 @@ class Uiautomator2(Connection):
             shake_random: 为抖动数组添加随机偏移。
             swipe_duration: 路径点之间的间隔时间。
             shake_duration: 抖动点之间的间隔时间。
+            hold_duration: 松开前的持续按住时间。
         """
         p1 = np.array(p1) - random_rectangle_point(point_random)
         p2 = np.array(p2) - random_rectangle_point(point_random)
@@ -231,10 +189,40 @@ class Uiautomator2(Connection):
             (*p2 - shake - random_rectangle_point(shake_random), shake_duration),
             (*p2, shake_duration)
         ]
+        internal_hold = ensure_time(shake_duration) * 3
+        hold_duration = ensure_time(hold_duration) - internal_hold
+        if hold_duration > 0:
+            path += [
+                (*p2, hold_duration),
+                (*p2, 0),
+            ]
         path = [(int(x), int(y), d) for x, y, d in path]
         self._drag_along(path)
 
     @retry
+    def island_swipe_hold_uiautomator2(self, p1, p2, hold_time):
+        """岛屿行走专用：按下 → 移动到偏移点 → 保持 hold_time 毫秒 → 抬起。
+
+        不走 drag_uiautomator2 的多点路径：uiautomator2 每个触点操作都是一次
+        HTTP 往返，路径点越多、每点还带 swipe_duration，整段手势会被拉长很多
+        （表现为"同样的时长走得更远"）。这里只用手势原语 + 本地 sleep。
+
+        Args:
+            p1 (tuple): 摇杆中心。
+            p2 (tuple): 偏移点。
+            hold_time (int, float): 保持时间，单位毫秒。
+        """
+        try:
+            self.u2.touch.down(*p1)
+            self.u2.touch.move(*p2)
+            self.sleep(hold_time / 1000)
+        finally:
+            try:
+                self.u2.touch.up(*p2)
+            except Exception as error:
+                logger.warning(f'[设备-U2] 岛屿行走抬手失败: {error}')
+
+    @retry(on_exhausted=EmulatorNotRunningError)
     def app_current_uiautomator2(self):
         """
         Returns:
@@ -243,7 +231,7 @@ class Uiautomator2(Connection):
         result = self.u2.app_current()
         return result['package']
 
-    @retry
+    @retry(on_exhausted=EmulatorNotRunningError)
     def _app_start_u2_monkey(self, package_name=None, allow_failure=False):
         """
         Args:
@@ -277,7 +265,7 @@ class Uiautomator2(Connection):
             # ## Network stats: elapsed time=4ms (0ms mobile, 0ms wifi, 4ms not connected)
             return True
 
-    @retry
+    @retry(on_exhausted=EmulatorNotRunningError)
     def _app_start_u2_am(self, package_name=None, activity_name=None, allow_failure=False):
         """
         Args:
@@ -326,7 +314,7 @@ class Uiautomator2(Connection):
         # 已在运行
         # Warning: Activity not started, intent has been delivered to currently running top-most instance.
         if 'Warning: Activity not started' in ret.output:
-            logger.info('App activity is already started')
+            logger.info('应用Activity已启动')
             return True
         # Starting: Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] cmp=com.YoStarEN.AzurLane/com.manjuu.azurlane.MainActivity }
         # java.lang.SecurityException: Permission Denial: starting Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10000000 cmp=com.YoStarEN.AzurLane/com.manjuu.azurlane.MainActivity } from null (pid=5140, uid=2000) not exported from uid 10064
@@ -344,7 +332,7 @@ class Uiautomator2(Connection):
                 return False
             else:
                 logger.error(ret)
-                logger.error('Permission Denial while starting app, probably because activity invalid')
+                logger.error('启动应用时权限拒绝，可能Activity无效')
                 return False
         # 成功
         # Starting: Intent...
@@ -383,10 +371,10 @@ class Uiautomator2(Connection):
         if self._app_start_u2_am(package_name, activity_name, allow_failure):
             return True
 
-        logger.error('app_start_uiautomator2: All trials failed')
+        logger.error('[设备-U2] 所有尝试失败')
         return False
 
-    @retry
+    @retry(on_exhausted=EmulatorNotRunningError)
     def app_stop_uiautomator2(self, package_name=None):
         if not package_name:
             package_name = self.package
@@ -400,7 +388,7 @@ class Uiautomator2(Connection):
         return hierarchy
 
     def uninstall_uiautomator2(self):
-        logger.info('Removing uiautomator2')
+        logger.info('[设备-U2] 移除uiautomator2')
         for file in [
             'app-uiautomator.apk',
             'app-uiautomator-test.apk',
@@ -413,11 +401,76 @@ class Uiautomator2(Connection):
     @retry
     def resolution_uiautomator2(self, cal_rotation=True) -> t.Tuple[int, int]:
         """
-        比 u2.window_size() 更快，因为后者会调用两次 `dumpsys display`。
+        获取设备的有效分辨率，优先通过 ADB wm size 获取（支持 wm size override），
+        回退到 uiautomator2 /info 接口。
+
+        当用户通过 `adb shell wm size 720x1280` 设置了覆盖分辨率时，
+        uiautomator2 /info 接口仍返回物理分辨率（如 1080x2400），
+        而 ADB wm size 能正确报告 Override size。
 
         Returns:
             (width, height)
         """
+        # 优先使用 ADB wm size，支持 override 分辨率
+        lines = []
+        result = ''
+        try:
+            result = self.adb_shell(['wm', 'size'])
+            lines = result.strip().split('\n')
+        except Exception:
+            logger.warning('[设备-U2] 执行adb shell wm size失败，回退到u2 /info')
+
+        if lines:
+            w, h = None, None
+            import re
+            size_pattern = re.compile(r'^(\d+)x(\d+)$')
+
+            # 优先读取 Override size（用户通过 wm size 设置的值）
+            for line in lines:
+                line = line.strip()
+                if 'Override size:' in line:
+                    try:
+                        size_str = line.split(':', 1)[1].strip()
+                        m = size_pattern.match(size_str)
+                        if m:
+                            w, h = int(m.group(1)), int(m.group(2))
+                            break
+                    except (ValueError, IndexError):
+                        continue
+
+            if w is None:
+                # 没有 Override，尝试 Physical size 行或裸分辨率行
+                for line in lines:
+                    line = line.strip()
+                    try:
+                        if 'Physical size:' in line:
+                            size_str = line.split(':', 1)[1].strip()
+                            m = size_pattern.match(size_str)
+                            if m:
+                                w, h = int(m.group(1)), int(m.group(2))
+                                break
+                        elif size_pattern.match(line):
+                            # 旧版 Android 仅输出 "1080x2400"
+                            m = size_pattern.match(line)
+                            if m:
+                                w, h = int(m.group(1)), int(m.group(2))
+                                break
+                    except (ValueError, IndexError):
+                        continue
+
+            if w is not None and h is not None:
+                if cal_rotation:
+                    rotation = self.get_orientation()
+                    if (w > h) != (rotation % 2 == 1):
+                        w, h = h, w
+                return w, h
+
+            logger.warning(
+                'Failed to parse resolution from ADB wm size, fallback to u2 /info. '
+                f'Raw output: {result!r}'
+            )
+
+        # 回退到 uiautomator2 /info 接口
         info = self.u2.http.get('/info').json()
         w, h = info['display']['width'], info['display']['height']
         if cal_rotation:
@@ -438,14 +491,14 @@ class Uiautomator2(Connection):
             RequestHumanTakeover: 分辨率不是 1280x720 时抛出
         """
         width, height = self.resolution_uiautomator2()
-        logger.attr('Screen_size', f'{width}x{height}')
+        logger.attr('屏幕尺寸', f'{width}x{height}')
         if width == 1280 and height == 720:
             return (width, height)
         if width == 720 and height == 1280:
             return (width, height)
 
-        logger.critical(f"大叔，你看着分辨率对吗: {width}x{height}。真是个连分辨率都不会设的杂鱼呢❤")
-        logger.critical("乖乖给我改成 1280x720 哦，不然我可不理你了❤")
+        logger.critical(f"[设备-U2] 大叔，你看着分辨率对吗: {width}x{height}。真是个连分辨率都不会设的杂鱼呢❤")
+        logger.critical("[设备-U2] 乖乖给我改成 1280x720 哦，不然我可不理你了❤")
         raise RequestHumanTakeover
 
     @retry

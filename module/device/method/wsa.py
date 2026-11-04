@@ -1,79 +1,43 @@
+"""WSA（Windows Subsystem for Android）截图与控制后端模块。
+
+继承 Connection，封装 WSA 特有的多显示屏检测（display id）、应用启动、前台应用检测和屏幕分辨率重置逻辑。
+"""
+
 import re
-import time
-from functools import wraps
+from functools import partial
 
 from adbutils.errors import AdbError
 
 from module.device.connection import Connection
-from module.device.method.utils import (PackageNotInstalled, RETRY_TRIES, handle_adb_error, handle_unknown_host_service,
-                                        retry_sleep)
-from module.exception import RequestHumanTakeover
+from module.device.method.retry import retry_backend, recover_adb, recover_unknown
+from module.device.method.utils import PackageNotInstalled
 from module.logger import logger
 
 
-def retry(func):
-    @wraps(func)
-    def retry_wrapper(self, *args, **kwargs):
-        """
-        Args:
-            self (Adb):
-        """
-        init = None
-        for _ in range(RETRY_TRIES):
-            try:
-                if callable(init):
-                    time.sleep(retry_sleep(_))
-                    init()
-                return func(self, *args, **kwargs)
-            # 不可处理
-            except RequestHumanTakeover:
-                break
-            # adb server 被终止时
-            except ConnectionResetError as e:
-                logger.error(e)
+def _retry_recover(self, error, trial):
+    if isinstance(error, (ConnectionResetError, AdbError)):
+        return recover_adb(self, error)
+    if isinstance(error, PackageNotInstalled):
+        logger.error(error)
+        return self.detect_package
+    return recover_unknown(error)
 
-                def init():
-                    self.adb_reconnect()
-            # AdbError
-            except AdbError as e:
-                if handle_adb_error(e):
-                    def init():
-                        self.adb_reconnect()
-                elif handle_unknown_host_service(e):
-                    def init():
-                        self.adb_start_server()
-                        self.adb_reconnect()
-                else:
-                    break
-            # 包未安装
-            except PackageNotInstalled as e:
-                logger.error(e)
 
-                def init():
-                    self.detect_package()
-            # 未知异常，可能是损坏的图像
-            except Exception as e:
-                logger.exception(e)
-
-                def init():
-                    pass
-
-        logger.critical(f'Retry {func.__name__}() failed')
-        raise RequestHumanTakeover
-
-    return retry_wrapper
+retry = partial(retry_backend, recover=_retry_recover, label='设备-WSA')
 
 
 class WSA(Connection):
+    """WSA 平台特定的连接与操作实现类。"""
 
     @retry
     def app_current_wsa(self):
-        """
+        """获取 WSA 中当前处于前台焦点的应用包名。
+
         Returns:
-            str: 包名。
+            str: 前台应用包名。
 
         Raises:
-            OSError
+            OSError: 无法获取前台应用时抛出。
         """
         # 尝试: adb shell dumpsys activity top
         _activityRE = re.compile(
@@ -86,19 +50,23 @@ class WSA(Connection):
             ret = m.group('package')
             if ret == self.package:
                 return ret
-        if ret:  # get last result
+        if ret:  # 获取最后匹配的结果
             return ret
         raise OSError("Couldn't get focused app")
 
     @retry
     def app_start_wsa(self, package_name=None, display=0):
-        """
+        """在 WSA 指定显示器上启动目标应用。
+
         Args:
-            package_name (str):
-            display (int):
+            package_name (str | None): 目标应用包名，默认使用当前绑定的 package。
+            display (int): 目标显示屏 ID。
 
         Returns:
-            bool: 是否成功启动
+            bool: 启动成功返回 True。
+
+        Raises:
+            PackageNotInstalled: 目标应用包未安装时抛出。
         """
         if not package_name:
             package_name = self.package
@@ -106,20 +74,24 @@ class WSA(Connection):
         activity_name = self.get_main_activity_name(package_name=package_name)
         result = self.adb_shell(['am', 'start', '--display', display, f'{package_name}/{activity_name}'])
         if 'Activity not started' in result or 'does not exist' in result:
-            # Starting: Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] pkg=xxx }
-            # Error: Activity not started, unable to resolve Intent { ... }
-
-            # Starting: Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] cmp=com.bilibili.azurlane/xxx }
-            # Error type 3
-            # Error: Activity class {com.bilibili.azurlane/com.manjuu.azurlane.MainAct} does not exist.
             logger.error(result)
             raise PackageNotInstalled(package_name)
         else:
-            # Starting: Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] cmp=.../... }
             return True
 
     @retry
     def get_main_activity_name(self, package_name=None):
+        """获取目标应用包的主 Activity 名称。
+
+        Args:
+            package_name (str | None): 目标应用包名。
+
+        Returns:
+            str: 主 Activity 名称。
+
+        Raises:
+            PackageNotInstalled: 未能解析到主 Activity 或应用未安装时抛出。
+        """
         if not package_name:
             package_name = self.package
         try:
@@ -135,10 +107,10 @@ class WSA(Connection):
 
     @retry
     def get_display_id(self):
-        """
+        """获取游戏运行所在的 WSA 显示屏 ID。
+
         Returns:
-            0: 未找到
-            int: 游戏的 display id
+            int: 游戏的 display id，未找到或运行在默认 display 0 时返回 0。
         """
         try:
             get_dump_sys_display = str(self.adb_shell(['dumpsys', 'display']))
@@ -150,5 +122,10 @@ class WSA(Connection):
 
     @retry
     def display_resize_wsa(self, display):
+        """调整 WSA 指定显示屏的分辨率为 1280x720。
+
+        Args:
+            display (int): 目标显示屏 ID。
+        """
         logger.warning('display ' + str(display) + ' should be resized')
         self.adb_shell(['wm', 'size', '1280x720', '-d', str(display)])

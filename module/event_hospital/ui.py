@@ -1,3 +1,10 @@
+"""医院活动 UI 处理模块。
+
+提供医院活动的界面交互功能，包括线索界面检测、
+线索获取弹窗处理、战斗准备页面检测以及返回导航等
+UI 操作，是医院活动各子模块的基础 UI 依赖。
+"""
+
 from module.combat.assets import BATTLE_PREPARATION
 from module.event_hospital.assets import *
 from module.logger import logger
@@ -11,7 +18,14 @@ class HospitalUI(UI):
     """医院活动 UI 处理器，处理线索界面的进入和退出。"""
 
     def is_in_clue(self, interval=0):
-        """检测当前是否在线索界面。"""
+        """检测当前是否在线索界面。
+
+        Args:
+            interval (int | float): 按钮检测间隔秒数，默认 0。
+
+        Returns:
+            bool: 处于线索界面返回 True，否则返回 False。
+        """
         return self.appear(HOSIPITAL_CLUE_CHECK, offset=(20, 20), interval=interval)
 
     def handle_get_clue(self):

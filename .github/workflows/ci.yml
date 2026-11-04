@@ -1,0 +1,182 @@
+name: CI
+
+# 统一 PR 质量检查工作流。
+# 原 lint.yml（ruff / button-config-check）与 import-test.yml（import-smoke）
+# 合并于此，三者均为 push / pull_request 触发，直接作为 PR 的 check 显示。
+#
+# 其余 workflow（docker-publish / git-over-cdn-* / sync2 / ai-issue-labeler）
+# 触发条件与职责不同（tags 发布、master 镜像、issues 自动化），保持独立，
+# 不并入本工作流。
+
+on: [push, pull_request]
+
+concurrency:
+  # 同一分支/PR 上避免并发重复运行。
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  game-data:
+    name: 茗交所持久化 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-14 为 Apple Silicon，标签来源见 GitHub runner 文档。
+        # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+        # 不含 macos-15-intel：llvmlite（numba 依赖）无 macOS x86_64 wheel（上游 0.46 起删除），
+        # 源码编译需 LLVM 的 CMake 包，该 runner 上 uv sync 必然失败。
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@v5
+      - name: 安装 Linux 图像运行库
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0 libgomp1
+      - name: 安装锁定依赖
+        run: uv sync --frozen
+      - name: 验证身份持久化、历史认证、账户恢复与部署迁移
+        run: uv run python -m unittest tests.test_game_data tests.test_stock_exchange tests.test_stock_exchange_history tests.test_stock_exchange_recovery tests.test_profile_relocation
+
+  frontend:
+    name: React 与 WebSocket 检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: 校验前端锁文件下载源
+        run: python -m unittest tests.test_frontend_build.FrontendLockfileTests
+      - name: 安装依赖
+        run: |
+          sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0 libgomp1
+          uv sync --frozen
+          npm ci --prefix frontend --registry=https://registry.npmjs.org
+      - name: 校验 Git over CDN 更新
+        run: |
+          npm install --prefix .github/scripts --no-audit --no-fund --no-package-lock
+          uv run python -m unittest tests.test_git_over_cdn tests.test_git_over_cdn_build tests.test_gitcode_sync
+      - name: 校验 API 契约
+        run: |
+          uv run python -m dev_tools.export_api_schema
+          git diff --exit-code -- frontend/src/api/generated.ts frontend/src/api/contract.json
+      - name: 校验 API 与前端
+        run: |
+          uv run ruff check module/api module/runtime deploy/frontend.py --select F821,F401
+          uv run python -m unittest tests.test_api tests.test_api_lifecycle tests.test_config_transaction tests.test_runtime_task_handler tests.test_frontend_build tests.test_gui_supervisor_exit
+          uv run python -m unittest tests.test_island_walk_rules tests.test_island_cargo_preparation tests.test_mind_calculator tests.test_mind_scan tests.test_mind_scan_stuck tests.test_mind_scan_bottom tests.test_mind_scan_identity tests.test_dock_scan_recovery tests.test_fleet_tech tests.test_fleet_tech_scan
+          uv run python -m unittest tests.test_dock_data tests.test_dock_service tests.test_fleet_database tests.test_fleet_database_lifecycle tests.test_fleet_ledger tests.test_fleet_legacy tests.test_fleet_legacy_service tests.test_mind_calculator_mock
+          npm run build --prefix frontend
+          npm test --prefix frontend
+      - name: 浏览器端到端测试
+        working-directory: frontend
+        run: |
+          npx playwright install --with-deps chromium
+          npm run test:e2e
+          npm run test:e2e:mock -- --grep "舰队科技完整图鉴"
+          npm run test:e2e:mock -- e2e/pairing.spec.ts
+          npm run test:e2e:fleet
+
+  ruff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: uv sync
+      - name: Run ruff
+        run: uv run ruff check . --select E9,F63,F7,F82 --ignore F821,F722
+
+  button-config-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: uv sync --no-dev
+      - name: Run button_extract
+        run: uv run -m dev_tools.button_extract
+      - name: Run config_updater
+        run: uv run -m module.config.config_updater
+      - name: Check for differences
+        run: |
+          git diff --exit-code
+
+  import-smoke:
+    name: Import Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      # OpenCV 在无头 CI 环境需要系统运行库（与 deploy/docker/Dockerfile 保持一致）。
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0 libgomp1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.14'
+
+      - name: Install dependencies
+        run: uv sync
+
+      # 全量导入冒烟：遍历 module/ deploy/ 下所有模块在独立子进程导入，
+      # 已知失败在白名单中（见 dev_tools/import_smoke_test.py），意外失败会使 CI 失败。
+      # --summary-file 产出机器可读汇总，供 pr-report job 写入 PR 评论。
+      - name: Run startup and cloud upload regression tests
+        run: uv run python -m unittest tests.test_deploy_location tests.test_deploy_settings_transactions tests.test_deploy_redirect_fields tests.test_cloud_upload tests.test_cloud_direct_upload
+
+      - name: Run transport, screenshot and event regression tests
+        run: uv run pytest -q tests/test_http_transport.py tests/test_cloud_direct_upload.py tests/test_event_20261022.py
+
+      - name: Run import smoke test
+        run: uv run python -m dev_tools.import_smoke_test --summary-file import-smoke-summary.json
+
+      # 入口点导入 + WebUI/MCP 进程隔离守卫。
+      - name: Run CI import unittest
+        run: uv run python -m unittest tests.test_ci_import
+
+      - name: Upload import smoke summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: import-smoke-summary
+          path: import-smoke-summary.json
+
+  # 说明：PR 检查报告评论由两条 workflow 协作完成：
+  # 1. ci-report-placeholder.yml（pull_request_target）：PR 提交时立即创建占位评论；
+  # 2. ci-report.yml（workflow_run）：CI 完成后找到占位评论并更新为最终报告。
+  # 因此不再在 ci.yml 内直接发布评论（fork PR 下 GITHUB_TOKEN 只读无法发布，
+  # 且与占位机制重复）。

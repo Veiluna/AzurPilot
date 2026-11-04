@@ -1,3 +1,9 @@
+"""大世界战斗处理器模块。
+
+针对大世界（Operation Siren）场景定制战斗流程，继承标准战斗处理器
+和地图事件处理器。提供连续战斗检测（塞壬扫描装置场景）、S 评价
+延迟点击、大世界专用物品获取逻辑，以及战斗统计计时等功能。
+"""
 from module.combat.assets import *
 from module.combat.combat import Combat as Combat_
 from module.logger import logger
@@ -136,7 +142,7 @@ class Combat(Combat_, MapEventHandler):
             auto (str): 自动战斗模式。
             fleet_index (int): 舰队索引。
         """
-        logger.info('Combat preparation.')
+        logger.info('战斗准备。')
         self.device.stuck_record_clear()
         self.device.click_record_clear()
         skip_first_screenshot = True
@@ -162,7 +168,7 @@ class Combat(Combat_, MapEventHandler):
             # 结束
             pause = self.is_combat_executing()
             if pause:
-                logger.attr('BattleUI', pause)
+                logger.attr('战斗界面', pause)
                 break
 
     def _get_exp_info_sleep(self):
@@ -330,13 +336,13 @@ class Combat(Combat_, MapEventHandler):
         for count in range(3):
             self._clear_battle_status_s_timer()
             if count >= 2:
-                logger.warning('Too many continuous combat')
+                logger.warning('[大世界战斗] 连续战斗过多')
 
             try:
                 super().combat(*args, save_get_items=save_get_items, **kwargs)
                 break
             except ContinuousCombat:
-                logger.info('Continuous combat detected')
+                logger.info('[大世界战斗] 检测到连续战斗')
                 continue
             finally:
                 self._clear_battle_status_s_timer()
@@ -358,9 +364,9 @@ class Combat(Combat_, MapEventHandler):
         """
         if self.appear(status_button, interval=self.battle_status_click_interval):
             if status_letter == 'S':
-                logger.info(f'Battle Status {status_letter}')
+                logger.info(f'[大世界战斗] 战斗评价 {status_letter}')
             else:
-                logger.warning(f'Battle Status {status_letter}')
+                logger.warning(f'[大世界战斗] 战斗评价 {status_letter}')
             if drop:
                 drop.handle_add(self)
             else:
@@ -444,8 +450,9 @@ class Combat(Combat_, MapEventHandler):
         """
         自动搜索模式下的经验结算页面处理。
 
-        依次检查 S/A/B/C/D 经验结算按钮，点击后清除 S 评价计时器并等待随机时间。
-        等待时间根据是否有掉落物决定（有掉落 1.5-2 秒，无掉落 0.25-0.5 秒）。
+        依次检查 S/A/B/C/D 经验结算按钮并点击，点击后清除 S 评价计时器。
+        点击沿用战斗结算的点击冷却，避免同一页面被连点；页面是否关闭由调用方
+        继续截图确认，不再用固定时长休眠猜测界面状态。
 
         Pages:
             in: 经验结算页面（S/A/B/C/D 任一可见）
@@ -454,11 +461,9 @@ class Combat(Combat_, MapEventHandler):
         Returns:
             bool: 是否点击了经验结算按钮。
         """
-        sleep = self._get_exp_info_sleep()
         for exp_info_button in [EXP_INFO_S, EXP_INFO_A, EXP_INFO_B, EXP_INFO_C, EXP_INFO_D]:
-            if self.appear_then_click(exp_info_button):
+            if self.appear_then_click(exp_info_button, interval=self.battle_status_click_interval):
                 self._clear_battle_status_s_timer()
-                self.device.sleep(sleep)
                 return True
         return False
 
@@ -488,13 +493,14 @@ class Combat(Combat_, MapEventHandler):
         
         cl1_combat_timer = Timer(300, count=300)
         
-        logger.info('Auto search combat loading')
+        logger.info('[大世界战斗] 自动搜索战斗加载中')
         self.device.stuck_record_clear()
         self.device.click_record_clear()
         self.device.screenshot_interval_set('combat')
         while 1:
             self.device.screenshot()
 
+            self.handle_background_coin_interrupt(drop=drop)
             if self.handle_combat_automation_confirm():
                 continue
 
@@ -504,12 +510,12 @@ class Combat(Combat_, MapEventHandler):
                 break
             pause = self.is_combat_executing()
             if pause:
-                logger.attr('BattleUI', pause)
+                logger.attr('战斗UI', pause)
                 break
             if self.is_in_map():
                 break
 
-        logger.info('Auto Search combat execute')
+        logger.info('[大世界战斗] 自动搜索战斗执行')
         self.submarine_call_reset()
         self.device.stuck_record_clear()
         self.device.click_record_clear()
@@ -525,8 +531,9 @@ class Combat(Combat_, MapEventHandler):
         while 1:
             self.device.screenshot()
 
+            self.handle_background_coin_interrupt(drop=drop)
             if battle_timer_source == 'cl1' and cl1_combat_timer.reached():
-                logger.warning('CL1 combat timeout (5 minutes limit reached)')
+                logger.warning('[大世界战斗] CL1 战斗超时（5 分钟限制）')
                 raise GameBugError('CL1 combat timeout')
 
             if self.handle_submarine_call(submarine_mode):
@@ -544,7 +551,9 @@ class Combat(Combat_, MapEventHandler):
             if self.is_combat_executing():
                 battle_status_s_timer.clear()
                 continue
-            if self.config.OpsiGeneral_RepairThreshold > 0 and self.handle_auto_search_exp_info():
+            # 自律被游戏或任务中断后，经验结算页需要主动确认才能回到地图，
+            # 与是否启用自动修理无关；此前按修理阈值门控会在关闭修理时卡在结算页。
+            if self.handle_auto_search_exp_info():
                 battle_status_s_timer.clear()
                 success = None
                 continue
@@ -555,7 +564,10 @@ class Combat(Combat_, MapEventHandler):
                 battle_status_s_timer.clear()
                 continue
             
-        logger.info('Combat end.')
+        logger.info('战斗结束。')
+        # 刚回到地图时界面仍在重建，自律寻敌按钮可能是过渡外观；记录窗口，
+        # 期间不操作地图自律开关，避免把仍在执行的自律寻敌点停。
+        self._os_auto_search_battle_settle_start()
         
         # 通过相同的指标源结束，避免 CL1 和 short-meow 样本意外共享存储键。
         finish_battle_timer(self.config, battle_timer_source)

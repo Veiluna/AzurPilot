@@ -1,6 +1,8 @@
+"""Hermit 截图和控制后端。通过 HTTP 与 ADB 端口转发通信，
+提供基于 JSON 协议的截图捕获和触摸注入功能。"""
+
 import json
-import time
-from functools import wraps
+from functools import partial
 
 import requests
 from adbutils.errors import AdbError
@@ -8,9 +10,9 @@ from adbutils.errors import AdbError
 from module.base.decorator import cached_property
 from module.base.timer import Timer
 from module.base.utils import point2str, random_rectangle_point
+from module.device.method.retry import retry_backend, recover_adb, recover_unknown
 from module.device.method.adb import Adb
-from module.device.method.utils import (RETRY_TRIES, handle_unknown_host_service, retry_sleep,
-                                        HierarchyButton, handle_adb_error)
+from module.device.method.utils import HierarchyButton
 from module.exception import RequestHumanTakeover
 from module.logger import logger
 
@@ -19,74 +21,25 @@ class HermitError(Exception):
     pass
 
 
-def retry(func):
-    @wraps(func)
-    def retry_wrapper(self, *args, **kwargs):
-        """
-        Args:
-            self (Hermit):
-        """
-        init = None
-        for _ in range(RETRY_TRIES):
-            try:
-                if callable(init):
-                    time.sleep(retry_sleep(_))
-                    init()
-                return func(self, *args, **kwargs)
-            # 无法处理
-            except RequestHumanTakeover:
-                break
-            # ADB 服务被终止时
-            except ConnectionResetError as e:
-                logger.error(e)
+def _retry_recover(self, error, trial):
+    def reconnect_hermit():
+        self.adb_reconnect()
+        self.hermit_init()
 
-                def init():
-                    self.adb_reconnect()
-            # 无法发送请求时
-            except requests.exceptions.ConnectionError as e:
-                logger.error(e)
-                text = str(e)
-                if 'Connection aborted' in text:
-                    # Hermit 未安装或未运行
-                    # ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
-                    def init():
-                        self.adb_reconnect()
-                        self.hermit_init()
-                else:
-                    # 连接丢失，ADB 服务被终止
-                    # HTTPConnectionPool(host='127.0.0.1', port=20269):
-                    # Max retries exceeded with url: /click?x=500&y=500
-                    def init():
-                        self.adb_reconnect()
-            # ADB 错误
-            except AdbError as e:
-                if handle_adb_error(e):
-                    def init():
-                        self.adb_reconnect()
-                elif handle_unknown_host_service(e):
-                    def init():
-                        self.adb_start_server()
-                        self.adb_reconnect()
-                else:
-                    break
-            # HermitError: {"code":-1,"msg":"error"}
-            except HermitError as e:
-                logger.error(e)
+    if isinstance(error, (ConnectionResetError, AdbError)):
+        return recover_adb(self, error)
+    if isinstance(error, requests.exceptions.ConnectionError):
+        logger.error(error)
+        if 'Connection aborted' in str(error):
+            return reconnect_hermit
+        return self.adb_reconnect
+    if isinstance(error, HermitError):
+        logger.error(error)
+        return reconnect_hermit
+    return recover_unknown(error)
 
-                def init():
-                    self.adb_reconnect()
-                    self.hermit_init()
-            # 未知异常，可能是图像损坏
-            except Exception as e:
-                logger.exception(e)
 
-                def init():
-                    pass
-
-        logger.critical(f'重试 {func.__name__}() 失败')
-        raise RequestHumanTakeover
-
-    return retry_wrapper
+retry = partial(retry_backend, recover=_retry_recover, label='设备-Hermit')
 
 
 class Hermit(Adb):
@@ -109,18 +62,24 @@ class Hermit(Adb):
         return f'http://127.0.0.1:{self._hermit_port}'
 
     def hermit_init(self):
-        logger.hr('Hermit init')
+        """
+        初始化 Hermit 服务。
+
+        尝试启动已安装的 Hermit 应用，若未安装则自动推送 APK 安装，
+        随后请求启用系统无障碍辅助服务并返回后台。
+        """
+        logger.hr('[设备-Hermit] Hermit初始化')
 
         self.app_stop_adb(self._hermit_package_name)
         # self.uninstall_hermit()
 
-        logger.info('Try to start hermit')
+        logger.info('[设备-Hermit] 尝试启动Hermit')
         if self.app_start_adb(self._hermit_package_name, allow_failure=True):
             # 成功启动 hermit
-            logger.info('Success to start hermit')
+            logger.info('[设备-Hermit] 启动Hermit成功')
         else:
             # Hermit 未安装
-            logger.warning(f'{self._hermit_package_name} not found, installing hermit')
+            logger.warning(f'[设备-Hermit] {self._hermit_package_name} 未找到，正在安装 hermit')
             self.adb_command(['install', '-t', self.config.HERMIT_FILEPATH_LOCAL])
             self.app_start_adb(self._hermit_package_name)
 
@@ -141,6 +100,7 @@ class Hermit(Adb):
         self.app_start_adb()
 
     def uninstall_hermit(self):
+        """卸载设备上的 Hermit 应用程序。"""
         self.adb_command(['uninstall', self._hermit_package_name])
 
     def hermit_enable_accessibility(self):
@@ -150,7 +110,7 @@ class Hermit(Adb):
         Raises:
             RequestHumanTakeover: 失败时抛出，需要用户手动操作。
         """
-        logger.hr('Enable accessibility service')
+        logger.hr('启用无障碍服务')
         interval = Timer(0.3)
         timeout = Timer(10, count=10).start()
         while 1:
@@ -165,7 +125,7 @@ class Hermit(Adb):
                 b = HierarchyButton(h, xpath)
                 if b:
                     point = random_rectangle_point(b.button)
-                    logger.info(f'Click {point2str(*point)} @ {b}')
+                    logger.info(f'[设备-Hermit] 点击 {point2str(*point)} @ {b}')
                     self.click_adb(*point)
                     return True
                 else:
@@ -185,10 +145,10 @@ class Hermit(Adb):
 
             # 超时
             if timeout.reached():
-                logger.critical('无法为 Hermit 打开辅助功能服务')
+                logger.critical('[设备-Hermit] 无法为 Hermit 打开辅助功能服务')
                 logger.critical(
                     '\n\n'
-                    '请手动执行以下操作：\n'
+                    '[设备-Hermit] 请手动执行以下操作：\n'
                     '1. 在辅助功能设置中找到 "Hermit" 并点击\n'
                     '2. 将其打开并点击 "确定"\n'
                     '3. 切换回碧蓝航线\n'
@@ -223,7 +183,7 @@ class Hermit(Adb):
             e = HermitError(result)
             if 'GestureDescription$Builder' in result:
                 logger.error(e)
-                logger.critical('Hermit 无法在当前设备上运行，Hermit 需要 Android>=7.0')
+                logger.critical('[设备-Hermit] Hermit 无法在当前设备上运行，Hermit 需要 Android>=7.0')
                 raise RequestHumanTakeover
             if 'accessibilityservice' in result:
                 # 尝试调用虚拟方法
@@ -232,7 +192,7 @@ class Hermit(Adb):
                 #     android.accessibilityservice.AccessibilityService$GestureResultCallback,
                 #     android.os.Handler
                 # )' on a null object reference
-                logger.error('Unable to access accessibility service')
+                logger.error('[设备-Hermit] 无法访问无障碍服务')
             raise e
 
         # Hermit 请求仅需 2-4ms
@@ -242,4 +202,11 @@ class Hermit(Adb):
 
     @retry
     def click_hermit(self, x, y):
+        """
+        通过 Hermit 模拟点击指定坐标。
+
+        Args:
+            x: 点击目标横坐标。
+            y: 点击目标纵坐标。
+        """
         self.hermit_send('/click', x=x, y=y)

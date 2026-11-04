@@ -1,8 +1,17 @@
+"""岛屿烧烤店铺模块。
+
+继承 IslandShopBase，实现烧烤店的商品配置与岗位管理。
+包含烤串、土豆鸡、蛋卷胡萝卜、炒鸡排、牛排碗等菜品的模板、选择与后续操作定义。
+"""
 from module.island_grill.assets import *
 from module.island.island_shop_base import IslandShopBase
 from module.logger import logger
 
 class IslandGrill(IslandShopBase):
+    """岛屿烧烤店铺自动化管理器。
+
+    继承 IslandShopBase，管理烧烤店的商品生产与岗位派遣。
+    """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -28,6 +37,9 @@ class IslandGrill(IslandShopBase):
             {'name': 'steak_bowl', 'template': TEMPLATE_STEAK_BOWL, 'var_name': 'steak_bowl',
              'selection': SELECT_STEAK_BOWL, 'selection_check': SELECT_STEAK_BOWL_CHECK,
              'post_action': POST_STEAK_BOWL},
+            {'name': 'crayfish_stir_fry', 'template': TEMPLATE_CRAYFISH_STIR_FRY, 'var_name': 'crayfish_stir_fry',
+             'selection': SELECT_CRAYFISH_STIR_FRY, 'selection_check': SELECT_CRAYFISH_STIR_FRY_CHECK,
+             'post_action': POST_CRAYFISH_STIR_FRY},
             {'name': 'carnival', 'template': TEMPLATE_CARNIVAL, 'var_name': 'carnival',
              'selection': SELECT_CARNIVAL, 'selection_check': SELECT_CARNIVAL_CHECK,
              'post_action': POST_CARNIVAL},
@@ -71,10 +83,11 @@ class IslandGrill(IslandShopBase):
         self.initialize_shop()
 
     def test(self):
+        """测试烧烤店收获与关闭岗位弹窗。"""
         self.island_error = False
         self.post_get_and_close()
         if self.island_error:
-            logger.info('error1')
+            logger.info('[岛屿-烧烤] 错误1')
 
 
 if __name__ == "__main__":

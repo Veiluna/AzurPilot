@@ -1,5 +1,6 @@
-"""
-Device ID 管理模块
+"""设备 ID 管理模块。
+
+基于不可逆的硬件指纹哈希生成匿名的设备唯一标识符，用于本地配置区分与遥测统计。
 """
 import hashlib
 import json
@@ -13,15 +14,14 @@ from typing import Optional
 from module.logger import logger
 
 def _wmic_query(wmic_class: str, field: str) -> str:
-    """
-    通过 WMIC 查询 Windows 硬件信息
+    """通过 WMIC 查询 Windows 硬件信息。
     
     Args:
-        wmic_class: WMI 类名 (例如 'baseboard', 'cpu')
-        field: 要查询的字段名
+        wmic_class (str): WMI 类名（例如 'baseboard', 'cpu'）。
+        field (str): 要查询的字段名。
         
     Returns:
-        str: 查询结果字符串，失败返回空字符串
+        str: 查询结果字符串，失败返回空字符串。
     """
     try:
         result = subprocess.run(
@@ -37,6 +37,11 @@ def _wmic_query(wmic_class: str, field: str) -> str:
     return ''
 
 def _collect_hardware_fingerprint() -> str:
+    """收集本机硬件指纹字符串。
+
+    Returns:
+        str: 拼接后的硬件特征指纹。
+    """
     parts = []
     
     if platform.system() == 'Windows':
@@ -53,7 +58,7 @@ def _collect_hardware_fingerprint() -> str:
     else:
         for mid_path in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
             try:
-                mid = Path(mid_path).read_text().strip()
+                mid = Path(mid_path).read_text(encoding='utf-8').strip()
                 if mid:
                     parts.append(f'machine-id={mid}')
                     break
@@ -80,10 +85,13 @@ def _collect_hardware_fingerprint() -> str:
 
 
 def generate_device_id() -> str:
-    """
-    基于硬件指纹生成唯一设备ID
+    """基于硬件指纹生成唯一设备 ID。
+
+    Returns:
+        str: 32 位 SHA-256 哈希设备标识符。
     """
     fingerprint = _collect_hardware_fingerprint()
+    # 使用 SHA-256 哈希处理硬件指纹，生成不可逆的匿名设备标识符
     device_id = hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:32]
     return device_id
 
@@ -95,6 +103,11 @@ _REFRESH_INTERVAL = 300
 
 
 def get_device_id() -> str:
+    """获取当前设备 ID。
+
+    Returns:
+        str: 32 位设备标识符。
+    """
     global _device_id
     if _device_id is None:
         _device_id = _init_device_id()
@@ -102,14 +115,21 @@ def get_device_id() -> str:
 
 
 def get_old_device_id() -> Optional[str]:
-    """
-    获取迁移前的旧 ID
+    """获取迁移前的旧 ID。
+
+    Returns:
+        str | None: 迁移前的旧设备 ID，若无变更则为 None。
     """
     global _old_device_id
     return _old_device_id
 
 
 def _init_device_id() -> str:
+    """初始化设备 ID 并检查旧 ID 迁移。
+
+    Returns:
+        str: 初始化后的设备 ID。
+    """
     global _old_device_id
     device_id = generate_device_id()
     
@@ -124,20 +144,25 @@ def _init_device_id() -> str:
                 stored_id = old_data.get('device_id')
                 if stored_id and stored_id != device_id:
                     _old_device_id = stored_id
-                    logger.info(f'Device ID change detected for migration! Old: {stored_id[:8]}, New: {device_id[:8]}')
+                    logger.info(f'检测到设备ID变更并用于迁移，旧ID: {stored_id[:8]}，新ID: {device_id[:8]}')
         except Exception:
             pass
 
     # 立即覆写新 ID
     _overwrite_device_id(device_id, device_id_file)
-    logger.info(f'Device ID initialized: {device_id[:8]}...')
-    
+
     _start_refresh_timer(device_id, device_id_file)
     
     return device_id
 
 
 def _overwrite_device_id(device_id: str, file_path: Path):
+    """将设备 ID 写入本地日志文件。
+
+    Args:
+        device_id (str): 32 位设备 ID。
+        file_path (Path): 目标 json 文件路径。
+    """
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         data = {
@@ -149,15 +174,27 @@ def _overwrite_device_id(device_id: str, file_path: Path):
         with file_path.open('w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.warning(f'Failed to overwrite device ID file: {e}')
+        logger.warning(f'[设备-ID] 覆盖设备ID文件失败: {e}')
 
 
 def _refresh_callback(device_id: str, file_path: Path):
+    """定时器回调：定期刷新设备 ID 文件。
+
+    Args:
+        device_id (str): 设备 ID。
+        file_path (Path): 目标 json 文件路径。
+    """
     _overwrite_device_id(device_id, file_path)
     _start_refresh_timer(device_id, file_path)
 
 
 def _start_refresh_timer(device_id: str, file_path: Path):
+    """启动设备 ID 文件的定期刷新后台定时器。
+
+    Args:
+        device_id (str): 设备 ID。
+        file_path (Path): 目标 json 文件路径。
+    """
     global _refresh_timer
     if _refresh_timer is not None:
         _refresh_timer.cancel()

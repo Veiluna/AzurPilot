@@ -1,3 +1,9 @@
+"""作战档案模板映射字典。
+
+将作战档案活动名称映射到对应的模板图像，用于在作战档案页面中
+通过模板匹配识别并选择特定的历史活动关卡。
+"""
+
 from module.war_archives.assets import *
 
 dic_archives_template = {
@@ -47,4 +53,8 @@ dic_archives_template = {
     'war_archives_20230223_cn': TEMPLATE_REVELATIONS_OF_DUST,
     'war_archives_20220818_cn': TEMPLATE_OPERATION_CONVERGENCE,
     'war_archives_20230803_cn': TEMPLATE_ANTHEM_OF_REMEMBRANCE,
+    'war_archives_20230525_cn': TEMPLATE_CONFLUENCE_OF_NOTHINGNESS,
+    'war_archives_20240725_cn': TEMPLATE_INTERLUDE_OF_ILLUSIONS,
+    'war_archives_20241024_cn': TEMPLATE_TEMPESTA_AND_THE_SLEEPING_SEA,
+    'war_archives_20251023_cn': TEMPLATE_TEMPESTA_AND_ISLAS_DE_LIBERTAD,
 }

@@ -40,12 +40,34 @@ MenuAlas:
   Overview:
   Log:
 
+TaskConfig:
+  SearchPlaceholder:
+  SearchNoResult:
+  SearchResultCount:
+
+FleetManagement:
+  StartScan:
+  Scanning:
+  ScanStarted:
+  ScanAlreadyRunning:
+  ScanStartFailed:
+  LastScan:
+  NoResult:
+  Main:
+  Vanguard:
+  Submarine:
+  SurfaceFleet:
+  UnderwaterFleet:
+  Fleet:
+  Ships:
+
 MenuDevelop:
   HomePage:
   Translate:
   Announcement:
   Update:
   Remote:
+  Setting:
   Utils:
 
 Overview:
@@ -76,6 +98,18 @@ Overview:
   Waiting:
   NoTask:
   Stat:
+  BackgroundCurrentDefault:
+  BackgroundCurrentLocal:
+  BackgroundCurrentMixed:
+  BackgroundCurrentUrl:
+  BackgroundCustomUrls:
+  BackgroundDirectLink:
+  BackgroundExtractToLocal:
+  BackgroundLocalCount:
+  BackgroundOpenFolder:
+  BackgroundOpenInNewWindow:
+  BackgroundTitle:
+  BackgroundUrlCount:
 
 Dashboard:
   TimeError:
@@ -122,8 +156,30 @@ AppManage:
   Back:
   New:
   Import:
+  ImportLegacy:
+  ImportLegacyTitle:
+  ImportLegacyHint:
+  ImportLegacyContent:
+  ImportLegacyWarning:
+  ImportLegacyChoose:
+  ImportLegacySelecting:
+  ImportLegacySuccess:
+  ImportLegacyFailed:
+  ImportLegacyNoMatch:
+  ImportLegacyRequestFailed:
+  ImportLegacyUnknownError:
   Export:
   Delete:
+  Summary:
+  Collapse:
+  EnabledTasks:
+  SchedulerOrderHint:
+  SummaryLoadFailed:
+  DeleteConfirm:
+  DeleteRunning:
+  DeleteLast:
+  DeleteSuccess:
+  DeleteFailed:
   OverrideWarning:
   ImportSuccess:
   NewSuccess:
@@ -155,12 +211,152 @@ Remote:
   NotRunning:
   NotEnable:
   EntryPoint:
+  StatusDirect:
+  StatusTurn:
+  StatusSsh:
+  StatusSignaling:
+  StatusStarting:
+  StatusFailed:
   ConfigureHint:
   SSHNotInstall:
+
+Launcher:
+  StartupTitle:
+  AutoStart:
+  AutoStartHelp:
+  Loading:
+  Connected:
+  Disconnected:
+  RemoteUnavailable:
+  Unsupported:
+  Enabled:
+  Disabled:
+  Setting:
+  Failed:
+
+DeploySetting:
+  Title:
+  RestartNotice:
+  Loading:
+  Refresh:
+  Save:
+  Saving:
+  Saved:
+  Failed:
+  Enabled:
+  Disabled:
+  DemoDisabled:
+  GroupGit:
+  GroupPython:
+  GroupAdb:
+  GroupOcr:
+  GroupUpdate:
+  GroupMisc:
+  GroupRemoteAccess:
+  GroupWebui:
+  Repository:
+  RepositoryHelp:
+  Branch:
+  BranchHelp:
+  GitExecutable:
+  GitExecutableHelp:
+  GitProxy:
+  GitProxyHelp:
+  SSLVerify:
+  SSLVerifyHelp:
+  PythonExecutable:
+  PythonExecutableHelp:
+  PypiMirror:
+  PypiMirrorHelp:
+  InstallDependencies:
+  InstallDependenciesHelp:
+  AdbExecutable:
+  AdbExecutableHelp:
+  ReplaceAdb:
+  ReplaceAdbHelp:
+  AutoConnect:
+  AutoConnectHelp:
+  InstallUiautomator2:
+  InstallUiautomator2Help:
+  UseOcrServer:
+  UseOcrServerHelp:
+  StartOcrServer:
+  StartOcrServerHelp:
+  OcrServerPort:
+  OcrServerPortHelp:
+  OcrClientAddress:
+  OcrClientAddressHelp:
+  EnableReload:
+  EnableReloadHelp:
+  CheckUpdateInterval:
+  CheckUpdateIntervalHelp:
+  AutoRestartTime:
+  AutoRestartTimeHelp:
+  DiscordRichPresence:
+  DiscordRichPresenceHelp:
+  EnableRemoteAccess:
+  EnableRemoteAccessHelp:
+  RemoteAccessMode:
+  RemoteAccessModeHelp:
+  CloudflareRegistry:
+  CloudflareRegistryHelp:
+  SSHUser:
+  SSHUserHelp:
+  SSHServer:
+  SSHServerHelp:
+  SSHExecutable:
+  SSHExecutableHelp:
+  AllowedRedirectHosts:
+  AllowedRedirectHostsHelp:
+  MaxRedirects:
+  MaxRedirectsHelp:
+  SignalingServer:
+  SignalingServerHelp:
+  StunServers:
+  StunServersHelp:
+  TurnServers:
+  TurnServersHelp:
+  TurnCredentialMode:
+  TurnCredentialModeHelp:
+  WebuiHost:
+  WebuiHostHelp:
+  WebuiPort:
+  WebuiPortHelp:
+  Language:
+  LanguageHelp:
+  Theme:
+  ThemeHelp:
+  DpiScaling:
+  DpiScalingHelp:
+  Password:
+  PasswordHelp:
+  CDN:
+  CDNHelp:
+  WebuiSSLKey:
+  WebuiSSLKeyHelp:
+  WebuiSSLCert:
+  WebuiSSLCertHelp:
+  DisableBranchWatermark:
+  DisableBranchWatermarkHelp:
+  WatermarkHiddenNow:
+
+StartupRun:
+  Title:
+  Description:
+  Loading:
+  Enabled:
+  Disabled:
+  Setting:
+  Failed:
+  Unavailable:
 
 Text:
   InvalidFeedBack:
   Clear:
+  RunNow:
+  RunNowSchedulerStopped:
+  RunNowTaskDisabled:
+  SchedulerQuickBar:
   EnterPassword:
   ChooseFile:
 
@@ -168,6 +364,7 @@ Stat:
   LoadApDataFailed:
   NoApData:
   Refresh:
+  NewDataAvailable:
   NoValidApData:
   ViewTitleLine:
   ViewTitleDay:
@@ -228,13 +425,6 @@ Stat:
   AvgMeowRoundTime:
   MeowLootTitle:
   NoMeowDataNotice:
-  MeowAdvanceAdviceTitle:
-  CurrentAP:
-  ApPerRound:
-  AvailableRounds:
-  AvgRoundDuration:
-  CurrentMode:
-  RecommendAhead:
   RoundUnit:
   SecondUnit:
   HourUnit:
@@ -257,9 +447,6 @@ Stat:
   TargetExpRequired:
   BattlesCompleted:
   ExpRemaining:
-  StartCleanupTime:
-  NextOsReset:
-  MeowAutoCleanupStatus:
   CommissionIncomeTitle:
   CommissionIncomeMonth:
   CommissionIncomeWeek:
@@ -280,6 +467,53 @@ Stat:
   LoadResourceDataFailed:
   NoResourceData:
   NoValidResourceData:
+  BackgroundBtn:
+  ChartAp:
+  ChartApLabel:
+  ChartAsset:
+  ChartChange:
+  ChartChangeLabel:
+  ChartClose:
+  ChartDelta:
+  ChartDensity:
+  ChartDistance:
+  ChartHigh:
+  ChartLow:
+  ChartMa10:
+  ChartMa5:
+  ChartMaxLabel:
+  ChartMean:
+  ChartMeanLabel:
+  ChartMinLabel:
+  ChartOpen:
+  ChartPanelTitle:
+  ChartPurple:
+  ChartResetBtn:
+  ChartSeriesAp:
+  ChartSeriesAsset:
+  ChartSeriesDistance:
+  ChartSeriesPurple:
+  ChartSeriesYellow:
+  ChartSource:
+  ChartYellow:
+  ExtractAlreadyLocal:
+  ExtractDone:
+  ExtractFailed:
+  ExtractHint:
+  ExtractNoImage:
+  ExtractNoImageData:
+  ExtractRunning:
+  ExtractSkipped:
+  ExtractUnknownError:
+  MaterialAdvancedOnly:
+  MaterialBlur:
+  MaterialCards:
+  MaterialReset:
+  MaterialTiles:
+  MaterialTitle:
+  MaterialTransparency:
+  Readme:
+  ScreenshotPreviewBtn:
 
 Tactical:
   SkillAutoSwitch:
@@ -294,7 +528,7 @@ OpsiScheduling:
   EnableObscure:
   EnableAbyssal:
   EnableStronghold:
-  MeowStartEarlyMode:
+  TaskPriority:
     
 Misc:
   Enabled:

@@ -1,3 +1,12 @@
+"""
+宿舍计划状态 OCR 识别。
+
+提供宿舍计划商店的货币余额和互动次数的 OCR 读取能力，
+包括金币、钻石和每日互动剩余次数。
+通过服务器分支适配不同区域的 OCR 参数（字体颜色差异）。
+
+Pages: in: PRIVATE_QUARTERS_SHOP, PRIVATE_QUARTERS_MAIN
+"""
 import module.config.server as server
 from module.ocr.ocr import Digit, DigitCounter
 from module.private_quarters.assets import *
@@ -22,41 +31,40 @@ OCR_SHOP_PRICE = Digit([], letter=(64, 72, 77), name='OCR_SHOP_PRICE')
 
 
 class PQStatus(ShopStatus):
+    """宿舍计划货币与互动次数状态识别器。"""
+
     def status_get_gold_coins(self):
-        """
-        OCR 识别商店金币数量。
+        """OCR 识别商店金币数量。
 
         Returns:
-            int: 金币数量
+            int: 金币数量。
 
         Pages:
-            in: 私人宿舍商店页
+            in: 宿舍计划商店页
         """
         amount = OCR_SHOP_GOLD_COINS.ocr(self.device.image)
         return amount
 
     def status_get_gems(self):
-        """
-        OCR 识别商店钻石数量。
+        """OCR 识别商店钻石数量。
 
         Returns:
-            int: 钻石数量
+            int: 钻石数量。
 
         Pages:
-            in: 私人宿舍商店页
+            in: 宿舍计划商店页
         """
         amount = OCR_SHOP_GEMS.ocr(self.device.image)
         return amount
 
     def status_get_daily_count(self):
-        """
-        OCR 识别每日互动剩余次数。
+        """OCR 识别每日互动剩余次数。
 
         Returns:
-            int: 剩余互动次数
+            int: 剩余互动次数。
 
         Pages:
-            in: 私人宿舍主页
+            in: 宿舍计划主页
         """
         count, _, _ = OCR_DAILY_COUNT.ocr(self.device.image)
         return count

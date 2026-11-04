@@ -1,3 +1,7 @@
+"""委托筛选预设配置，定义不同场景下的委托优先级排序方案。
+包含最短时间筛选、芯片/魔方/装备箱等专用预设，
+以及对应的夜间模式变体和通用默认筛选规则。"""
+
 SHORTEST_FILTER = """
 0:20 > 0:30
 > 1 > 1:10 > 1:20 > 1:30 > 1:40 > 1:45
@@ -15,7 +19,6 @@ DICT_FILTER_PRESET = {
     > UrgentCube-2:15 > UrgentCube-4
     > ExtraDrill-1 > UrgentCube-6 > ExtraCube-1:30 
     > ExtraDrill-2:40 > ExtraDrill-0:20
-    > expire
     > Major > DailyChip > DailyResource
     > ExtraPart-0:30 > ExtraOil-1 > UrgentBox-6 
     > ExtraCube-3 > ExtraPart-1 > UrgentBox-3
@@ -66,7 +69,6 @@ DICT_FILTER_PRESET = {
     > UrgentCube-2:15 > UrgentCube-4 > UrgentCube-6 
     > ExtraCube-1:30 > ExtraCube-3 > ExtraCube-4 
     > ExtraCube-8 > UrgentBox-6 > UrgentBox-3 > ExtraCube-5 > UrgentBox-1
-    > expire
     > Major > DailyChip > DailyResource
     > ExtraOil-8 > UrgentDrill-4 > ExtraOil-4 > ExtraOil-1 
     > ExtraDrill-0:20 > UrgentDrill-2:40 > ExtraPart-0:30 
@@ -115,7 +117,6 @@ DICT_FILTER_PRESET = {
     > UrgentBox-6 > ExtraCube-1:30 > UrgentCube-6 
     > UrgentBox-3 > UrgentBox-1
     > UrgentDrill-4 > ExtraOil-8 > UrgentDrill-2:40 > ExtraOil-4
-    > expire
     > Major > DailyChip > DailyResource
     > ExtraCube-3 > UrgentDrill-2 > UrgentDrill-1
     > UrgentDrill-1:30 > UrgentDrill-1:10 

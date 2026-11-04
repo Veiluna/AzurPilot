@@ -1,3 +1,26 @@
+"""
+大世界海域操作模块。
+
+负责大世界（Operation Siren）模式下的海域层面操作，包括海域名称识别、
+当前海域检测、海域初始化、特殊海域退出等功能。
+
+主要类:
+    OSMapOperation: 海域操作类，整合命令处理器、任务处理器、港口处理器等。
+
+功能:
+    - 多服务器海域名称 OCR 识别（CN/EN/JP/TW），包含大量服务器特有的 OCR 修正逻辑。
+    - 海域初始化：处理弹窗、动画延迟、海域名称识别。
+    - 特殊海域（隐秘海域、深渊海域、要塞）的进入和退出。
+    - 指挥喵搜索状态检测和进度读取。
+
+术语:
+    海域 (Zone): 大世界地图上的一个可进入区域，有安全区/危险区等类型。
+    隐秘海域 (Obscure Zone): 特殊海域类型，需要特定条件才能进入。
+    深渊海域 (Abyssal Zone): 特殊海域类型，包含强力敌人。
+    要塞 (Stronghold): 塞壬要塞，特殊海域类型。
+    安全区 (Safe Zone): 已完全清理的海域。
+    危险区 (Danger Zone): 未完全清理的海域。
+"""
 from module.base.decorator import Config
 from module.base.timer import Timer
 from module.base.utils import *
@@ -16,6 +39,19 @@ from module.ui.assets import BACK_ARROW, OS_CHECK
 
 
 def _remove_zone_suffix(name, suffixes, trim_chars=''):
+    """从海域名称中移除后缀和尾部字符。
+
+    先移除尾部指定字符，再匹配并移除已知后缀。
+    用于多服务器的海域名称标准化。
+
+    Args:
+        name (str): 原始海域名称。
+        suffixes (tuple[str, ...]): 要移除的后缀列表。
+        trim_chars (str): 要从尾部移除的字符集合。
+
+    Returns:
+        str: 处理后的海域名称。
+    """
     while trim_chars and any(name.endswith(char) for char in trim_chars):
         name = name[:-1]
     for suffix in suffixes:
@@ -25,6 +61,15 @@ def _remove_zone_suffix(name, suffixes, trim_chars=''):
 
 
 class OSMapOperation(MapOrderHandler, MissionHandler, PortHandler, StorageHandler, OSFleetSelector):
+    """大世界海域操作类。
+
+    整合地图命令处理器、任务处理器、港口处理器、仓库处理器和舰队选择器，
+    提供海域层面的完整操作能力。
+
+    Attributes:
+        zone (Zone): 当前海域对象。
+        is_zone_name_hidden (bool): 海域名称是否被安全区标记遮挡。
+    """
     zone: Zone
     is_zone_name_hidden = False
 
@@ -61,8 +106,13 @@ class OSMapOperation(MapOrderHandler, MissionHandler, PortHandler, StorageHandle
 
     @Config.when(SERVER='en')
     def get_zone_name(self):
+        """识别并清洗当前海域名称（美服专用）。
+
+        Returns:
+            str: 清洗后的海域名称字符串。
+        """
         # 仅用于 EN 服务器
-        ocr = Ocr(MAP_NAME, lang='cnocr', letter=(206, 223, 247), threshold=96, name='OCR_OS_MAP_NAME')
+        ocr = Ocr(MAP_NAME, lang='ppocr_v6', letter=(206, 223, 247), threshold=96, name='OCR_OS_MAP_NAME')
         name = ocr.ocr(self.device.image)
         name = "".join(name.split())
         name = name.lower()
@@ -95,6 +145,11 @@ class OSMapOperation(MapOrderHandler, MissionHandler, PortHandler, StorageHandle
 
     @Config.when(SERVER='jp')
     def get_zone_name(self):
+        """识别并清洗当前海域名称（日服专用）。
+
+        Returns:
+            str: 清洗后的海域名称字符串。
+        """
         # 仅用于 JP 服务器
         ocr = Ocr(MAP_NAME, lang='jp', letter=(157, 173, 192), threshold=127, name='OCR_OS_MAP_NAME')
         name = ocr.ocr(self.device.image)
@@ -135,6 +190,11 @@ class OSMapOperation(MapOrderHandler, MissionHandler, PortHandler, StorageHandle
 
     @Config.when(SERVER='tw')
     def get_zone_name(self):
+        """识别并清洗当前海域名称（台服专用）。
+
+        Returns:
+            str: 清洗后的海域名称字符串。
+        """
         # 仅用于 TW 服务器
         ocr = Ocr(MAP_NAME, lang='tw', letter=(198, 215, 239), threshold=127, name='OCR_OS_MAP_NAME')
         name = ocr.ocr(self.device.image)
@@ -160,6 +220,11 @@ class OSMapOperation(MapOrderHandler, MissionHandler, PortHandler, StorageHandle
 
     @Config.when(SERVER=None)
     def get_zone_name(self):
+        """识别并清洗当前海域名称（国服默认）。
+
+        Returns:
+            str: 清洗后的海域名称字符串。
+        """
         # 仅用于 CN 服务器
         ocr = Ocr(MAP_NAME, lang='cnocr', letter=(214, 231, 255), threshold=127, name='OCR_OS_MAP_NAME')
         name = ocr.ocr(self.device.image)
@@ -179,7 +244,8 @@ class OSMapOperation(MapOrderHandler, MissionHandler, PortHandler, StorageHandle
         return name
 
     def get_current_zone(self):
-        """
+        """获取并解析当前海域对象。
+
         Returns:
             Zone: 当前海域对象。
 
@@ -187,17 +253,24 @@ class OSMapOperation(MapOrderHandler, MissionHandler, PortHandler, StorageHandle
             MapDetectionError: 解析海域名称失败时抛出。
             ScriptError: 脚本错误时抛出。
         """
+        # 等待 UI 过渡动画完成后再截图，避免 OCR 读取到不完整的海域名称
+        self.device.sleep(0.3)
+        self.device.screenshot()
         name = self.get_zone_name()
-        logger.info(f'Map name processed: {name}')
+        logger.info(f'[大世界-地图操作] 地图名称已处理: {name}')
         try:
             self.zone = self.name_to_zone(name)
         except ScriptError as e:
             raise MapDetectionError(*e.args) from e
-        logger.attr('Zone', self.zone)
+        logger.attr('海域', self.zone)
         self.zone_config_set()
         return self.zone
 
     def zone_config_set(self):
+        """根据当前海域区域设置地图检测参数。
+
+        区域 5（极地海域）使用不同的边缘颜色范围和角落检测方向。
+        """
         if self.zone.region == 5:
             self.config.HOMO_EDGE_COLOR_RANGE = (0, 8)
             self.config.MAP_ENSURE_EDGE_INSIGHT_CORNER = 'bottom'
@@ -219,9 +292,9 @@ class OSMapOperation(MapOrderHandler, MissionHandler, PortHandler, StorageHandle
         Raises:
             MapDetectionError: 解析海域名称失败时抛出。
         """
-        logger.hr('Zone init')
+        logger.hr('[大世界-地图操作] 区域初始化')
         self.wait_os_map_buttons()
-        logger.info('Get zone name')
+        logger.info('[大世界-地图操作] 获取区域名称')
         timeout = Timer(1.5, count=5).start()
         for _ in self.loop():
             # 处理弹窗
@@ -248,7 +321,7 @@ class OSMapOperation(MapOrderHandler, MissionHandler, PortHandler, StorageHandle
                 continue
 
             if timeout.reached():
-                logger.warning('Zone init timeout')
+                logger.warning('[大世界-地图操作] 区域初始化超时')
                 break
             if self.is_in_map():
                 try:
@@ -259,13 +332,13 @@ class OSMapOperation(MapOrderHandler, MissionHandler, PortHandler, StorageHandle
                 timeout.reset()
 
         if fallback_init:
-            logger.warning('Unable to get zone name, get current zone from globe map instead')
+            logger.warning('[大世界-地图] 无法获取区域名称，从地球仪获取当前区域')
             if hasattr(self, 'get_current_zone_from_globe'):
                 return self.get_current_zone_from_globe()
             else:
-                logger.warning('OperationSiren.get_current_zone_from_globe() not exists')
+                logger.warning('[大世界-地图] OperationSiren.get_current_zone_from_globe() 不存在')
                 if not self.is_in_map():
-                    logger.warning('Trying to get zone name, but not in OS map')
+                    logger.warning('[大世界-地图操作] 尝试获取区域名称，但不在大世界地图中')
                 return self.get_current_zone()
 
     def is_in_special_zone(self):
@@ -275,15 +348,18 @@ class OSMapOperation(MapOrderHandler, MissionHandler, PortHandler, StorageHandle
         """
         return self.appear(MAP_EXIT, offset=(20, 20), similarity=0.75)
 
-    def map_exit(self):
+    def map_exit(self, drop=None):
         """
         从隐秘海域、深渊海域或要塞中退出。
+
+        Args:
+            drop (DropImage, optional): 收集退出海域时出现的结算与领奖弹窗。
 
         Pages:
             in: is_in_map
             out: is_in_map, 来源海域
         """
-        logger.hr('Map exit')
+        logger.hr('[大世界-地图操作] 地图退出')
         confirm_timer = Timer(1, count=2)
         changed = False
         for _ in self.loop():
@@ -303,11 +379,14 @@ class OSMapOperation(MapOrderHandler, MissionHandler, PortHandler, StorageHandle
             if self.handle_popup_confirm('MAP_EXIT'):
                 self.interval_reset(MAP_EXIT)
                 continue
-            if self.appear_then_click(AUTO_SEARCH_REWARD, offset=(50, 50)):
+            if self.appear(AUTO_SEARCH_REWARD, offset=(50, 50), interval=2):
                 # 偶尔会出现
+                if drop:
+                    drop.add(self.device.image)
+                self.device.click(AUTO_SEARCH_REWARD)
                 self.device.screenshot_interval_set()
                 continue
-            if self.handle_map_event():
+            if self.handle_map_event(drop=drop):
                 self.interval_reset(MAP_EXIT)
                 changed = True
                 continue

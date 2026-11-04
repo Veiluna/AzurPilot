@@ -1,10 +1,17 @@
+"""医院活动线索识别模块。
+
+通过图像处理和 OCR 识别医院活动中的线索信息。包含矩形
+合并、文本行聚类等图像预处理逻辑，用于从线索界面截图中
+提取并解析线索文本内容。
+"""
+
 from functools import reduce
 from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-from module.base.utils import area_offset, color_similarity_2d, image_size, rgb2gray, xywh2xyxy
+from module.base.utils import area_offset, color_mask, image_size, rgb2gray, xywh2xyxy
 from module.event_hospital.assets import *
 from module.event_hospital.ui import HospitalUI
 from module.logger import logger
@@ -17,7 +24,15 @@ def merge_two_rects(
         r1: Tuple[int, int, int, int],
         r2: Tuple[int, int, int, int]
 ) -> Tuple[int, int, int, int]:
-    """合并两个矩形区域，返回包含两者的最小矩形。"""
+    """合并两个矩形区域，返回包含两者的最小矩形。
+
+    Args:
+        r1 (Tuple[int, int, int, int]): 第一个矩形坐标 (x1, y1, x2, y2)。
+        r2 (Tuple[int, int, int, int]): 第二个矩形坐标 (x1, y1, x2, y2)。
+
+    Returns:
+        Tuple[int, int, int, int]: 包含两者的最小外接矩形。
+    """
     return (
         min(r1[0], r2[0]),
         min(r1[1], r2[1]),
@@ -27,7 +42,15 @@ def merge_two_rects(
 
 
 def merge_rows(list_word, merge):
-    """将相近的文本行合并为同一行。"""
+    """将垂直间距相近的文本行合并为同一行。
+
+    Args:
+        list_word (list): 包含 (矩形坐标, 中心y坐标) 的元组列表。
+        merge (int): 允许合并的最大垂直像素间距。
+
+    Returns:
+        list: 合并后的行矩形坐标列表。
+    """
     # 按 y 坐标排序
     list_word = sorted(list_word, key=lambda x: x[1])
 
@@ -53,6 +76,11 @@ def merge_rows(list_word, merge):
 
 
 class HospitalClue(HospitalUI):
+    """医院活动线索分析与交互处理器。
+
+    继承自 HospitalUI，负责线索旁白列表解析、未完成调查检测以及线索界面进退与选择。
+    """
+
     def get_clue_list(self) -> List[Button]:
         """获取线索列表中所有旁白按钮。
 
@@ -65,12 +93,10 @@ class HospitalClue(HospitalUI):
         area = CLUE_LIST.area
         image = self.image_crop(area, copy=False)
 
-        # 灰色文字掩码
-        gray = color_similarity_2d(image, color=(132, 134, 148))
-        cv2.inRange(gray, 215, 255, dst=gray)
+        # 灰色文字掩码（容差 40 等价于旧相似度阈值 215）
+        gray = color_mask(image, color=(132, 134, 148), threshold=40)
         # 白色文字掩码（已选中的旁白）
-        white = color_similarity_2d(image, color=(255, 255, 255))
-        cv2.inRange(white, 215, 255, dst=white)
+        white = color_mask(image, color=(255, 255, 255), threshold=40)
         # 清除白色像素周围的灰色掩码
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (200, 20))
         white_expanded = cv2.dilate(white, kernel)
@@ -153,7 +179,7 @@ class HospitalClue(HospitalUI):
             in: 医院活动任意子页面
             out: is_in_clue
         """
-        logger.info('Hospital clue enter')
+        logger.info('进入医院线索')
         self.interval_clear(page_hospital.check_button)
         while 1:
             if skip_first_screenshot:
@@ -172,7 +198,7 @@ class HospitalClue(HospitalUI):
             in: 医院活动任意子页面
             out: page_hospital
         """
-        logger.info('Hospital clue exit')
+        logger.info('退出医院线索')
         self.interval_clear(HOSIPITAL_CLUE_CHECK)
         while 1:
             if skip_first_screenshot:
@@ -201,7 +227,7 @@ class HospitalClue(HospitalUI):
             in: is_in_clue
             out: FLEET_PREPARATION
         """
-        logger.info('Clue invest')
+        logger.info('线索投资')
         self.interval_clear(HOSIPITAL_CLUE_CHECK)
         while 1:
             if skip_first_screenshot:
@@ -214,9 +240,9 @@ class HospitalClue(HospitalUI):
             if self.is_in_clue(interval=2):
                 invest = next(self.iter_invest(), None)
                 if invest is None:
-                    logger.info('No more invest')
+                    logger.info('无更多投资')
                     return False
-                logger.info(f'is_in_clue -> {invest}')
+                logger.info(f'线索中 -> {invest}')
                 self.device.click(invest)
                 self.interval_reset(HOSIPITAL_CLUE_CHECK, interval=2)
                 continue
@@ -233,11 +259,11 @@ class HospitalClue(HospitalUI):
         Yields:
             Button: 未完成的调查按钮。
         """
-        logger.hr('Iter invest')
+        logger.hr('迭代投资')
         scroll = Scroll(INVEST_SCROLL, color=(107, 97, 107), name='INVEST_SCROLL')
         # 无滚动条时只检查当前页
         if not scroll.appear(main=self):
-            logger.info('No scroll')
+            logger.info('无滚动条')
             button = self.get_invest_button()
             if button:
                 yield button
@@ -257,7 +283,7 @@ class HospitalClue(HospitalUI):
         # 逐页遍历
         while 1:
             if scroll.at_bottom(main=self):
-                logger.info(f'{scroll.name} reached end')
+                logger.info(f'{scroll.name} 到达终点')
                 return
             scroll.next_page(main=self, page=0.5)
             button = self.get_invest_button()
@@ -270,7 +296,7 @@ class HospitalClue(HospitalUI):
         search = CLUE_LIST.area
         # 检查周围是否有深色背景
         area = (search[0], area[1], search[2], area[3])
-        return self.image_color_count(area, color=(82, 85, 107), threshold=221, count=500)
+        return self.image_color_count(area, color=(82, 85, 107), threshold=30, count=500)
 
     def is_aside_checked(self, button: Button) -> bool:
         """检查旁白是否已完成（青色标记）。"""
@@ -278,7 +304,7 @@ class HospitalClue(HospitalUI):
         search = CLUE_LIST.area
         # 检查是否有青色标记，JP 服文字溢出故右边界设为 308
         area = (search[0], area[1], 308, area[3])
-        return self.image_color_count(area, color=(74, 130, 148), threshold=221, count=20)
+        return self.image_color_count(area, color=(74, 130, 148), threshold=30, count=20)
 
     def iter_aside(self):
         """遍历所有未完成的旁白按钮。
@@ -308,7 +334,7 @@ class HospitalClue(HospitalUI):
         Pages:
             in: is_in_clue
         """
-        logger.info(f'Select aside')
+        logger.info(f'选择旁白')
         aside = None
         self.interval_clear(HOSIPITAL_CLUE_CHECK)
         while 1:
@@ -322,9 +348,9 @@ class HospitalClue(HospitalUI):
             if self.is_in_clue(interval=2):
                 aside = next(self.iter_aside(), None)
                 if aside is None:
-                    logger.info('No more aside')
+                    logger.info('无更多旁白')
                     return False
-                logger.info(f'is_in_clue -> {aside}')
+                logger.info(f'线索中 -> {aside}')
                 self.device.click(aside)
                 self.interval_reset(HOSIPITAL_CLUE_CHECK, interval=2)
                 continue

@@ -1,3 +1,23 @@
+"""全球地图操作模块。
+
+管理大世界全球地图视图中的操作，包括：
+- 海域类型检测（危险区、安全区、隐秘海域、深渊海域、要塞、档案）
+- 海域选择和进入
+- 固定海域（Pinned Zone）的导航
+- 行动力管理
+- 自动搜索奖励处理
+
+海域类型：
+- DANGEROUS: 危险海域（未清理）
+- SAFE: 安全海域（已清理）
+- OBSCURE: 隐秘海域（特殊条件进入）
+- ABYSSAL: 深渊海域（强力敌人）
+- STRONGHOLD: 塞壬要塞
+- ARCHIVE: 档案海域
+
+继承自 ActionPointHandler，提供行动力管理能力。
+"""
+
 import time
 import module.base.utils as _base_utils
 from module.base.timer import Timer
@@ -9,8 +29,11 @@ from module.os_handler.assets import AUTO_SEARCH_REWARD
 from module.os_handler.port import PORT_CHECK
 from module.ui.assets import BACK_ARROW
 
+# 海域类型按钮列表
 ZONE_TYPES = [ZONE_DANGEROUS, ZONE_SAFE, ZONE_OBSCURE, ZONE_ABYSSAL, ZONE_STRONGHOLD, ZONE_ARCHIVE]
+# 海域选择按钮列表（与 ZONE_TYPES 一一对应）
 ZONE_SELECT = [SELECT_DANGEROUS, SELECT_SAFE, SELECT_OBSCURE, SELECT_ABYSSAL, SELECT_STRONGHOLD, SELECT_ARCHIVE]
+# 固定海域检测的资源列表
 ASSETS_PINNED_ZONE = ZONE_TYPES + [ZONE_ENTRANCE, ZONE_SWITCH, ZONE_PINNED]
 
 # Under a certain scene, the similarity are as follows:
@@ -62,15 +85,26 @@ class RewardUncollectedError(Exception):
 
 
 class GlobeOperation(ActionPointHandler):
+    """全球地图操作类。
+
+    提供大世界全球地图界面的各种交互能力，包括海域固定、海域类型切换、
+    海域进出和行动力消耗处理。
+    """
     _zone_unpin_interval = Timer(0.5)
 
     def is_in_globe(self):
+        """检查当前是否处于大世界全球地图界面。
+
+        Returns:
+            bool: 处于全球地图返回 True，否则返回 False。
+        """
         return self.appear(GLOBE_GOTO_MAP, offset=(20, 20), similarity=0.75)
 
     def get_zone_pinned(self):
-        """
+        """获取当前固定的海域按钮。
+
         Returns:
-            Button: 当前固定的海域按钮，无则返回 None。
+            Button | None: 当前固定的海域按钮，无则返回 None。
         """
         similarity = _ZONE_PINNED_SIMILARITY_THRESHOLDS.get(
             _base_utils.TEMPLATE_MATCH_NON_NATIVE_720P_RESOLUTION,
@@ -86,7 +120,8 @@ class GlobeOperation(ActionPointHandler):
         return None
 
     def is_zone_pinned(self):
-        """
+        """检查是否有海域被固定显示。
+
         Returns:
             bool: 是否有海域被固定显示。
         """
@@ -94,7 +129,8 @@ class GlobeOperation(ActionPointHandler):
 
     @staticmethod
     def pinned_to_name(button):
-        """
+        """将海域固定按钮转换为海域类型名称字符串。
+
         Args:
             button (Button): 海域类型按钮。
 
@@ -104,7 +140,8 @@ class GlobeOperation(ActionPointHandler):
         return button.name.split('_')[1]
 
     def get_zone_pinned_name(self):
-        """
+        """获取当前固定海域的类型名称。
+
         Returns:
             str: 海域类型名称（DANGEROUS、SAFE、OBSCURE、ABYSSAL、STRONGHOLD、ARCHIVE），无固定海域时返回空字符串。
         """
@@ -115,8 +152,7 @@ class GlobeOperation(ActionPointHandler):
             return ''
 
     def handle_zone_pinned(self):
-        """
-        关闭固定海域信息弹窗。
+        """关闭固定海域信息弹窗。
 
         Returns:
             bool: 是否处理了弹窗。
@@ -125,7 +161,7 @@ class GlobeOperation(ActionPointHandler):
             return False
 
         if self.is_zone_pinned():
-            # A click does not disable pinned zone, a swipe does.
+            # 点击无法关闭固定海域，必须执行滑动
             self.device.swipe_vector(
                 (50, -50), box=area_pad(ZONE_PINNED.area, pad=-80), random_range=(-10, -10, 10, 10),
                 padding=0, name='PINNED_DISABLE')
@@ -135,6 +171,7 @@ class GlobeOperation(ActionPointHandler):
         return False
 
     def ensure_no_zone_pinned(self):
+        """确保当前没有海域处于固定选中状态。"""
         confirm_timer = Timer(1, count=2).start()
         for _ in self.loop():
             if self.handle_zone_pinned():
@@ -207,12 +244,11 @@ class GlobeOperation(ActionPointHandler):
             record = len(selection)
             self.device.screenshot()
 
-        logger.warning('Failed to ensure zone selection expanded, assume expanded')
+        logger.warning('[大世界-操作] 无法确保区域选择已展开，假设已展开')
         return self.get_zone_select()
 
     def zone_select_enter(self):
-        """
-        进入海域类型选择界面。
+        """进入海域类型选择界面。
 
         Pages:
             in: is_zone_pinned
@@ -224,7 +260,8 @@ class GlobeOperation(ActionPointHandler):
         time.sleep(0.015)
 
     def zone_select_execute(self, button):
-        """
+        """执行选择指定海域类型操作。
+
         Args:
             button (Button): 要选择的海域类型按钮，为 SELECT_* 按钮之一。
 
@@ -232,7 +269,7 @@ class GlobeOperation(ActionPointHandler):
             in: is_in_zone_select
             out: is_zone_pinned
         """
-        logger.info(f'Zone select: {button}')
+        logger.info(f'区域选择: {button}')
         for _ in self.loop():
             # End
             if self.is_zone_pinned():
@@ -242,9 +279,10 @@ class GlobeOperation(ActionPointHandler):
                 continue
 
     def zone_type_select(self, types=('SAFE', 'DANGEROUS')):
-        """
+        """选择指定的海域类型。
+
         Args:
-            types (tuple[str], list[str], str): 海域类型名称或其列表。
+            types (tuple[str, ...] | list[str] | str): 海域类型名称或其列表。
                 可用类型：DANGEROUS、SAFE、OBSCURE、ABYSSAL、STRONGHOLD、ARCHIVE。
                 按列表顺序优先尝试选择，不可用时尝试下一个。
                 若无匹配项则不执行操作。
@@ -257,7 +295,7 @@ class GlobeOperation(ActionPointHandler):
             out: is_zone_pinned
         """
         if not self.zone_has_switch():
-            logger.info('Zone has no type to select, skip')
+            logger.info('区域无类型可选，跳过')
             return True
 
         if isinstance(types, str):
@@ -275,41 +313,40 @@ class GlobeOperation(ActionPointHandler):
 
         pinned = self.get_zone_pinned_name()
         if pinned in types:
-            logger.info(f'Already selected at {pinned}')
+            logger.info(f'已选择于 {pinned}')
             return True
 
         for _ in range(3):
             self.zone_select_enter()
             selection = self.ensure_zone_select_expanded()
-            logger.attr('Zone_selection', selection)
+            logger.attr('海域选择', selection)
 
             button = get_button(selection)
             if button is None:
                 # 获取所有可用的区域类型（不含SELECT_前缀）
                 available_types = [getattr(sel, 'name', str(sel)).replace('SELECT_', '') for sel in selection]
                 logger.warning(
-                    f'Zone type {requested_type} not found in selection, '
-                    f'available types: {available_types}, '
-                    f'fallback to default (SAFE > DANGEROUS)'
+                    f'[大世界-操作] 海域类型 {requested_type} 未在选择列表中, '
+                    f'可用类型: {available_types}, '
+                    f'回退到默认 (SAFE > DANGEROUS)'
                 )
                 # 回退到安全的默认优先级，而不是选择列表中的第一个
                 # 这样在有深渊海域时不会错误地进入深渊而是选择安全海域
                 types = ('SAFE', 'DANGEROUS')
                 button = get_button(selection)
                 if button is None:
-                    logger.warning('No zone type selection available')
+                    logger.warning('[大世界-操作] 无区域类型可选')
                     return False
 
             self.zone_select_execute(button)
             if self.pinned_to_name(button) == self.get_zone_pinned_name():
                 return True
 
-        logger.warning('Failed to select zone type after 3 trial')
+        logger.warning('[大世界-操作] 尝试3次后仍无法选择区域类型')
         return False
 
     def zone_has_safe(self):
-        """
-        检查并选择海域类型：优先选择 SAFE，否则选择 DANGEROUS（每个海域都有）。
+        """检查并选择海域类型：优先选择 SAFE，否则选择 DANGEROUS。
 
         Returns:
             bool: 是否存在 SAFE 类型。
@@ -331,8 +368,13 @@ class GlobeOperation(ActionPointHandler):
             return False
 
     def os_globe_goto_map(self, skip_first_screenshot=True):
-        """
-        从全球地图进入海域地图。
+        """从全球地图进入海域地图。
+
+        Args:
+            skip_first_screenshot (bool): 是否跳过首次截图。默认 True。
+
+        Returns:
+            bool: 成功进入海域地图返回 True。
 
         Pages:
             in: is_in_globe
@@ -346,10 +388,11 @@ class GlobeOperation(ActionPointHandler):
                 self.device.screenshot()
 
             if self.is_in_map():
+                time.sleep(1)
                 break
 
             if self.appear(PORT_CHECK, offset=(20, 20), interval=3):
-                logger.info('Accidentally entered port, exiting')
+                logger.info('误入港口，退出')
                 self.device.click(BACK_ARROW)
                 self.interval_reset(GLOBE_GOTO_MAP)
                 continue
@@ -359,11 +402,13 @@ class GlobeOperation(ActionPointHandler):
         return True
 
     def os_map_goto_globe(self, unpin=True):
-        """
-        从海域地图返回全球地图。
+        """从海域地图返回全球地图。
 
         Args:
-            unpin (bool): 是否取消海域固定信息。
+            unpin (bool): 是否取消海域固定信息。默认 True。
+
+        Raises:
+            RewardUncollectedError: 有未收集的探索奖励阻止退出时抛出。
 
         Pages:
             in: is_in_map
@@ -382,8 +427,7 @@ class GlobeOperation(ActionPointHandler):
                 click_count += 1
                 if click_count >= 5:
                     # 当海域存在探索奖励时，游戏不会允许你离开。
-                    logger.warning('Unable to goto globe, '
-                                   'there might be uncollected zone exploration rewards preventing exit')
+                    logger.warning('[大世界-操作] 无法前往全球地图, 可能有未收集的海域探索奖励阻止退出')
                     raise RewardUncollectedError
                 continue
             if self.appear_then_click(MAP_GOTO_GLOBE_FOG, interval=5):
@@ -394,7 +438,7 @@ class GlobeOperation(ActionPointHandler):
                 continue
             # 意外进入港口
             if self.appear(PORT_CHECK, offset=(20, 20), interval=5):
-                logger.info(f'Page switch: {PORT_CHECK} -> {BACK_ARROW}')
+                logger.info(f'页面切换: {PORT_CHECK} -> {BACK_ARROW}')
                 self.device.click(BACK_ARROW)
                 continue
             # 弹窗：AUTO_SEARCH_REWARD 出现较慢
@@ -407,22 +451,19 @@ class GlobeOperation(ActionPointHandler):
                 continue
 
         confirm_timer = Timer(1, count=2).start()
-        unpinned = 0
         for _ in self.loop():
             if unpin:
                 if self.handle_zone_pinned():
-                    unpinned += 1
                     confirm_timer.reset()
                 else:
-                    if unpinned and confirm_timer.reached():
+                    if self.is_in_globe() and confirm_timer.reached():
                         break
             else:
                 if self.is_zone_pinned():
                     break
 
     def globe_enter(self, zone):
-        """
-        从全球地图进入指定海域。
+        """从全球地图进入指定海域。
 
         Args:
             zone (Zone): 要进入的海域。
@@ -443,14 +484,16 @@ class GlobeOperation(ActionPointHandler):
 
             # End
             if self.is_in_map():
+                if click_count > 0:
+                    time.sleep(1)
                 break
 
             if self.is_zone_pinned():
                 if self.appear(ZONE_LOCKED, offset=(20, 20)):
-                    logger.warning(f'Zone {zone} locked, neighbouring zones may not have been explored')
+                    logger.warning(f'[大世界-操作] 海域 {zone} 已锁定, 相邻海域可能未被探索过')
                     raise OSExploreError
                 if click_count > 5:
-                    logger.warning(f'Unable to enter zone {zone}, neighbouring zones may not have been explored')
+                    logger.warning(f'[大世界-操作] 无法进入海域 {zone}, 相邻海域可能未被探索过')
                     raise OSExploreError
                 if click_timer.reached():
                     # 点太快会进不去 浪费时间

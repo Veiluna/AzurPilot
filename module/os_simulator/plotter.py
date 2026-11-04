@@ -1,7 +1,14 @@
-import os
+"""大世界模拟器可视化模块。
+
+提供大世界模拟器的图表绘制功能，包括单样本轨迹图、
+多轮模拟的行动力/代币/完成海域数分布直方图以及
+综合报告图，使用 matplotlib 生成并保存为 PNG 图像。
+"""
 import numpy as np
 import matplotlib
 from datetime import datetime
+from pathlib import Path
+from threading import RLock
 
 from module.os_simulator.constants import *
 
@@ -16,17 +23,37 @@ plt.rcParams['font.sans-serif'] = [
     'Droid Sans Fallback'  # Fallback
 ]
 plt.rcParams['axes.unicode_minus'] = False
+PLOT_LOCK = RLock()
 
 class OSSimulatorPlotter:
-    def __init__(self, logger):
+    """大世界模拟器图表绘制器。
+
+    负责将单样本或多样本蒙特卡洛模拟的历史轨迹与统计分布绘制为图像。
+
+    Attributes:
+        logger: 日志器实例。
+        result_figure_path (str): 最近一次保存图表的文件路径。
+    """
+
+    def __init__(self, logger, directory=None):
+        """初始化图表绘制器。
+
+        Args:
+            logger: 日志器实例。
+        """
         self.logger = logger
         self.result_figure_path = ''
+        self.directory = Path(directory or './log/oss/figures')
 
     def plot_single_sample_history(self, history_single):
+        """绘制单样本轨迹图。
+
+        包含时间、行动力、黄币走势，并用背景色区分侵蚀1、耄耋相接与坠机状态。
+
+        Args:
+            history_single (dict): 单个样本的历史记录字典，包含 time, ap, coin, status 序列。
         """
-        绘制单样本轨迹图。
-        """
-        self.logger.info("正在生成单样本轨迹图...")
+        self.logger.info("[大世界模拟器] 正在生成单样本轨迹图...")
         
         fig, ax1 = plt.subplots(figsize=(18, 6))
         
@@ -68,13 +95,13 @@ class OSSimulatorPlotter:
                 ax1.axvspan(start_t, times[-1], facecolor='red', alpha=0.15)
                 
         cl1_patch = mpatches.Patch(color='green', alpha=0.15, label='侵蚀1')
-        meow_patch = mpatches.Patch(color='orange', alpha=0.15, label='短猫')
+        meow_patch = mpatches.Patch(color='orange', alpha=0.15, label='耄耋相接')
         crash_patch = mpatches.Patch(color='red', alpha=0.15, label='坠机')
         
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax1.legend(lines1 + lines2 + [cl1_patch, meow_patch, crash_patch], 
-                labels1 + labels2 + ['侵蚀1', '短猫', '坠机'], 
+                labels1 + labels2 + ['侵蚀1', '耄耋相接', '坠机'],
                 loc='upper left')
 
         plt.title('大世界模拟器: 单样本轨迹图')
@@ -83,10 +110,15 @@ class OSSimulatorPlotter:
         self._save(fig, 'single_sample')
 
     def plot_multi_sample_history(self, result, history_multi_avg):
+        """绘制多样本平均值和标准差随时间变化的轨迹图。
+
+        展示平均行动力、平均黄币（含标准差带）以及累计坠机概率。
+
+        Args:
+            result: 模拟总体结果对象。
+            history_multi_avg (dict): 多样本均值与方差统计数据字典。
         """
-        多样本模式：绘制所有样本的平均值和标准差随时间变化的轨迹图。
-        """
-        self.logger.info("正在生成多样本平均轨迹图...")
+        self.logger.info("[大世界模拟器] 正在生成多样本平均轨迹图...")
         
         fig, ax1 = plt.subplots(figsize=(18, 6))
         
@@ -129,9 +161,19 @@ class OSSimulatorPlotter:
         self._save(fig, 'multi_sample')
 
     def _save(self, fig, name):
-        os.makedirs('./log/oss/figures', exist_ok=True)
-        self.result_figure_path = f'./log/oss/figures/{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{name}.png'
-        plt.savefig(self.result_figure_path)
-        self.logger.info(f"图表已保存至: {self.result_figure_path}")
-        plt.close()
+        """保存 matplotlib 图表为 PNG 文件。
+
+        Args:
+            fig (matplotlib.figure.Figure): 待保存的图表对象。
+            name (str): 图表文件标识名。
+
+        Returns:
+            str: 保存的文件相对路径。
+        """
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.directory / f'{datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")}_{name}.png'
+        fig.savefig(path)
+        self.result_figure_path = str(path)
+        self.logger.info(f"[大世界模拟器] 图表已保存至: {self.result_figure_path}")
+        plt.close(fig)
         return self.result_figure_path

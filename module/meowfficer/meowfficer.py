@@ -1,56 +1,60 @@
+"""指挥喵任务调度模块。
+
+作为指挥喵系统（Meowfficer）的顶层任务入口，负责编排指挥喵相关的所有子任务：
+- 指挥喵购买（Buy）：消耗金币购买指挥喵猫箱
+- 指挥喵要塞（Fort）：执行要塞日常任务
+- 指挥喵训练（Train）：收集已训练的指挥喵并排队训练新猫箱
+- 指挥喵强化（Enhance）：消耗多余指挥喵为目标指挥喵提供经验值
+
+根据配置决定执行哪些子任务，并安排下次执行的调度时间。
+训练模式下，强化操作在每周日或无缝模式下自动执行。
+
+配置项前缀：`Meowfficer_*`、`MeowfficerTrain_*`
+"""
+
 from module.meowfficer.buy import MeowfficerBuy
 from module.meowfficer.fort import MeowfficerFort
 from module.meowfficer.train import MeowfficerTrain
 from module.ui.page import page_meowfficer
-from module.meowfficer.assets import MEOWFFICER_BUY_ENTER
 
 
 class RewardMeowfficer(MeowfficerBuy, MeowfficerFort, MeowfficerTrain):
-    def wait_meowfficer_buttons(self, skip_first_screenshot=True):
-        """
-        等待指挥喵 UI 完全加载。
+    """指挥喵任务调度器。
 
-        MEOWFFICER_INFO 和 MEOWFFICER_BUY_ENTER 的加载速度慢于 MEOWFFICER_CHECK，
-        需要等待它们出现后才能进行后续操作。
-        """
-        while 1:
-            if skip_first_screenshot:
-                skip_first_screenshot = False
-            else:
-                self.device.screenshot()
+    继承购买、要塞、训练三个子模块，按配置依次执行对应的指挥喵操作。
+    所有子任务完成后，根据是否启用训练功能安排不同的延迟时间：
+    - 训练模式：延迟 2.5~3.5 小时（等待训练完成）
+    - 非训练模式：延迟至服务器更新时间
 
-            if self.appear(MEOWFFICER_BUY_ENTER, offset=(20, 20)):
-                break
-
-            # MEOWFFICER_INFO
-            if self.ui_additional():
-                continue
-
+    继承关系：
+        MeowfficerBuy: 指挥喵购买功能
+        MeowfficerFort: 指挥喵要塞功能
+        MeowfficerTrain: 指挥喵训练功能
+    """
     def run(self):
-        """
-        执行指挥喵的购买、强化、训练和小屋操作（仅执行配置中启用的操作）。
+        """执行指挥喵模块的主调度任务。
+
+        根据配置依次执行购买、打扫猫窝、训练与强化操作，并设置下次执行的调度延迟。
 
         Pages:
             in: 任意页面
             out: page_meowfficer
         """
         if self.config.Meowfficer_BuyAmount <= 0 \
-                and self.config.Meowfficer_OverflowCoins == -1 \
                 and not self.config.Meowfficer_FortChoreMeowfficer \
                 and not self.config.MeowfficerTrain_Enable:
             self.config.Scheduler_Enable = False
             self.config.task_stop()
 
         self.ui_ensure(page_meowfficer)
-        self.wait_meowfficer_buttons()  # 等待 UI 完全加载
+        self.wait_meowfficer_buttons()  # 等待界面完全加载
 
-        if self.config.Meowfficer_BuyAmount > 0 \
-                or self.config.Meowfficer_OverflowCoins != -1:
+        if self.config.Meowfficer_BuyAmount > 0:
             self.meow_buy()
         if self.config.Meowfficer_FortChoreMeowfficer:
             self.meow_fort()
 
-        # 训练
+        # 训练与强化
         if self.config.MeowfficerTrain_Enable:
             self.meow_train()
             if self.config.MeowfficerTrain_Mode == 'seamlessly':
@@ -60,13 +64,13 @@ class RewardMeowfficer(MeowfficerBuy, MeowfficerFort, MeowfficerTrain):
             else:
                 pass
 
-        # 调度
+        # 任务调度
         if self.config.MeowfficerTrain_Enable:
             # 指挥喵训练时长：
-            # - 蓝色品质，2.0h ~ 2.5h
-            # - 紫色品质，5.5h ~ 6.5h
-            # - 金色品质，9.5h ~ 10.5h
-            # 有指挥喵正在训练时，延迟 2.5h ~ 3.5h
+            # - 蓝箱：2.0h ~ 2.5h
+            # - 紫箱：5.5h ~ 6.5h
+            # - 金箱：9.5h ~ 10.5h
+            # 有指挥喵在训时延迟 2.5h ~ 3.5h
             self.config.task_delay(minute=(150, 210), server_update=True)
         else:
             self.config.task_delay(server_update=True)

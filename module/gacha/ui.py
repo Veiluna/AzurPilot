@@ -1,3 +1,10 @@
+"""建造系统 UI 处理模块。
+
+提供建造（Gacha）页面的 UI 操作，包括页面资源加载检测、
+侧边栏标签导航（轻型/重型/特型/限时建造）、
+建造池切换以及建造结果处理等界面交互功能。
+"""
+
 from module.base.button import ButtonGrid
 from module.base.decorator import cached_property
 from module.base.timer import Timer
@@ -11,19 +18,23 @@ GACHA_LOAD_ENSURE_BUTTONS = [SHOP_MEDAL_CHECK, BUILD_SUBMIT_ORDERS, BUILD_SUBMIT
 
 
 class GachaUI(UI):
+    """建造界面交互处理器。
+
+    负责处理建造主页面侧边栏、底部建造池导航栏的切换与加载确认。
+    """
+
     def gacha_load_ensure(self, skip_first_screenshot=True):
-        """
-        等待建造页面资源加载完成。
+        """等待建造页面资源加载完成。
 
         切换侧边栏后需要一定的处理时间才能完全加载，
         类似大舰队后勤页面的加载过程。
         通过截图循环检测目标按钮是否出现来判断加载是否完成。
 
         Args:
-            skip_first_screenshot: 是否跳过首次截图，复用上一次循环的截图。
+            skip_first_screenshot (bool): 是否跳过首次截图，默认 True。
 
         Returns:
-            资源是否加载完成。
+            bool: 资源加载完成返回 True，超时返回 False。
         """
         ensure_timeout = Timer(3, count=6).start()
         while 1:
@@ -39,17 +50,17 @@ class GachaUI(UI):
 
             # 超时异常——资源加载未完成
             if ensure_timeout.reached():
-                logger.warning('Wait for loaded assets is incomplete, ensure not guaranteed')
+                logger.warning('[建造-UI] 等待资源加载超时，加载未完成')
                 return False
 
     @cached_property
     def _gacha_side_navbar(self):
-        """
-        获取建造页面左侧侧边导航栏。
+        """获取建造页面左侧侧边导航栏。
 
         限时建造侧边栏有 5 个选项，常驻建造侧边栏有 4 个选项。
 
-        Pages: page_build
+        Pages:
+            in: page_build
 
         选项分布:
             限时建造 (5项): 建造、限定建造、兑换、商店、退役
@@ -61,24 +72,21 @@ class GachaUI(UI):
             name='GACHA_SIDE_NAVBAR')
 
         return Navbar(grids=gacha_side_navbar,
-                      active_color=(247, 255, 173), active_threshold=221,
-                      inactive_color=(140, 162, 181), inactive_threshold=221)
+                      active_color=(247, 255, 173), active_threshold=30,
+                      inactive_color=(140, 162, 181), inactive_threshold=30)
 
     def gacha_side_navbar_ensure(self, upper=None, bottom=None):
-        """
-        确保侧边导航栏切换到指定标签页并加载完成。
-
-        Pages: page_build
+        """确保侧边导航栏切换到指定标签页并加载完成。
 
         Args:
-            upper: 从上往下数的标签序号。
+            upper (int, optional): 从上往下数的标签序号。
                 限时建造|常驻建造
                     1     -> 建造
                     2|N/A -> 限定建造（仅限时）
                     3|2   -> 兑换
                     4|3   -> 商店
                     5|4   -> 退役
-            bottom: 从下往上数的标签序号。
+            bottom (int, optional): 从下往上数的标签序号。
                 限时建造|常驻建造
                     5|4   -> 建造
                     4|N/A -> 限定建造（仅限时）
@@ -87,11 +95,14 @@ class GachaUI(UI):
                     1     -> 退役
 
         Returns:
-            侧边导航栏是否切换成功。
+            bool: 侧边导航栏是否切换成功。
+
+        Pages:
+            in: page_build
         """
         retire_upper = 5 if self._gacha_side_navbar.get_total(main=self) == 5 else 4
         if upper == retire_upper or bottom == 1:
-            logger.warning('Transitions to "retire" is not supported')
+            logger.warning('[建造-UI] 不支持跳转到退役页面')
             return False
 
         if self._gacha_side_navbar.set(self, upper=upper, bottom=bottom) \
@@ -101,12 +112,12 @@ class GachaUI(UI):
 
     @cached_property
     def _construct_bottom_navbar(self):
-        """
-        获取建造页面底部标签导航栏。
+        """获取建造页面底部标签导航栏。
 
         限时建造底部有 4 个标签，常驻建造底部有 3 个标签。
 
-        Pages: page_build
+        Pages:
+            in: page_build
 
         选项分布:
             限时建造 (4项): 活动、轻型、重型、特型
@@ -123,12 +134,12 @@ class GachaUI(UI):
 
     @cached_property
     def _exchange_bottom_navbar(self):
-        """
-        获取兑换页面底部标签导航栏。
+        """获取兑换页面底部标签导航栏。
 
         兑换页面底部有 2 个标签。
 
-        Pages: page_build
+        Pages:
+            in: page_build
 
         选项分布:
             2项: 舰船、物品
@@ -143,16 +154,13 @@ class GachaUI(UI):
                       inactive_color=(189, 231, 247))
 
     def _gacha_bottom_navbar(self, is_build=True):
-        """
-        根据当前页面类型返回对应的底部导航栏。
-
-        建造页面返回建造底部导航栏，兑换页面返回兑换底部导航栏。
+        """根据当前页面类型返回对应的底部导航栏。
 
         Args:
-            is_build: 是否为建造页面。True 返回建造导航栏，False 返回兑换导航栏。
+            is_build (bool): 是否为建造页面，True 返回建造导航栏，False 返回兑换导航栏。
 
         Returns:
-            对应页面的底部 Navbar 实例。
+            Navbar: 对应页面的底部 Navbar 实例。
         """
         if is_build:
             return self._construct_bottom_navbar
@@ -160,13 +168,10 @@ class GachaUI(UI):
             return self._exchange_bottom_navbar
 
     def gacha_bottom_navbar_ensure(self, left=None, right=None, is_build=True):
-        """
-        确保底部标签导航栏切换到指定标签页并加载完成。
-
-        Pages: page_build
+        """确保底部标签导航栏切换到指定标签页并加载完成。
 
         Args:
-            left: 从左往右数的标签序号。
+            left (int, optional): 从左往右数的标签序号。
                 建造导航栏:
                     限时|常驻
                     1|N/A -> 活动
@@ -176,7 +181,7 @@ class GachaUI(UI):
                 兑换导航栏:
                     1     -> 舰船
                     2     -> 物品
-            right: 从右往左数的标签序号。
+            right (int, optional): 从右往左数的标签序号。
                 建造导航栏:
                     限时|常驻
                     4|N/A -> 活动
@@ -186,15 +191,18 @@ class GachaUI(UI):
                 兑换导航栏:
                     2     -> 舰船
                     1     -> 物品
-            is_build: 是否为建造页面。
+            is_build (bool): 是否为建造页面，默认 True。
 
         Returns:
-            底部导航栏是否切换成功。
+            bool: 底部导航栏是否切换成功。
+
+        Pages:
+            in: page_build
         """
         gacha_bottom_navbar = self._gacha_bottom_navbar(is_build)
         if is_build and gacha_bottom_navbar.get_total(main=self) == 3:
             if left == 1 or right == 4:
-                logger.info('Construct event not available, default to light')
+                logger.info('[建造-UI] 限时建造不可用，切换到轻型建造')
                 left = 1
                 right = None
             if left == 4:
@@ -206,10 +214,11 @@ class GachaUI(UI):
         return False
 
     def ui_goto_gacha(self):
-        """
-        导航到建造页面。
+        """导航到建造主页面。
 
-        Pages: out: *, in: page_build
+        Pages:
+            in: 任意页面
+            out: page_build
         """
         self.ui_ensure(page_build)
 

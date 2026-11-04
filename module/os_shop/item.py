@@ -1,3 +1,9 @@
+"""大世界商店物品数据模块。
+
+定义大世界商店的物品数据结构，包括价格 OCR 识别器（修正常见
+OCR 错误）、计数器 OCR 识别器以及商品价格区域的识别逻辑，
+为商店购买决策提供准确的价格和数量信息。
+"""
 from typing import List
 import module.config.server as server
 from module.logger import logger
@@ -13,13 +19,21 @@ class PriceOcr(DigitYuv):
     """
 
     def after_process(self, result):
+        """后处理识别结果，修正常见误识别字符和前导零。
+
+        Args:
+            result (str): 原始 OCR 结果。
+
+        Returns:
+            str: 修正后的价格字符串。
+        """
         result = result.replace('I', '1').replace('D', '0').replace('S', '5')
         result = result.replace('B', '8')
 
         prev = result
         if result.startswith('0'):
             result = '1' + result
-            logger.warning(f'OS shop amount {prev} is revised to {result}')
+            logger.warning(f'大世界商店+数量 {prev} 已修正为 {result}')
 
         result = super().after_process(result)
         return result
@@ -36,6 +50,14 @@ class CounterOcr(Ocr):
         super().__init__(buttons, lang=lang, letter=letter, threshold=threshold, alphabet=alphabet, name=name)
 
     def after_process(self, result):
+        """后处理计数器识别结果，替换易混淆字符。
+
+        Args:
+            result (str): 原始 OCR 结果。
+
+        Returns:
+            str: 修正后的字符串。
+        """
         result = super().after_process(result)
         result = result.replace('I', '1').replace('D', '0').replace('S', '5')
         result = result.replace('B', '8')
@@ -56,13 +78,13 @@ class CounterOcr(Ocr):
             parsed = []
             for i in result_list:
                 if not i or '/' not in i:
-                    logger.warning(f'Invalid OCR result format: {i}')
+                    logger.warning(f'计数器 OCR 结果格式无效: {i}')
                     parsed.append([0, 0])
                     continue
 
                 parts = i.split('/')
                 if len(parts) != 2:
-                    logger.warning(f'Invalid counter format: {i}')
+                    logger.warning(f'计数器格式无效: {i}')
                     parsed.append([0, 0])
                     continue
                 parsed.append([int(j) for j in parts])
@@ -70,12 +92,12 @@ class CounterOcr(Ocr):
             return parsed
         else:
             if not result_list or '/' not in result_list:
-                logger.warning(f'Invalid OCR result: {result_list}')
+                logger.warning(f'计数器 OCR 结果无效: {result_list}')
                 return [0, 0]
 
             parts = result_list.split('/')
             if len(parts) != 2:
-                logger.warning(f'Invalid counter format: {result_list}')
+                logger.warning(f'计数器格式无效: {result_list}')
                 return [0, 0]
 
             return [int(i) for i in parts]
@@ -90,7 +112,7 @@ else:
 
 
 class OSShopItem(Item):
-    """大世界商店物品类。
+    """大世界商店+物品类。
 
     扩展基础物品类，增加商店索引、滚动位置、库存计数等属性。
     """
@@ -109,6 +131,11 @@ class OSShopItem(Item):
 
     @shop_index.setter
     def shop_index(self, value):
+        """设置商店索引。
+
+        Args:
+            value (int): 商店索引。
+        """
         self._shop_index = value
 
     @property
@@ -118,6 +145,11 @@ class OSShopItem(Item):
 
     @scroll_pos.setter
     def scroll_pos(self, value):
+        """设置滚动位置。
+
+        Args:
+            value (float): 滚动位置。
+        """
         self._scroll_pos = value
 
     def is_known_item(self) -> bool:
@@ -155,14 +187,14 @@ class OSShopItem(Item):
 
 
 class OSShopItemGrid(ItemGrid):
-    """大世界商店物品网格类。
+    """大世界商店+物品网格类。
 
     支持物品识别、计数器 OCR、商店索引和滚动位置记录。
     """
 
     item_class = OSShopItem
 
-    def __init__(self, grids, templates, template_area=(40, 21, 89, 70), amount_area=(60, 71, 91, 92),
+    def __init__(self, grids, templates, template_area=(25, 16, 89, 70), amount_area=(60, 71, 91, 92),
                  cost_area=(6, 123, 84, 166), price_area=(52, 132, 132, 156), tag_area=(81, 4, 91, 8),
                  counter_area=(85, 170, 134, 186)):
         super().__init__(grids, templates, template_area, amount_area, cost_area, price_area, tag_area)
